@@ -118,6 +118,26 @@ case "$dirty_adapter_exit" in
     ;;
 esac
 
+# 14-15: --level con2prim, table-free (M3b). Same pattern as the adapter
+# pair above: --synthetic is exactly consistent and defect-free (a clean
+# round trip is required), --synthetic-dirty plants pathologies the
+# in-memory repair pass cannot fully clean up, so either outcome is
+# accepted. --states 4000 keeps the clean run's Newton/fallback/round-trip
+# statistics directly comparable to tests/test_con2prim_audit.cpp's own
+# n_states=4000 acceptance test.
+expect_exit 0 "$TEST" --level con2prim --synthetic --states 4000
+set +e
+"$TEST" --level con2prim --synthetic-dirty >"$T/dirty_con2prim.report.txt"
+dirty_con2prim_exit=$?
+set -e
+case "$dirty_con2prim_exit" in
+  0 | 1) echo "PASS: eos_test --level con2prim --synthetic-dirty exit=$dirty_con2prim_exit" ;;
+  *)
+    echo "FAIL: eos_test --level con2prim --synthetic-dirty exited $dirty_con2prim_exit (expected 0 or 1)"
+    exit 1
+    ;;
+esac
+
 echo "=== Part B: real tables (skipped gracefully if absent) ==="
 
 # run_real_table PATH NAME -- exercises eos_test/eos_repair on one real
@@ -142,6 +162,11 @@ echo "=== Part B: real tables (skipped gracefully if absent) ==="
 run_real_table() {
   local path="$1"
   local name="$2"
+  # Optional extra eos_test args (e.g. "--m-B 1.67492749804e-24" for SRO's
+  # measured neutron-mass baryon convention, CODE.md "M2 empirical
+  # findings") -- applied to BOTH the adapter and con2prim runs below,
+  # unquoted so it word-splits into separate argv entries.
+  local extra_args="${3:-}"
 
   if [ ! -f "$path" ]; then
     echo "skipped: $name ($path not found)"
@@ -216,13 +241,35 @@ run_real_table() {
   local adapter_report="$T/${name}_adapter.report.txt"
   local adapter_test_exit=0
   set +e
-  "$TEST" --level adapter "$path" >"$adapter_report"
+  "$TEST" --level adapter "$path" $extra_args >"$adapter_report"
   adapter_test_exit=$?
   set -e
   case "$adapter_test_exit" in
     0 | 1) echo "PASS: eos_test --level adapter $name exit=$adapter_test_exit" ;;
     *)
       echo "FAIL: eos_test --level adapter $name exited $adapter_test_exit (expected 0 or 1)"
+      exit 1
+      ;;
+  esac
+
+  # --level con2prim (M3b): same auto-repair-then-build flow, over the
+  # con2prim round-trip audit (con2prim-entropy-rapidity.md deliverable 2).
+  # "clean" (0) or "found something to flag" (1) are both accepted outcomes,
+  # exactly like the adapter run above (CODE.md "Open decisions" #4:
+  # residual multi-root pockets are documented, accept-and-guard); a real
+  # table's own audit statistics are pulled from the saved report below for
+  # the summary line. --states 8000 keeps this guarded integration smoke
+  # test's runtime bounded while still exercising a real sample size.
+  local con2prim_report="$T/${name}_con2prim.report.txt"
+  local con2prim_test_exit=0
+  set +e
+  "$TEST" --level con2prim "$path" --states 8000 $extra_args >"$con2prim_report"
+  con2prim_test_exit=$?
+  set -e
+  case "$con2prim_test_exit" in
+    0 | 1) echo "PASS: eos_test --level con2prim $name exit=$con2prim_test_exit" ;;
+    *)
+      echo "FAIL: eos_test --level con2prim $name exited $con2prim_test_exit (expected 0 or 1)"
       exit 1
       ;;
   esac
@@ -289,15 +336,52 @@ run_real_table() {
   a_maxiter=${a_maxiter:-?}
   a_evals=${a_evals:-?}
 
+  # Best-effort extraction of the con2prim report's headline numbers
+  # (Con2PrimReport::print()'s "warm: n_newton=... n_fallback=...
+  # n_failed_total=..." line, its "rt_tau quantiles: p50=... p99=...
+  # max=..." line, and its "solves_per_sec_warm=... solves_per_sec_cold=..."
+  # line), for the summary line below; "?" if a line is ever absent.
+  local c_newton c_fallback c_failed c_rt_tau_p99 c_rt_tau_max c_solves_warm c_solves_cold
+  c_newton=$( (grep -E '^warm:' "$con2prim_report" || true) | grep -oE 'n_newton=[0-9]+' | head -1 |
+    cut -d= -f2)
+  c_fallback=$( (grep -E '^warm:' "$con2prim_report" || true) | grep -oE 'n_fallback=[0-9]+' | head -1 |
+    cut -d= -f2)
+  c_failed=$( (grep -E '^warm:' "$con2prim_report" || true) | grep -oE 'n_failed_total=[0-9]+' | head -1 |
+    cut -d= -f2)
+  # "p99=" cannot match inside "p999=" (different key, see the adapter
+  # extraction above for the same reasoning).
+  c_rt_tau_p99=$( (grep -E '^rt_tau quantiles:' "$con2prim_report" || true) | grep -oE 'p99=[0-9.eE+-]+' |
+    head -1 | cut -d= -f2)
+  c_rt_tau_max=$( (grep -E '^rt_tau quantiles:' "$con2prim_report" || true) | grep -oE ' max=[0-9.eE+-]+' |
+    head -1 | cut -d= -f2)
+  c_solves_warm=$( (grep -oE 'solves_per_sec_warm=[0-9.eE+-]+' "$con2prim_report" || true) | head -1 |
+    cut -d= -f2)
+  c_solves_cold=$( (grep -oE 'solves_per_sec_cold=[0-9.eE+-]+' "$con2prim_report" || true) | head -1 |
+    cut -d= -f2)
+  c_newton=${c_newton:-?}
+  c_fallback=${c_fallback:-?}
+  c_failed=${c_failed:-?}
+  c_rt_tau_p99=${c_rt_tau_p99:-?}
+  c_rt_tau_max=${c_rt_tau_max:-?}
+  c_solves_warm=${c_solves_warm:-?}
+  c_solves_cold=${c_solves_cold:-?}
+
   echo "SUMMARY $name: eos_test(raw)=$test_exit eos_repair=$repair_exit" \
     "eos_test(repaired)=$rep_test_exit entropy_repaired=$s_changed logenergy_repaired=$e_changed" \
     "violations3d_remaining_entropy=$s_v3d violations3d_remaining_logenergy=$e_v3d" \
     "eos_test(adapter)=$adapter_test_exit kappa=$a_kappa roundtrip_T_count=$a_rt_count" \
     "delta_T_max=$a_dT_max delta_T_p99=$a_dT_p99 delta_p_max=$a_dp_max delta_p_p99=$a_dp_p99" \
-    "sigma_monotonicity_count=$a_sigma_count maxiter_count=$a_maxiter evals_per_sec=$a_evals"
+    "sigma_monotonicity_count=$a_sigma_count maxiter_count=$a_maxiter evals_per_sec=$a_evals" \
+    "eos_test(con2prim)=$con2prim_test_exit c2p_newton=$c_newton c2p_fallback=$c_fallback" \
+    "c2p_failed=$c_failed rt_tau_p99=$c_rt_tau_p99 rt_tau_max=$c_rt_tau_max" \
+    "solves_per_sec_warm=$c_solves_warm solves_per_sec_cold=$c_solves_cold"
 }
 
 run_real_table "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5" "LS220"
-run_real_table "tables/LS220_3335_rho391_temp163_ye66.h5" "SRO"
+# SRO's measured baryon-mass convention is the neutron mass, not the default
+# amu (CODE.md "M2 empirical findings": rebuilding with m_neutron_g collapses
+# the delta_T fidelity quantiles from a flat ~8.7e-3 to ~1.6e-5) -- passed to
+# BOTH the adapter and con2prim runs inside run_real_table() via extra_args.
+run_real_table "tables/LS220_3335_rho391_temp163_ye66.h5" "SRO" "--m-B 1.67492749804e-24"
 
 echo "=== integration tests passed ==="
