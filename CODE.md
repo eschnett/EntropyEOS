@@ -215,6 +215,13 @@ and OpenMP builds).
   temperature T_F is reported alongside in MeV. m_B\* = κ·m_B with m_B the table
   convention (default amu; see open decision) — note that the δ_T audit effectively
   *measures* the table's true m_B, and its value is reported.
+- **Banded solver in-tree, not LAPACK.** The spline-fit solves are build-time only
+  (milliseconds even for SRO; the hot loop does no linear algebra), the collocation
+  matrix is benign (diagonally dominant 1-4-1 rows, fixed bandwidth 4, O(1) condition),
+  and LAPACK would break the HDF5-only-dependency and copy-in rules for real platform
+  friction (provider variance, Fortran mangling, LAPACKE availability). ~150 tested
+  lines instead; the solve sits behind one signature, so swapping LAPACK in later is
+  cheap if ever warranted.
 - **Staged delivery**: (a) B-spline fit/eval with exactness+convergence tests;
   (b) adapter core — κ re-zeroing, warm-started monotone T-solve, chain rule, EOSPoint,
   srange, flags — with out-of-range s/ρ *clamped and flagged* as a stopgap;
