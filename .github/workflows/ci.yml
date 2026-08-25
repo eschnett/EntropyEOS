@@ -19,6 +19,15 @@ jobs:
           HDF5_INC="-I/usr/include/hdf5/serial"
           HDF5_LIB="-L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5"
 
+      # tables/*.h5 aren't checked in, so tests/integration.sh's real-table
+      # part (B) skips itself here; the table-free synthetic part (A) still
+      # runs and must pass.
+      - name: Integration tests (tools)
+        run: >
+          make integration OPENMP=-fopenmp CXX=g++
+          HDF5_INC="-I/usr/include/hdf5/serial"
+          HDF5_LIB="-L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5"
+
       - name: Clean
         run: make clean
 

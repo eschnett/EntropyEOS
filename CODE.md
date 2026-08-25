@@ -130,8 +130,13 @@ auditable trail. Design points:
   separately, then a strictification pass imposing the minimum slopes (PAVA leaves flat
   runs; the adapter needs strictly positive σ_T, e_T). Min-slope defaults are still open:
   tune on real LS220 violations first.
-- Structural problems (NaN/Inf, non-monotone axes, ε + Δ ≤ 0) are *fatal*, not
-  repaired: they indicate a broken file, not physics noise.
+- Structural problems are *fatal*, not repaired — they indicate a broken file, not
+  physics noise. Fatal means: non-monotone/non-finite axes, missing `energy_shift`, or
+  a missing or non-finite **interpreted** field (`logenergy`, `entropy`). Non-finite
+  values in fields the pipeline never reads (the shipped LS220 table carries Inf points
+  in `cs2`/`gamma`) are a reported `nonfinite_<field>` violation class instead: they
+  pass through the writer byte-identically and must not block repairing the fields we
+  do interpret.
 - Guarantees: input never modified; deterministic; **idempotent** (a second run reports
   zero changes — enforced by tests). Output = faithful copy of every untouched dataset,
   the two repaired fields, plus a `/repair` provenance group (per-field indices /

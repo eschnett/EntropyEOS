@@ -46,7 +46,10 @@ HOST_OBJS = $(HOST_SRCS:.cpp=.o)
 TEST_SRCS = $(wildcard tests/test_*.cpp)
 TEST_BINS = $(TEST_SRCS:.cpp=)
 
-.PHONY: all lib test install clean
+TOOL_SRCS = $(wildcard tools/*.cpp)
+TOOL_BINS = $(TOOL_SRCS:.cpp=)
+
+.PHONY: all lib test tools integration install clean
 
 all: lib
 
@@ -66,6 +69,16 @@ tests/test_%: tests/test_%.cpp $(LIB)
 test: $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t =="; ./$$t; done
 
+# Each tools/*.cpp is a thin main() over the static lib (CODE.md: "no physics
+# or table logic in the tools"), built the same way as a test binary.
+tools/%: tools/%.cpp $(LIB)
+	$(CXX) $(ALL_CXXFLAGS) $(CPPFLAGS) -o $@ $< $(LIB) $(LDFLAGS)
+
+tools: $(TOOL_BINS)
+
+integration: tools
+	./tests/integration.sh
+
 install: lib
 	mkdir -p $(PREFIX)/lib $(PREFIX)/include/entropy_eos
 	(cd entropy_eos && find . -name '*.hpp' -print0 | tar --null -T - -cf -) | \
@@ -73,4 +86,4 @@ install: lib
 	cp $(LIB) $(PREFIX)/lib/
 
 clean:
-	rm -f $(HOST_OBJS) $(LIB) $(TEST_BINS)
+	rm -f $(HOST_OBJS) $(LIB) $(TEST_BINS) $(TOOL_BINS)

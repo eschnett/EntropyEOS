@@ -157,6 +157,38 @@ TEST_CASE("check_table: NaN injected into a field is fatal and names the field")
   CHECK(report.classes.empty());
 }
 
+TEST_CASE("check_table: non-finite values in a non-interpreted field are reported, not fatal") {
+  // Policy (CODE.md "Repair harness"): finiteness is fatal only for the
+  // fields the pipeline interprets (logenergy, entropy). The shipped LS220
+  // table carries Inf in cs2/gamma, and "logpress" is diagnostic-only, so an
+  // Inf there must yield a "nonfinite_logpress" violation class, with the
+  // Maxwell diagnostics still computed (poisoned stencil points skipped).
+  RawTable table = eeos::make_synthetic_table();
+  table.field("logpress")[table.index(3, 4, 5)] = std::numeric_limits<double>::infinity();
+
+  CheckReport report = eeos::check_table(table);
+  CHECK(report.status == Status::ok);
+  CHECK(report.fatal_messages.empty());
+
+  const CheckClassResult *nonfinite = nullptr;
+  const CheckClassResult *delta_T = nullptr;
+  for (const CheckClassResult &c : report.classes) {
+    if (c.name == "nonfinite_logpress") nonfinite = &c;
+    if (c.name == "delta_T") delta_T = &c;
+  }
+  REQUIRE(nonfinite != nullptr);
+  CHECK(nonfinite->count == 1);
+  REQUIRE(!nonfinite->worst.empty());
+  CHECK(nonfinite->worst[0].irho == 3);
+  CHECK(nonfinite->worst[0].jT == 4);
+  CHECK(nonfinite->worst[0].kYe == 5);
+
+  // Diagnostics still ran and stayed finite despite the poisoned point.
+  REQUIRE(delta_T != nullptr);
+  CHECK(std::isfinite(delta_T->max));
+  CHECK(std::isfinite(delta_T->rms));
+}
+
 TEST_CASE("check_table: missing required field 'entropy' is fatal") {
   RawTable table;
   table.set_axes({5.0, 6.0, 7.0}, {-1.0, 0.0, 1.0}, {0.1, 0.3, 0.5});

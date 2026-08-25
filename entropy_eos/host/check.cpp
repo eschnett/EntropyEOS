@@ -213,6 +213,32 @@ CheckClassResult skipped_class(const std::string &name) {
   return r;
 }
 
+// Non-finite values in a field the pipeline does not *interpret* (anything
+// other than "logenergy"/"entropy") are a reported violation class rather
+// than a structural fatal: repair and the adapter never read those fields,
+// and the writer passes them through byte-identically (CODE.md "Repair
+// harness"). This is not hypothetical -- the shipped stellarcollapse LS220
+// table carries Inf points in its cs2 and gamma fields.
+CheckClassResult check_nonfinite_field(const RawTable &table, const CheckOptions &opts,
+                                       const std::string &name) {
+  Accum acc(opts.worst_n);
+  const std::vector<double> &data = table.field(name);
+  for (size_t idx = 0; idx < data.size(); ++idx) {
+    const double v = data[idx];
+    if (!std::isfinite(v)) {
+      size_t irho, jT, kYe;
+      unflatten(table, idx, irho, jT, kYe);
+      // Metric 1.0, not v: feeding Inf/NaN into max/rms would make the class
+      // statistics themselves non-finite. The offending value is still shown
+      // via Loc.value.
+      acc.add_violation(1.0, true, make_loc(table, irho, jT, kYe, v));
+    } else {
+      acc.add_violation(0.0, false, Loc{});
+    }
+  }
+  return acc.finalize("nonfinite_" + name);
+}
+
 // --- B. Range/positivity ----------------------------------------------------
 //
 // eps + shift > 0 and p > 0 are automatic once logenergy/logpress are
@@ -343,12 +369,19 @@ void check_consistency(const RawTable &table, const CheckOptions &opts, CheckCla
         const double maxwell_s_rho = std::fabs(dS_dRho + dP_dT * m_B / (rho * rho * MeV_to_erg)) /
                                       std::max(std::fabs(dS_dRho), kTiny);
 
-        local_T[tid].add_diagnostic(delta_T, delta_T > opts.tol_consistency,
-                                     make_loc(table, irho, jT, kYe, delta_T));
-        local_p[tid].add_diagnostic(delta_p, delta_p > opts.tol_consistency,
-                                     make_loc(table, irho, jT, kYe, delta_p));
-        local_sr[tid].add_diagnostic(maxwell_s_rho, maxwell_s_rho > opts.tol_consistency,
-                                      make_loc(table, irho, jT, kYe, maxwell_s_rho));
+        // A non-finite metric means a non-finite input reached the FD stencil
+        // (possible in "logpress", which is diagnostic-only and therefore not
+        // structurally fatal); such points are skipped here and reported by
+        // the "nonfinite_<field>" class instead.
+        if (std::isfinite(delta_T))
+          local_T[tid].add_diagnostic(delta_T, delta_T > opts.tol_consistency,
+                                       make_loc(table, irho, jT, kYe, delta_T));
+        if (std::isfinite(delta_p))
+          local_p[tid].add_diagnostic(delta_p, delta_p > opts.tol_consistency,
+                                       make_loc(table, irho, jT, kYe, delta_p));
+        if (std::isfinite(maxwell_s_rho))
+          local_sr[tid].add_diagnostic(maxwell_s_rho, maxwell_s_rho > opts.tol_consistency,
+                                        make_loc(table, irho, jT, kYe, maxwell_s_rho));
       }
     }
   }
@@ -376,6 +409,12 @@ CheckClassResult check_cs2_out_of_range(const RawTable &table, const CheckOption
   const std::vector<double> &cs2 = table.field("cs2");
   for (size_t idx = 0; idx < cs2.size(); ++idx) {
     const double v = cs2[idx];
+    if (!std::isfinite(v)) {
+      // Reported by the "nonfinite_cs2" class; counting Inf here as well
+      // would double-report it as a range violation.
+      acc.add_violation(0.0, false, Loc{});
+      continue;
+    }
     double metric = 0.0;
     bool bad = false;
     if (v <= 0.0) {
@@ -441,8 +480,11 @@ CheckClassResult check_cs2_vs_fd(const RawTable &table, const CheckOptions &opts
         const double cs2_fd = (dP_dRho - dP_dT * (dS_dRho / dS_dT)) / (h * c * c);
 
         const double metric = std::fabs(cs2[idx] - cs2_fd) / std::max(std::fabs(cs2_fd), kTiny);
-        local[tid].add_diagnostic(metric, metric > opts.tol_consistency,
-                                   make_loc(table, irho, jT, kYe, metric));
+        // Skip points poisoned by non-finite inputs (stored cs2 or logpress
+        // feeding the stencil); those are reported by "nonfinite_<field>".
+        if (std::isfinite(metric))
+          local[tid].add_diagnostic(metric, metric > opts.tol_consistency,
+                                     make_loc(table, irho, jT, kYe, metric));
       }
     }
   }
@@ -479,7 +521,12 @@ CheckReport check_table(const RawTable &table, const CheckOptions &opts) {
     report.fatal_messages.push_back("missing required attribute 'energy_shift'");
   }
 
-  for (const std::string &name : table.field_names()) {
+  // Finiteness is *fatal* only for the fields the pipeline interprets
+  // (repairs, or feeds to the M2 adapter): "logenergy" and "entropy".
+  // Non-finite values anywhere else become "nonfinite_<field>" violation
+  // classes in section B below -- see check_nonfinite_field().
+  for (const char *name : {"logenergy", "entropy"}) {
+    if (!table.has_field(name)) continue; // absence already reported above
     const std::vector<double> &data = table.field(name);
     size_t bad_count = 0;
     size_t first_bad = 0;
@@ -511,6 +558,15 @@ CheckReport check_table(const RawTable &table, const CheckOptions &opts) {
 
   // --- B. Range/positivity -------------------------------------------------
   report.classes.push_back(check_entropy_negative(table, opts));
+
+  // Non-finite values in non-interpreted fields (see check_nonfinite_field).
+  // Only offending fields get a class, so a clean table isn't padded with
+  // one zero-count class per auxiliary field.
+  for (const std::string &name : table.field_names()) {
+    if (name == "logenergy" || name == "entropy") continue; // fatal above
+    CheckClassResult r = check_nonfinite_field(table, opts, name);
+    if (r.count > 0) report.classes.push_back(std::move(r));
+  }
 
   // --- C. Monotonicity in T -------------------------------------------------
   CheckClassResult mono_s, mono_e;
