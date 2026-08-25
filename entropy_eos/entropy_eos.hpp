@@ -10,8 +10,10 @@
 #pragma once
 
 // IWYU pragma: begin_exports
+#include "entropy_eos/core/bspline_eval.hpp"
 #include "entropy_eos/core/defs.hpp"
 
+#include "entropy_eos/host/bspline_fit.hpp"
 #include "entropy_eos/host/check.hpp"
 #include "entropy_eos/host/io_stellarcollapse.hpp"
 #include "entropy_eos/host/repair.hpp"
