@@ -266,8 +266,12 @@ and OpenMP builds).
   `io_stellarcollapse`, `check`, `repair`; tools `eos_repair` and
   `eos_test --level table`; unit tests. Acceptance: clean runs and repair reports on
   LS220 and SRO tables; idempotence; synthetic clean/seeded-violation tests pass.
-- **M2:** `bspline_fit`/`bspline_eval`, `adapter_build`/`adapter_eval` (T-solve, chain
-  rule, extensions, κ); `eos_test --level adapter`.
+- **M2:** ✅ complete (stages a–d landed: B-splines, adapter core, audit harness,
+  spline-safe repair with its measured limits, designed domain extensions). The
+  adapter presents U(ρ,s,Ye) on an extended domain (ext_cells=8 per side) with C²
+  monotone tails, flags judged on the solved state, and U ≥ 0 over the whole extended
+  box; synthetic seam jumps ~5e-7, real-table seam maxima confined to the documented
+  residual pockets (accept-and-guard, open decision 4).
 - **M3:** `prim2con`, `con2prim` (coupled 2×2 Newton + nested 1D fallback);
   `eos_test --level con2prim`; benchmarks vs. RePrimAnd.
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
