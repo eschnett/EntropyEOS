@@ -9,6 +9,7 @@
 
 #pragma once
 
+// IWYU pragma: begin_exports
 #include "entropy_eos/core/defs.hpp"
 
 #include "entropy_eos/host/check.hpp"
@@ -16,3 +17,4 @@
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
 #include "entropy_eos/host/units.hpp"
+// IWYU pragma: end_exports
