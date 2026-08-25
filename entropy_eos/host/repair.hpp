@@ -23,6 +23,24 @@
 // before re-repairing and re-auditing -- see repair_table()'s doc comment
 // for the exact algorithm.
 //
+// M2d-1 "spline-safe-3d" repair (eos-adapter-F-to-U.md §4, CODE.md open
+// decision 4): the per-column loop above only ever looks at S'(u) along a
+// single (irho, kYe) column, so it provably cannot see or fix a violation
+// that only shows up in the *tensor-product* 3D fit adapter_build.cpp
+// actually evaluates -- e.g. two neighboring columns that are each
+// individually monotone but differ enough in local steepness that the
+// smooth blend the spline performs *between* them dips non-monotone in u at
+// an off-node (rho, Ye) position no per-column audit ever samples. The
+// spline-safe-3d stage (RepairOptions::spline_safe_3d, on by default) runs
+// after the per-column stage, per field: it fits the *whole field* as one
+// tensor-product not-a-knot cubic B-spline (the same fit_bspline_3d()
+// adapter_build.cpp uses), audits fu (= S_u) on a refined 3D grid, and
+// wherever it finds a violation, nudges the data with one small local 3D
+// diffusion step, then re-runs the per-column pipeline on every column the
+// nudge touched (to restore the 1D monotonicity/spline-safety the 3D
+// diffusion may have perturbed) -- see repair_table()'s doc comment for the
+// exact algorithm.
+//
 // Host-only: STL containers, may throw. Structural problems -- a listed
 // field missing from the table, or a non-finite value in a listed field --
 // mean a broken file, not physics noise, and are reported by throwing
@@ -89,6 +107,37 @@ struct RepairOptions {
   // indices [j - diffuse_window, j + 1 + diffuse_window], clamped to the
   // column.
   int diffuse_window = 2;
+
+  // --- M2d-1 spline-safe-3d smoothing (see the module comment above) ------
+
+  // Run the tensor-product 3D audit-driven diffusion stage, per field,
+  // after the per-column stage above. On by default: fixes cross-column
+  // x/y ringing that no per-column repair can reach (CODE.md open decision
+  // 4). A field whose grid has fewer than 4 points along rho, T, or Ye is
+  // silently skipped (fit_bspline_3d's own minimum -- a tensor-product fit
+  // is not meaningfully defined below that), matching the per-column
+  // stage's own n < 4 no-op.
+  bool spline_safe_3d = true;
+
+  // Cap on rounds of the main 3D loop (repair_table()'s doc comment, 3D
+  // stage step a-d) per field. Unlike spline_rounds_max (per column), this
+  // is per *field*: the whole tensor-product fit/audit/diffuse cycle is one
+  // round.
+  int rounds3d_max = 10;
+
+  // Per-cell oversampling used by the main 3D loop's audit, along u (T) and
+  // along x/y (rho/Ye) respectively -- see repair_table()'s doc comment for
+  // the exact sample grid. The final verification pass always audits at
+  // (4,4,4) regardless of these (see below); the main loop's cheaper
+  // resolution exists purely so most of the convergence work happens at a
+  // fraction of the final pass's cost (repair.hpp's module comment;
+  // performance guardrail in the M2d-1 work order).
+  int refine3d_u = 4;
+  int refine3d_xy = 2;
+
+  // diffuse_alpha and diffuse_window (above) are reused by the 3D stage's
+  // Jacobi diffusion step and box-marking, exactly as documented for the
+  // per-column stage but applied in 3D (repair_table()'s doc comment).
 };
 
 // One value changed by repair_table(), identified by field and grid index.
@@ -133,6 +182,49 @@ struct RepairResult {
     // options.spline_rounds_max+1 whenever spline_safe ran, empty
     // otherwise.
     std::vector<size_t> spline_rounds_histogram;
+
+    // --- M2d-1 spline-safe-3d stats (all 0 / empty if options.spline_safe_3d
+    // was false, or if the field's grid was too small to fit -- see
+    // RepairOptions::spline_safe_3d) ----------------------------------------
+
+    // Number of 3D diffusion rounds *kept* in this field's final state:
+    // every main-loop round, and every verification extra round (up to 3),
+    // that was still part of the best (lowest (4,4,4)-equivalent
+    // violation-count) state repair_table() settled on -- see
+    // repair_table()'s doc comment (steps 2-4) and spline_safe_3d_field()'s
+    // doc comment in repair.cpp for why "kept" and "attempted" can differ
+    // (a round whose fix made things worse is discarded, not counted here).
+    // A round whose audit finds nothing (including the final verification's
+    // own first audit, when it is already clean) does *not* count, so a
+    // field with no 3D-stage defect at all reports 0, same as a field with
+    // the stage turned off; a field where the backstop (step 4) reverted
+    // everything back to the pre-3D-stage state also reports 0.
+    int rounds3d_used = 0;
+
+    // How many DISTINCT data points are different from the pre-3D-stage
+    // state because of a 3D Jacobi diffusion step, in this field's final
+    // (kept) state -- counted once each no matter how many rounds touched
+    // them, and 0 whenever the backstop (step 4) reverted everything.
+    size_t points_diffused_3d = 0;
+
+    // Violation *sample* count of this field's final state at (4,4,4)
+    // resolution when repair_table() returned -- either the final
+    // verification's own last audit (repair_table()'s doc comment, step 3),
+    // or, if the backstop (step 4) reverted to the pre-3D-stage state, that
+    // state's own (4,4,4) count. 0 means the field is fully
+    // tensor-fit-monotone in u at (4,4,4) resolution.
+    size_t violations3d_remaining = 0;
+
+    // Every 3D-stage audit's violation *sample* count, in chronological
+    // order: the main loop's rounds (at refine (refine3d_xy, refine3d_u,
+    // refine3d_xy)), one entry per round including the one that finds zero
+    // and ends the loop, followed by the final verification's audits (at
+    // (4,4,4)), again one entry per audit including its last (clean or
+    // not). Empty iff options.spline_safe_3d was false or the field's grid
+    // was too small to fit. repair_table() itself prints nothing (CODE.md
+    // "Environment": library code stays quiet); tools/eos_repair prints
+    // these as per-round progress lines.
+    std::vector<size_t> rounds3d_violation_history;
   };
   std::vector<FieldSummary> summaries;
 
@@ -140,8 +232,10 @@ struct RepairResult {
   void print(std::ostream &os) const;
 };
 
-// Repairs `table` in place. For each field in options.fields, and for every
-// (irho, kYe) column along T, this:
+// Repairs `table` in place. For each field in options.fields:
+//
+// Per-column stage, applied independently to every (irho, kYe) column along
+// T (columns are independent -> OpenMP):
 //   0. Base pass: applies L2 isotonic regression (PAVA, uniform weights) to
 //      make the column non-decreasing, then a strictification forward pass
 //      enforcing the field's minimum slope: v[j] = max(v[j], v[j-1] +
@@ -170,29 +264,112 @@ struct RepairResult {
 //      If the cap is reached with violations remaining, the column is
 //      recorded (FieldSummary::spline_columns_still_violating) rather than
 //      repaired further; this never throws.
-//   2. Writes the column back, recording a RepairEntry for every index
-//      whose *final* value (after both the base pass and, if run, the
-//      spline-safe loop) differs from the original input value (exact
-//      bitwise != -- this is always computed against the original, not
-//      incrementally against the base-pass output, so the log stays
-//      meaningful across smoothing rounds). Indices that never changed are
-//      left bit-identical -- no arithmetic touches them.
 //
-// Columns are independent of each other and may be repaired in parallel
-// (OpenMP), but entries are always concatenated in the fixed order described
-// on RepairResult::entries, so the result does not depend on thread count;
-// the spline-safe loop's audit (step 1a-b) is itself deterministic (same
-// fit, same samples) for a given column, so this holds with spline_safe on
-// or off.
+// Field-wide 3D stage (M2d-1), applied once per field after every column has
+// gone through the per-column stage above, if options.spline_safe_3d
+// (default on) and every axis has >= 4 points (else a silent no-op for that
+// field):
+//   2. Main loop, up to options.rounds3d_max rounds:
+//        a. Fit the *whole field* with fit_bspline_3d() at unit spacing
+//           (x0=u0=y0=0, hx=hu=hy=1 -- again only derivative signs matter).
+//        b. Audit fu (= S_u) of bspline_eval3() on the grid {every rho node
+//           plus (refine3d_xy-1) interior points per rho cell} x {every T
+//           node plus (refine3d_u-1) interior points per T cell} x {same as
+//           rho, for Ye}, i.e. per axis the union of every data node and
+//           (refine-1) points interior to each cell. Collect every sample
+//           with fu <= options.spline_slope_floor (OpenMP over the rho
+//           axis; the violation count and the marked set below are sums/an
+//           idempotent OR over independent samples, so both are the same
+//           regardless of thread count or scheduling).
+//        c. If no sample violated, the field is done with this stage.
+//        d. Otherwise, for every violating sample's owning cell (i,j,k) (rho,
+//           T, Ye cell indices), mark the data-index box [i-w, i+1+w] x
+//           [j-w, j+1+w] x [k-w, k+1+w] (w = options.diffuse_window, clamped
+//           to the grid). Apply one 3D Jacobi diffusion step to every marked
+//           point that is interior in *all three* axes (points on any
+//           axis's boundary never move, even if marked): v_ijk <- v_ijk +
+//           diffuse_alpha*(sum of the 6 axis-neighbors - 6*v_ijk)/6, using
+//           the pre-step snapshot on the right-hand side. Then re-run the
+//           per-column stage (steps 0-1 above) on every (irho, kYe) column
+//           that intersects a marked box (i.e. has any marked jT) -- the 3D
+//           diffusion can perturb a column's own 1D monotonicity or
+//           spline-safety, and this restores it. Go back to (a).
+//      This loop is *not* assumed to improve monotonically round over round
+//      (see spline_safe_3d_field()'s doc comment in repair.cpp for the
+//      empirical reason: fields with a very thin natural safety margin --
+//      e.g. "logenergy" where eps << energy_shift makes S_u tiny almost
+//      everywhere at low T -- can have a round's diffusion tip a
+//      neighboring, previously-fine sample negative, so the violation count
+//      can rise before it falls), so it tracks the best (lowest-violation)
+//      state seen and gives up early -- reverting to that best state --
+//      after 4 consecutive rounds fail to beat it. Reaching options.
+//      rounds3d_max rounds without giving up early behaves the same way
+//      (revert to the best state seen); this step never throws.
+//   3. Final verification, run unconditionally (even if step 2 exited via
+//      (c) on round 1): one audit pass exactly like 2b but always at refine
+//      (4,4,4), regardless of options.refine3d_u/refine3d_xy. If it finds
+//      nothing, the field's 3D stage is done. Otherwise, up to 3 more
+//      rounds of "fix like 2d, then re-audit at (4,4,4)", stopping (and
+//      reverting to the best of these (4,4,4)-audited states) the instant a
+//      round fails to improve on it -- there is no rounds3d_max-sized
+//      budget left here to recover from a bad round, unlike step 2.
+//   4. Backstop, only when step 3 ends with a nonzero count: one more
+//      (4,4,4) audit, of the state `data` held *before* this whole 3D stage
+//      started (i.e. after the per-column stage but before step 2's first
+//      round) -- never returning (or leaving in `data`) a field worse off,
+//      at this authoritative resolution, than skipping the 3D stage
+//      entirely. If step 3's result is worse, every field byte and
+//      FieldSummary::rounds3d_used/points_diffused_3d revert to exactly
+//      that pre-3D-stage state (0 rounds, 0 points diffused).
+//      FieldSummary::violations3d_remaining is this step's final count.
+//   Every 3D audit's violation count actually run (main loop rounds, then
+//   the verification's own audits -- *not* including the backstop's own
+//   audit in step 4, which is bookkeeping, not a "round") is appended, in
+//   order, to FieldSummary::rounds3d_violation_history.
+//
+// Final write-back, per field: a RepairEntry for every index whose value
+// after *all* stages above (per-column, then 3D if it ran) differs from the
+// original input value (exact bitwise != -- always computed against the
+// pre-repair original, not incrementally against an intermediate stage's
+// output, so the log stays meaningful across every round of every stage),
+// in the fixed order documented on RepairResult::entries. Indices that never
+// changed are left bit-identical -- no arithmetic touches them.
+//
+// The per-column stage is embarrassingly parallel (OpenMP over columns) and
+// the 3D stage's own audit/diffusion/re-repair are each parallelized
+// internally (over the rho axis for the audit, over affected columns for
+// the re-repair); every stage's *result* is independent of thread count and
+// scheduling (see 2b's parenthetical and the per-column stage's existing
+// determinism argument), so the final write-back above is deterministic
+// regardless of how many threads ran.
 //
 // Repairing an already-repaired table is a no-op (RepairResult::entries
-// empty, Status::ok, no bits changed): with spline_safe off, this follows
-// from PAVA and strictification both being true no-ops on a column that
-// already satisfies the minimum slope everywhere; with spline_safe on, it
-// additionally requires the spline audit (step 1b) to find no offending
-// cell on its first pass over already-repaired data -- guaranteed by the
-// audit's own determinism, since a first repair_table() run only stops
-// smoothing a column once that same audit reports it clean.
+// empty, Status::ok, no bits changed) *whenever the previous repair_table()
+// run left every processed field genuinely clean*: with spline_safe (and
+// spline_safe_3d) off, this follows from PAVA and strictification both
+// being true no-ops on a column that already satisfies the minimum slope
+// everywhere; with spline_safe on, it additionally requires that stage's
+// own audit to find no violation on its first pass over already-repaired
+// data -- guaranteed by the audit's own determinism, since a first
+// repair_table() run only stops that stage once that same audit reports it
+// clean. With spline_safe_3d on and a field left with
+// FieldSummary::violations3d_remaining == 0, the same argument applies
+// whenever options.refine3d_xy divides the verification's fixed refine of 4
+// (true for the documented default refine3d_xy=2): every main-loop audit
+// sample is then also one of the final verification's samples, so a field
+// left clean by the verification pass is guaranteed clean on the next run's
+// very first (cheaper) main-loop audit too. A field left with
+// violations3d_remaining > 0, however, is *not* guaranteed idempotent: step
+// 2's doc comment above (and spline_safe_3d_field()'s doc comment in
+// repair.cpp) describe an empirically-observed defect shape (a wide,
+// sharp-edged cross-column discontinuity) that the tensor-product stage
+// cannot fully resolve within its round budget -- repairing such a table a
+// second time can still find (and repair) more of the same residual, since
+// each run explores independently from wherever the data currently stands.
+// This is expected, not a bug: it mirrors the parent design's own framing
+// (eos-adapter-F-to-U.md S4, CODE.md "M2 empirical findings") of stubborn
+// residual pathologies as something to measure and report, not something
+// this stage promises to eliminate in one pass.
 //
 // Throws std::runtime_error if a listed field is missing from `table` or
 // contains a non-finite value (checked for every listed field before any

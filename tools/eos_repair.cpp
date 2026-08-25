@@ -8,9 +8,9 @@
 // that.
 //
 //   eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]
-//              [--no-spline-safe] [--log FILE]
+//              [--no-spline-safe] [--no-spline-safe-3d] [--log FILE]
 //   eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]
-//              [--no-spline-safe]
+//              [--no-spline-safe] [--no-spline-safe-3d]
 //
 // Exit codes: 0 = already clean, 1 = repaired (or would repair, under
 // --check-only), 2 = fatal structural problem or other runtime error,
@@ -38,24 +38,30 @@ const char *const kToolVersion = "entropy_eos eos_repair 0.1";
 void print_usage(std::ostream &os) {
   os << "usage:\n"
         "  eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]\n"
-        "             [--no-spline-safe] [--log FILE]\n"
+        "             [--no-spline-safe] [--no-spline-safe-3d] [--log FILE]\n"
         "  eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]\n"
-        "             [--no-spline-safe]\n"
+        "             [--no-spline-safe] [--no-spline-safe-3d]\n"
         "\n"
         "Repairs a stellarcollapse-format EOS table so that \"entropy\" and\n"
         "\"logenergy\" are strictly monotone increasing in temperature at every\n"
         "(rho, Ye): L2 isotonic regression (PAVA) followed by a minimum-slope\n"
         "strictification pass (see CODE.md \"Repair harness\"), then -- unless\n"
-        "--no-spline-safe -- an audit-driven smoothing loop (M2c-prime,\n"
-        "eos-adapter-F-to-U.md S4) that fits the same C^2 not-a-knot cubic\n"
-        "B-spline the adapter build uses and nudges any cell where the fitted\n"
-        "spline's derivative dips to <= 0 between nodes (a near-plateau\n"
-        "immediately adjacent to a steep recovery can ring the spline non-\n"
-        "monotone there even though the raw data is monotone), then re-runs\n"
-        "PAVA + strictification and re-audits, up to a bounded number of\n"
-        "rounds. Structural problems (bad axes, non-finite values, missing\n"
-        "required fields or attributes) are fatal and are never repaired --\n"
-        "they indicate a broken file, not physics noise.\n"
+        "--no-spline-safe -- a per-column audit-driven smoothing loop\n"
+        "(M2c-prime, eos-adapter-F-to-U.md S4) that fits the same C^2\n"
+        "not-a-knot cubic B-spline the adapter build uses to each (rho, Ye)\n"
+        "column and nudges any cell where the fitted spline's derivative dips\n"
+        "to <= 0 between nodes (a near-plateau immediately adjacent to a steep\n"
+        "recovery can ring the spline non-monotone there even though the raw\n"
+        "data is monotone), then re-runs PAVA + strictification and re-audits,\n"
+        "up to a bounded number of rounds. Then -- unless --no-spline-safe-3d\n"
+        "-- a tensor-product 3D audit-driven diffusion stage (M2d-1, CODE.md\n"
+        "\"open decision 4\") that fits the *whole* field as one tensor-product\n"
+        "spline and fixes cross-column violations (two neighboring columns\n"
+        "individually monotone but blending non-monotone between them) that no\n"
+        "per-column repair can see, let alone fix. Structural problems (bad\n"
+        "axes, non-finite values, missing required fields or attributes) are\n"
+        "fatal and are never repaired -- they indicate a broken file, not\n"
+        "physics noise.\n"
         "\n"
         "positional arguments:\n"
         "  IN.h5               input table (stellarcollapse.org / O'Connor-Ott\n"
@@ -68,9 +74,13 @@ void print_usage(std::ostream &os) {
         "                      kB/baryon; default: RepairOptions::min_slope_entropy)\n"
         "  --min-slope-loge X  minimum logenergy slope per T grid step (absolute,\n"
         "                      log10(erg/g); default: RepairOptions::min_slope_logenergy)\n"
-        "  --no-spline-safe    skip the spline-safe smoothing loop (RepairOptions::\n"
-        "                      spline_safe = false); repair is then plain PAVA +\n"
-        "                      strictification, as before M2c-prime. On by default.\n"
+        "  --no-spline-safe    skip the per-column spline-safe smoothing loop\n"
+        "                      (RepairOptions::spline_safe = false); repair is\n"
+        "                      then plain PAVA + strictification, as before\n"
+        "                      M2c-prime. On by default.\n"
+        "  --no-spline-safe-3d skip the tensor-product 3D spline-safe stage\n"
+        "                      (RepairOptions::spline_safe_3d = false). On by\n"
+        "                      default.\n"
         "  --log FILE          write a human-readable repair log to FILE (not\n"
         "                      valid together with --check-only)\n"
         "  -h, --help          print this message\n"
@@ -89,6 +99,7 @@ struct ParsedArgs {
   bool have_min_slope_loge = false;
   double min_slope_loge = 0.0;
   bool no_spline_safe = false;
+  bool no_spline_safe_3d = false;
   bool have_log = false;
   std::string log_path;
   std::vector<std::string> positionals;
@@ -136,6 +147,8 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
       out.have_min_slope_loge = true;
     } else if (a == "--no-spline-safe") {
       out.no_spline_safe = true;
+    } else if (a == "--no-spline-safe-3d") {
+      out.no_spline_safe_3d = true;
     } else if (a == "--log") {
       if (i + 1 >= args.size()) {
         std::cerr << "eos_repair: option '--log' requires a value\n\n";
@@ -204,6 +217,7 @@ void write_log(const std::string &log_path, const std::string &in_path, const st
   log << "min_slope_entropy:   " << options.min_slope_entropy << "\n";
   log << "min_slope_logenergy: " << options.min_slope_logenergy << "\n";
   log << "spline_safe:         " << (options.spline_safe ? "on" : "off") << "\n";
+  log << "spline_safe_3d:      " << (options.spline_safe_3d ? "on" : "off") << "\n";
   log << "timestamp:           " << std::put_time(&now_tm, "%Y-%m-%dT%H:%M:%SZ") << "\n";
   log << "\n";
 
@@ -216,6 +230,26 @@ void write_log(const std::string &log_path, const std::string &in_path, const st
       log << e.field << " (" << e.irho << "," << e.jT << "," << e.kYe << ") " << e.old_value << " -> "
           << e.new_value << "\n";
     }
+  }
+}
+
+// Per-round progress lines for the M2d-1 tensor-product 3D spline-safe
+// stage (repair.hpp: "the library itself stays quiet ... tools/eos_repair
+// prints these"): one line per field that ran the stage (non-empty
+// rounds3d_violation_history), listing every recorded audit's violation
+// *sample* count in order (main-loop rounds, then the final (4,4,4)
+// verification's own audits -- see RepairResult::FieldSummary's doc
+// comment for exactly what each entry means).
+void print_rounds3d_progress(std::ostream &os, const eeos::RepairResult &result) {
+  for (const eeos::RepairResult::FieldSummary &s : result.summaries) {
+    if (s.rounds3d_violation_history.empty()) {
+      continue;
+    }
+    os << "spline-safe-3d " << s.field << ":";
+    for (size_t r = 0; r < s.rounds3d_violation_history.size(); ++r) {
+      os << " round" << (r + 1) << "_violations=" << s.rounds3d_violation_history[r];
+    }
+    os << "\n";
   }
 }
 
@@ -259,8 +293,12 @@ int main(int argc, char **argv) {
     if (pa.no_spline_safe) {
       repair_opts.spline_safe = false;
     }
+    if (pa.no_spline_safe_3d) {
+      repair_opts.spline_safe_3d = false;
+    }
 
     eeos::RepairResult result = eeos::repair_table(table, repair_opts);
+    print_rounds3d_progress(std::cout, result);
 
     if (pa.check_only) {
       std::cout << "eos_repair --check-only: "

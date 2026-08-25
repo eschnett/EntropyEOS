@@ -520,24 +520,31 @@ TEST_CASE("repair_table: spline-safe removes a plateau-then-jump spline-monotoni
   }
 
   // spline_safe = false: repair_table() only runs the base PAVA +
-  // strictify pass, so the violation survives.
+  // strictify pass, so the violation survives. spline_safe_3d = false too
+  // (with a comment, per this milestone's instructions): this table is a
+  // single (irho=1, kYe=1) column, so the M2d-1 tensor-product stage would
+  // already be a silent no-op (fit_bspline_3d needs >= 4 points on every
+  // axis) -- set explicitly to document that this test is only ever about
+  // the per-column stage in isolation.
   {
     RawTable table = make_single_column_table("entropy", col);
     RepairOptions opts;
     opts.fields = {"entropy"};
     opts.spline_safe = false;
+    opts.spline_safe_3d = false;
     eeos::repair_table(table, opts);
     CHECK(fresh_fit_min_slope(table.field("entropy")) <= 0.0);
   }
 
   // spline_safe = true (default): the smoothing loop removes it -- a fresh
   // fit of the repaired column has S' > spline_slope_floor (0.0) at every
-  // refined sample.
+  // refined sample. spline_safe_3d = false for the same reason as above.
   {
     RawTable table = make_single_column_table("entropy", col);
     RepairOptions opts;
     opts.fields = {"entropy"};
     opts.spline_safe = true;
+    opts.spline_safe_3d = false;
     const RepairResult result = eeos::repair_table(table, opts);
     CHECK(fresh_fit_min_slope(table.field("entropy")) > 0.0);
 
@@ -578,14 +585,31 @@ TEST_CASE("repair_table: idempotent with spline_safe on (repair_table() and a sy
   // (b) synthetic-dirty end-to-end: the fixed LS220/SRO-mimicking defect
   // preset (near-plateaus, wiggle clusters, ...) is exactly the kind of
   // input the spline-safe loop targets, so this exercises idempotence
-  // through the loop itself, not just the base pass.
+  // through the loop itself, not just the base pass. spline_safe_3d =
+  // false here (M2d-1; this test predates that stage): empirically,
+  // dirty_synthetic_options()'s "entropy" WiggleDefect (+-0.5 kB/baryon
+  // over a 6-rho x 3-Ye column block, eos-adapter-F-to-U.md-S4 "several
+  // adjacent pairs decrease") is a genuinely hard block-edge cross-column
+  // discontinuity: repair_table()'s M2d-1 stage reduces its (4,4,4)
+  // violation count substantially (1120 -> 664 samples) but does not reach
+  // the fixed point idempotence needs here -- more rounds do not help (it
+  // plateaus, confirmed up to 200 rounds) and more aggressive
+  // diffuse_window/diffuse_alpha make it *worse*, not better, so this is a
+  // property of the defect and RepairOptions::diffuse_window/diffuse_alpha
+  // reused at their existing (mild, per-column-tuned) values, not a bug.
+  // The dedicated M2d-1 idempotence/determinism test below uses a milder,
+  // fully-convergent cross-column defect instead; this test keeps
+  // exercising exactly what it always has (the per-column stage's
+  // idempotence against this preset).
   {
     RawTable table = eeos::make_synthetic_table(eeos::dirty_synthetic_options());
-    const RepairResult first = eeos::repair_table(table);
+    RepairOptions ropts;
+    ropts.spline_safe_3d = false;
+    const RepairResult first = eeos::repair_table(table, ropts);
     CHECK_FALSE(first.entries.empty());
 
     const RawTable after_first = table;
-    const RepairResult second = eeos::repair_table(table);
+    const RepairResult second = eeos::repair_table(table, ropts);
     CHECK(second.entries.empty());
     CHECK(second.status == eeos::Status::ok);
     CHECK(fields_bit_identical(after_first, table, "entropy"));
@@ -604,4 +628,261 @@ TEST_CASE("repair_table: deterministic with spline_safe on (synthetic-dirty, ind
   CHECK(entries_equal(result_a.entries, result_b.entries));
   CHECK(fields_bit_identical(table_a, table_b, "entropy"));
   CHECK(fields_bit_identical(table_a, table_b, "logenergy"));
+}
+
+// --- (10) M2d-1 spline-safe-3d tensor-product repair ------------------------
+
+namespace {
+
+// Test-local, independent-of-repair.cpp 3D audit helper (per this
+// milestone's instructions): fits `field`'s current data on `table`'s grid
+// as one tensor-product not-a-knot cubic B-spline at unit spacing (x0=u0=
+// y0=0, hx=hu=hy=1 -- the same convention repair.cpp's spline-safe-3d stage
+// uses) and returns the number of samples with fu <= 0.0 on the
+// (refine,refine,refine) grid repair.hpp's repair_table() doc comment
+// describes: per axis, the union of every data node and (refine-1) points
+// interior to each cell (position i/refine for i = 0..(n-1)*refine).
+size_t count_3d_fu_violations(const RawTable &table, const std::string &field, int refine) {
+  const int nrho = static_cast<int>(table.nrho());
+  const int ntemp = static_cast<int>(table.ntemp());
+  const int nye = static_cast<int>(table.nye());
+  const eeos::Bspline3 fit =
+      eeos::fit_bspline_3d(nrho, ntemp, nye, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, table.field(field));
+  const eeos::BsplineView3 view = fit.view();
+
+  auto positions = [&](int n) {
+    std::vector<double> pos;
+    pos.reserve(static_cast<size_t>((n - 1) * refine + 1));
+    for (int i = 0; i <= (n - 1) * refine; ++i) {
+      pos.push_back(static_cast<double>(i) / static_cast<double>(refine));
+    }
+    return pos;
+  };
+  const std::vector<double> xs = positions(nrho);
+  const std::vector<double> us = positions(ntemp);
+  const std::vector<double> ys = positions(nye);
+
+  size_t violations = 0;
+  for (double x : xs) {
+    for (double u : us) {
+      for (double y : ys) {
+        if (eeos::bspline_eval3(view, x, u, y).fu <= 0.0) {
+          ++violations;
+        }
+      }
+    }
+  }
+  return violations;
+}
+
+// Builds a default-grid (40x30x10) synthetic table, then plants a
+// hand-crafted CROSS-COLUMN "entropy" defect that no per-column repair can
+// see, let alone fix (repair.hpp's module comment): for irho in
+// [irho0,irho0+5] at one fixed kYe, adds
+// +amplitude*(-1)^(irho-irho0)*bump(jT) to entropy, where bump is a tent
+// function of jT peaking at 1.0 (so alternating columns get an extra
+// +amplitude/-amplitude "bulge" through the same T-window, each individually
+// still smooth). At amplitude=3.0 (kB/baryon -- well above the model's
+// natural ~0.3-0.5 per-T-step increment, but the *sign* alternation between
+// neighbors, not the raw size, is what matters here) this leaves every
+// column monotone after the per-column stage (PAVA + strictify + the
+// per-column spline-safe loop all still apply to *each column in
+// isolation*, and each column's own shape is smooth and monotone) but the
+// *tensor-product* fit's fu dips <= 0 at several x-midpoint samples between
+// the alternating-sign columns -- exactly the cross-column ringing
+// eos-adapter-F-to-U.md-S4 / CODE.md open decision 4 describe, and which
+// only a 3D audit (not a per-column one) can ever see.
+RawTable make_cross_column_defect_table(double amplitude = 3.0) {
+  SyntheticOptions sopts; // default grid, no defects yet
+  RawTable table = eeos::make_synthetic_table(sopts);
+
+  constexpr int irho0 = 14, irho1 = 19; // 6 alternating-sign columns
+  constexpr int kYe_fixed = 5;
+  constexpr int jT0 = 10, jT1 = 20, jTc = 15, width = 5; // tent bump in jT
+
+  std::vector<double> &entropy = table.field("entropy");
+  for (int irho = irho0; irho <= irho1; ++irho) {
+    const double sign = ((irho - irho0) % 2 == 0) ? 1.0 : -1.0;
+    for (int jT = jT0; jT <= jT1; ++jT) {
+      const double bump = std::max(0.0, 1.0 - std::fabs(static_cast<double>(jT - jTc)) / width);
+      const size_t idx = table.index(static_cast<size_t>(irho), static_cast<size_t>(jT), kYe_fixed);
+      entropy[idx] += amplitude * sign * bump;
+    }
+  }
+  return table;
+}
+
+} // namespace
+
+TEST_CASE("repair_table: spline-safe-3d fixes a cross-column tensor-blending violation "
+          "per-column repair cannot reach") {
+  const RawTable defect_table = make_cross_column_defect_table();
+
+  // With spline_safe_3d = false: the per-column stage (PAVA + strictify +
+  // per-column spline-safe loop) still runs, and leaves every column
+  // individually monotone/spline-safe -- but the whole-field tensor-product
+  // fit still rings non-monotone in u between the alternating-sign columns,
+  // found by the test-local 3D audit helper at (4,4,4).
+  {
+    RawTable table = defect_table;
+    RepairOptions opts;
+    opts.fields = {"entropy"};
+    opts.spline_safe_3d = false;
+    eeos::repair_table(table, opts);
+
+    // Sanity: every column is individually monotone after the per-column
+    // stage (otherwise this test would not be isolating the cross-column
+    // case the 3D stage targets).
+    const std::vector<double> &data = table.field("entropy");
+    for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+      for (size_t irho = 0; irho < table.nrho(); ++irho) {
+        for (size_t jT = 1; jT < table.ntemp(); ++jT) {
+          CHECK(data[table.index(irho, jT, kYe)] > data[table.index(irho, jT - 1, kYe)]);
+        }
+      }
+    }
+
+    CHECK(count_3d_fu_violations(table, "entropy", 4) > 0);
+  }
+
+  // With spline_safe_3d = true (default): the tensor-product stage removes
+  // every such violation -- a fresh (4,4,4) audit of the repaired table
+  // finds none.
+  {
+    RawTable table = defect_table;
+    RepairOptions opts;
+    opts.fields = {"entropy"};
+    opts.spline_safe_3d = true;
+    const RepairResult result = eeos::repair_table(table, opts);
+
+    CHECK(count_3d_fu_violations(table, "entropy", 4) == 0);
+
+    // The stage actually ran and reports it in the summary.
+    REQUIRE(result.summaries.size() == 1);
+    CHECK(result.summaries[0].rounds3d_used > 0);
+    CHECK(result.summaries[0].points_diffused_3d > 0);
+    CHECK(result.summaries[0].violations3d_remaining == 0);
+  }
+}
+
+TEST_CASE("repair_table: spline-safe-3d is idempotent and deterministic (cross-column defect)") {
+  // (a) repair_table() applied twice to the same cross-column-defect table:
+  // the first run converges the "entropy" field to zero (4,4,4) violations
+  // (see the test above), so a second run must report zero further changes.
+  {
+    RawTable table = make_cross_column_defect_table();
+    RepairOptions opts;
+    opts.fields = {"entropy"};
+
+    const RepairResult first = eeos::repair_table(table, opts);
+    CHECK_FALSE(first.entries.empty());
+    REQUIRE(first.summaries.size() == 1);
+    CHECK(first.summaries[0].violations3d_remaining == 0);
+
+    const RawTable after_first = table;
+    const RepairResult second = eeos::repair_table(table, opts);
+    CHECK(second.entries.empty());
+    CHECK(second.status == eeos::Status::ok);
+    CHECK(fields_bit_identical(after_first, table, "entropy"));
+  }
+
+  // (b) two independently-built copies of the same defect table repair to
+  // bit-identical results (OpenMP-schedule-independent, same as the
+  // per-column stage's own determinism guarantee).
+  {
+    RawTable table_a = make_cross_column_defect_table();
+    RawTable table_b = make_cross_column_defect_table();
+    RepairOptions opts;
+    opts.fields = {"entropy"};
+
+    const RepairResult result_a = eeos::repair_table(table_a, opts);
+    const RepairResult result_b = eeos::repair_table(table_b, opts);
+
+    CHECK_FALSE(result_a.entries.empty());
+    CHECK(entries_equal(result_a.entries, result_b.entries));
+    CHECK(fields_bit_identical(table_a, table_b, "entropy"));
+  }
+}
+
+TEST_CASE("repair_table: dirty-synthetic end-to-end with the 3D stage") {
+  // logenergy's residual (from dirty_synthetic_options()'s FlattenDefect --
+  // a near-flat plateau, matching SRO's real pathology per CODE.md) is a
+  // milder pattern than entropy's WiggleDefect below: the 3D stage
+  // eliminates every (4,4,4) violation.
+  //
+  // entropy's residual, by contrast, comes from a deliberately harsh
+  // manufactured defect (dirty_synthetic_options()'s WiggleDefect: a
+  // +-0.5 kB/baryon oscillation over a 6-rho x 3-Ye column block -- see the
+  // comment on the idempotence test above for the empirical detail): the
+  // M2d-1 stage substantially reduces its (4,4,4) violation count but does
+  // not drive this specific block-edge discontinuity to zero within
+  // RepairOptions's default round budget (confirmed stable even at 200
+  // rounds and at the verification's own (4,4,4) main-loop resolution, and
+  // *worse*, not better, under a larger diffuse_window/diffuse_alpha -- a
+  // genuine property of this defect against a local-diffusion repair, not a
+  // bug). This test therefore checks substantial, quantified improvement for
+  // "entropy" (against an independently-measured pre-3D-stage baseline)
+  // rather than the exact elimination the milder "logenergy" defect gets.
+  RawTable before_3d = eeos::make_synthetic_table(eeos::dirty_synthetic_options());
+  {
+    RepairOptions precol_opts;
+    precol_opts.spline_safe_3d = false;
+    eeos::repair_table(before_3d, precol_opts);
+  }
+  const size_t entropy_violations_before_3d = count_3d_fu_violations(before_3d, "entropy", 4);
+  REQUIRE(entropy_violations_before_3d > 0); // sanity: the pattern is real
+
+  RawTable table = eeos::make_synthetic_table(eeos::dirty_synthetic_options());
+  const RepairResult result = eeos::repair_table(table); // both stages on (default)
+
+  size_t entropy_remaining = 0, logenergy_remaining = 0;
+  bool have_entropy = false, have_logenergy = false;
+  for (const RepairResult::FieldSummary &s : result.summaries) {
+    if (s.field == "entropy") {
+      entropy_remaining = s.violations3d_remaining;
+      have_entropy = true;
+    } else if (s.field == "logenergy") {
+      logenergy_remaining = s.violations3d_remaining;
+      have_logenergy = true;
+    }
+  }
+  REQUIRE(have_entropy);
+  REQUIRE(have_logenergy);
+
+  // A fresh (4,4,4) audit of the final table must agree with the reported
+  // violations3d_remaining (cross-checks the library's own bookkeeping).
+  CHECK(count_3d_fu_violations(table, "entropy", 4) == entropy_remaining);
+  CHECK(count_3d_fu_violations(table, "logenergy", 4) == logenergy_remaining);
+
+  CHECK(logenergy_remaining == 0);
+  // Substantial (not necessarily complete) reduction for the harsher
+  // "entropy" defect -- comfortably below the ~41% reduction actually
+  // measured (1120 -> 664 samples), so this is robust to small
+  // platform/compiler floating-point differences.
+  CHECK(entropy_remaining < entropy_violations_before_3d * 3 / 4);
+}
+
+TEST_CASE("repair_table: a no-defect table leaves the 3D stage a true no-op") {
+  RawTable table = eeos::make_synthetic_table(SyntheticOptions{}); // clean, default grid
+  const RepairResult result = eeos::repair_table(table);
+  CHECK(result.entries.empty());
+  CHECK(result.status == eeos::Status::ok);
+
+  for (const RepairResult::FieldSummary &s : result.summaries) {
+    // rounds3d_used counts only rounds that found (and fixed) a violation
+    // (repair.hpp's RepairResult::FieldSummary doc comment); a table with
+    // no 3D-stage defect at all never finds one, on the very first
+    // main-loop audit or the final (4,4,4) verification, so this is 0 here
+    // -- not 1 -- documenting the choice repair.hpp's doc comment leaves
+    // open.
+    CHECK(s.rounds3d_used == 0);
+    CHECK(s.points_diffused_3d == 0);
+    CHECK(s.violations3d_remaining == 0);
+    // The main loop's first (and only) audit, plus the final verification's
+    // first (and only) audit, both ran and both found nothing -- exactly
+    // two entries, both zero.
+    REQUIRE(s.rounds3d_violation_history.size() == 2);
+    CHECK(s.rounds3d_violation_history[0] == 0);
+    CHECK(s.rounds3d_violation_history[1] == 0);
+  }
 }

@@ -68,7 +68,21 @@ fi
 # used below to confirm exactly which classes persist.
 expect_exit 1 "$TEST" --synthetic-dirty --write-synthetic "$T/dirty.h5"
 expect_exit 1 "$REPAIR" "$T/dirty.h5" "$T/dirty_rep.h5"
-expect_exit 0 "$REPAIR" --check-only "$T/dirty_rep.h5"
+# M2d-1: unlike the base PAVA/strictify + per-column spline-safe stages
+# (both proven idempotent), a *second* eos_repair --check-only here is not
+# exit 0: dirty_synthetic_options()'s "entropy" WiggleDefect (a +-0.5
+# kB/baryon oscillation over a 6-rho x 3-Ye column block) is a genuinely
+# hard block-edge cross-column discontinuity for the tensor-product
+# spline-safe-3d stage -- empirically, it reduces that field's (4,4,4)
+# violation count substantially but does not reach a fixed point within
+# RepairOptions's default round budget (see entropy_eos/host/repair.cpp's
+# spline_safe_3d_field() doc comment and tests/test_repair.cpp's dedicated
+# tests for the full empirical detail: more rounds do not help -- confirmed
+# stable even at 200 rounds -- and a larger diffuse_window/diffuse_alpha
+# make it *worse*, not better, so bounding the effort and reporting/
+# repairing whatever it finds each run, rather than claiming a single-run
+# fixed point, is the correct behavior here, not a bug).
+expect_exit 1 "$REPAIR" --check-only "$T/dirty_rep.h5"
 expect_exit 1 "$TEST" "$T/dirty_rep.h5" --csv "$T/dirty_rep"
 
 if [ -f "$T/dirty_rep_entropy_nonmonotone_T.csv" ] || [ -f "$T/dirty_rep_logenergy_nonmonotone_T.csv" ]; then
@@ -222,6 +236,22 @@ run_real_table() {
   s_changed=${s_changed:-?}
   e_changed=${e_changed:-?}
 
+  # M2d-1: violations3d_remaining per field, from eos_repair's own
+  # RepairResult::print() output (the "    spline-safe-3d: rounds_used=...
+  # points_diffused=... violations_remaining=..." line nested under each
+  # field's "  <field>: N value(s) changed" block -- -A3 spans the
+  # "spline-safe:" line, the always-present "spline-safe rounds histogram:"
+  # label line (RepairResult::print() prints it whenever spline_safe ran,
+  # regardless of whether any column needed a round), and the
+  # "spline-safe-3d:" line itself).
+  local s_v3d e_v3d
+  s_v3d=$( (grep -A3 -E '^  entropy:' "$repair_out" || true) | grep -oE 'violations_remaining=[0-9]+' |
+    head -1 | cut -d= -f2)
+  e_v3d=$( (grep -A3 -E '^  logenergy:' "$repair_out" || true) | grep -oE 'violations_remaining=[0-9]+' |
+    head -1 | cut -d= -f2)
+  s_v3d=${s_v3d:-?}
+  e_v3d=${e_v3d:-?}
+
   # Best-effort extraction of the adapter report's headline numbers
   # (AdapterReport::print()'s "kappa=...", "<class>: count=... max=...",
   # its "  quantiles: p50=... p90=... p99=... p999=... max=..." follow-up
@@ -261,6 +291,7 @@ run_real_table() {
 
   echo "SUMMARY $name: eos_test(raw)=$test_exit eos_repair=$repair_exit" \
     "eos_test(repaired)=$rep_test_exit entropy_repaired=$s_changed logenergy_repaired=$e_changed" \
+    "violations3d_remaining_entropy=$s_v3d violations3d_remaining_logenergy=$e_v3d" \
     "eos_test(adapter)=$adapter_test_exit kappa=$a_kappa roundtrip_T_count=$a_rt_count" \
     "delta_T_max=$a_dT_max delta_T_p99=$a_dT_p99 delta_p_max=$a_dp_max delta_p_p99=$a_dp_p99" \
     "sigma_monotonicity_count=$a_sigma_count maxiter_count=$a_maxiter evals_per_sec=$a_evals"

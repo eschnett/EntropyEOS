@@ -249,8 +249,16 @@ and OpenMP builds).
   cold-start round trips land on wrong roots at 11 (LS220) / 711 (SRO) of ~4M nodes;
   soak physicality: T̂≤0 and cs²≤0 at ≤1 random point per 50k, cs²≥1 at ~4% of
   uniform-in-log samples (concentrated at the extreme-ρ corner — map before M3).
-  Addressing the residual (2D/3D audit-driven smoothing vs. flag-and-guard in
-  con2prim) is folded into stage (d).
+- **M2d-1 outcome — local diffusion has a safe limit.** A 3D audit-driven diffusion
+  stage was built and *empirically bounded*: in wide near-flat regions (logenergy at
+  low T, where ε ≪ energy_shift makes the margin razor-thin) a diffusion step aimed at
+  one violation tips barely-positive neighbors negative and the counts run away
+  10–100×. The stage therefore tracks the best state seen, reverts after 4
+  non-improving rounds, and is backstopped to never leave a field worse than skipping
+  it. Net effect on real tables: SRO σ_u 6201→3844 (multi-root nodes 711→610),
+  everything else safely reverted to baseline; idempotence holds on both real tables
+  (second run: zero changes). The adversarial synthetic wiggle defect does not reach a
+  single-run fixed point and is documented as such in integration.sh.
 
 ## Milestones
 
@@ -275,5 +283,10 @@ and OpenMP builds).
    per-table override via `BuildOptions::m_B_table_g` / `eos_test --m-B`.
 3. Whether/when an `extern "C"` shim for C/Fortran consumers is warranted (not before a
    concrete consumer asks).
-4. Residual cross-column spline violations and multi-root pockets: 2D/3D audit-driven
-   smoothing vs. flag-and-guard in con2prim — decide in M2 stage (d).
+4. ~~Residual cross-column spline violations and multi-root pockets~~ — resolved:
+   **accept and guard**. Data-side local diffusion has hit its safe limit (M2d-1
+   outcome above); the residual pockets are mapped by the audits, harm random states
+   at the ≤1-per-50k level, and the safeguarded T-solve never fails on them — so
+   con2prim (M3) guards against them (flags, fallback), and shape-constrained
+   monotone tensor fitting is deferred unless M3 testing shows actual recovery
+   failures.
