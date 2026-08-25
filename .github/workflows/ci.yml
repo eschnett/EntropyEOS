@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install HDF5
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
+
+      - name: Build and run tests (OpenMP)
+        run: make test OPENMP=-fopenmp CXX=g++
+
+      - name: Clean
+        run: make clean
+
+      - name: Build and run tests (OpenMP + ASan/UBSan)
+        run: make test SAN=1 OPENMP=-fopenmp CXX=g++

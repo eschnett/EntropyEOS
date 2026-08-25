@@ -1,0 +1,20 @@
+# Object files
+*.o
+*.obj
+
+# Static/shared libraries
+*.a
+*.so
+*.dylib
+
+# Test and tool binaries
+tests/test_*
+!tests/test_*.cpp
+tools/eos_repair
+tools/eos_test
+
+# macOS debug-symbol bundles (clang -g)
+*.dSYM/
+
+# macOS
+.DS_Store
