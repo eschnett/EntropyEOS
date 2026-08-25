@@ -367,7 +367,16 @@ feature. Alternatives, all built and validated against the reference adapter:
    $\sigma := -f_{\hat T}$, $e := f - \hat T f_{\hat T}$ before applying §2. Then $F$
    itself becomes consistent, $\hat T = T_F$ exactly, and the two-temperatures issue of
    §3.2 disappears — at the price of least-squares deviations from the raw $\epsilon, s$
-   columns. This slots in without changing anything downstream.
+   columns. This slots in without changing anything downstream. Two caveats: (i) no
+   standard format stores $f$, so it is assembled pointwise from the same two columns —
+   the single-potential route reduces the number of *fitted* objects, not the number of
+   columns read; (ii) since $e, \sigma$ become first derivatives of $f$, the solver's
+   $U_{\rho\rho}, U_{\rho s}$ need **third** derivatives of $f$
+   ($\sigma_{TT} = -f_{\hat T\hat T\hat T}$), which a cubic spline cannot supply
+   continuously — the refit requires quintic ($C^4$) tensor-product splines
+   ($6^3$-point evaluation instead of $4^3$), exactly why the Helmholtz EOS of Timmes &
+   Swesty interpolates biquintically. The two-spline default needs only $C^2$ cubics
+   because it never differentiates a fitted quantity more than twice.
 
 ## 10. Audits and tests (build-time artifacts)
 

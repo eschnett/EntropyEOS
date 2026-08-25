@@ -198,6 +198,30 @@ projects the tests carry no weight for consumers and may grow arbitrarily heavy.
 a minimal GitHub Actions workflow: `apt-get install libhdf5-dev`, `make test` (serial
 and OpenMP builds).
 
+## M2 design notes
+
+- **Uniform knots.** The B-spline layer requires uniformly spaced axes (in log10 ρ,
+  log10 T, linear Ye) — true for stellarcollapse tables and the synthetic generator,
+  asserted at adapter build. Uniformity makes evaluation branch-light and GPU-friendly
+  (cell index by one multiply, fixed basis polynomials); non-uniform axes (CompOSE?)
+  would need a general de Boor layer later.
+- **Fitted quantities are the stored ones**: `logenergy` (log10(ε+Δ)) and `entropy`,
+  bit-verbatim, with the log10 factors handled analytically in the chain rule — no
+  conversion noise enters the fit.
+- **Unit contract of the adapter** (where percent-level bugs live, so fixed here):
+  ρ in g/cm³ *rescaled by κ* (§ energy zero point of the adapter doc), U = ε/c²
+  (dimensionless), p reported as p/c² in g/cm³ (so h = 1 + U + p/ρ is dimensionless),
+  s in k_B/baryon, T̂ = U_s = k_B T/(m_B\* c²) dimensionless; the solved table
+  temperature T_F is reported alongside in MeV. m_B\* = κ·m_B with m_B the table
+  convention (default amu; see open decision) — note that the δ_T audit effectively
+  *measures* the table's true m_B, and its value is reported.
+- **Staged delivery**: (a) B-spline fit/eval with exactness+convergence tests;
+  (b) adapter core — κ re-zeroing, warm-started monotone T-solve, chain rule, EOSPoint,
+  srange, flags — with out-of-range s/ρ *clamped and flagged* as a stopgap;
+  (c) `eos_test --level adapter` audit suite (the adapter doc §10 list), validated
+  against the closed-form U(ρ,s,Ye) of the synthetic gas; (d) the smooth C¹/C²
+  domain extensions of adapter doc §7 replacing the clamps, re-audited.
+
 ## Milestones
 
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,
