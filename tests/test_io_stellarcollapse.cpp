@@ -331,6 +331,61 @@ TEST_CASE("write_stellarcollapse (with source): passthrough round trip is exact"
   CHECK(read_scalar_number(path_b, "pointsye") == static_cast<long long>(b.nye()));
 }
 
+// --- (2b) opaque-blob passthrough without a real table -----------------------
+//
+// Exercises the same opaque-provenance-blob passthrough guarantee as (5)'s
+// "SRO opaque blob survives byte-identical" test, but entirely with a
+// synthetic table and a hand-added dataset -- no tables/*.h5 file required,
+// so this runs (and matters) in CI, which has no real tables.
+
+TEST_CASE("write_stellarcollapse (with source): a hand-added opaque uint8 blob survives "
+          "byte-identical with no real table present") {
+  SyntheticOptions opts;
+  opts.nrho = 6;
+  opts.ntemp = 5;
+  opts.nye = 3;
+  RawTable table = eeos::make_synthetic_table(opts);
+
+  const std::string path_in = scratch_path("fake_provenance_in.h5");
+  eeos::write_stellarcollapse(path_in, table);
+
+  // A few hundred fixed, non-constant bytes (not all-zero/all-equal, so a
+  // bug that zeroes or constant-fills the copy would still be caught).
+  std::vector<unsigned char> blob(300);
+  for (size_t i = 0; i < blob.size(); ++i) {
+    blob[i] = static_cast<unsigned char>((i * 37 + 11) % 256);
+  }
+
+  {
+    H5Guard file(H5Fopen(path_in.c_str(), H5F_ACC_RDWR, H5P_DEFAULT), H5Fclose);
+    REQUIRE(file.valid());
+    const hsize_t dim = static_cast<hsize_t>(blob.size());
+    H5Guard space(H5Screate_simple(1, &dim, nullptr), H5Sclose);
+    REQUIRE(space.valid());
+    H5Guard dset(H5Dcreate(file.get(), "FAKE-provenance.in", H5T_NATIVE_UCHAR, space.get(),
+                            H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT),
+                 H5Dclose);
+    REQUIRE(dset.valid());
+    REQUIRE(H5Dwrite(dset.get(), H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, blob.data()) >= 0);
+  }
+
+  // read_stellarcollapse() must leave the blob out of the RawTable entirely
+  // (it matches none of the axis/field/attribute rules), while the real
+  // fields are unaffected.
+  RawTable read_back = eeos::read_stellarcollapse(path_in);
+  CHECK_FALSE(read_back.has_field("FAKE-provenance.in"));
+  CHECK(read_back.has_field("logenergy"));
+  CHECK(read_back.has_field("entropy"));
+  CHECK(read_back.has_field("logpress"));
+
+  const std::string path_out = scratch_path("fake_provenance_out.h5");
+  eeos::write_stellarcollapse(path_out, read_back, path_in);
+
+  const std::vector<unsigned char> blob_out = read_raw_dataset_bytes(path_out, "FAKE-provenance.in");
+  REQUIRE(blob_out.size() == blob.size());
+  CHECK(blob_out == blob);
+}
+
 // --- (3) append_repair_group -------------------------------------------------
 
 TEST_CASE("append_repair_group: writes group contents and attributes correctly") {

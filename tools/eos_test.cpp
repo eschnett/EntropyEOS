@@ -9,7 +9,8 @@
 // whether any hard violation was found. No physics or table logic lives here
 // -- see entropy_eos/host/{check,synthetic}.hpp for that.
 //
-//   eos_test [--level table] (FILE.h5 | --synthetic | --synthetic-seeded)
+//   eos_test [--level table] (FILE.h5 | --synthetic | --synthetic-seeded |
+//                              --synthetic-dirty)
 //            [--write-synthetic PATH] [--csv PREFIX] [--tol X] [--worst N]
 //            [--m-B GRAMS]
 //
@@ -39,11 +40,13 @@ void print_usage(std::ostream &os) {
         "  eos_test [--level table] FILE.h5 [options]\n"
         "  eos_test [--level table] --synthetic [options]\n"
         "  eos_test [--level table] --synthetic-seeded [options]\n"
+        "  eos_test [--level table] --synthetic-dirty [options]\n"
         "\n"
         "Runs check_table() (CODE.md \"Test harness\") against a stellarcollapse-\n"
-        "format table, an in-memory synthetic ideal-gas table, or a synthetic\n"
-        "table with 4 deliberately seeded monotonicity violations, and prints a\n"
-        "human-readable report to stdout.\n"
+        "format table, an in-memory synthetic ideal-gas table, a synthetic table\n"
+        "with 4 deliberately seeded monotonicity violations, or a synthetic table\n"
+        "with a fixed set of deterministic defects mimicking real LS220/SRO table\n"
+        "pathologies, and prints a human-readable report to stdout.\n"
         "\n"
         "input (exactly one required):\n"
         "  FILE.h5              read a stellarcollapse-format table from FILE.h5\n"
@@ -51,14 +54,21 @@ void print_usage(std::ostream &os) {
         "  --synthetic-seeded   like --synthetic, plus 4 seeded violations (two on\n"
         "                       \"entropy\", two on \"logenergy\") at interior grid\n"
         "                       points, printed to stdout before the report\n"
+        "  --synthetic-dirty    use dirty_synthetic_options(): default grid, aux\n"
+        "                       fields (cs2/gamma/mu_e), and a fixed deterministic\n"
+        "                       defect set (a wiggle-induced entropy\n"
+        "                       non-monotone-T cluster, a logenergy plateau, a\n"
+        "                       negative-entropy cold corner, and planted\n"
+        "                       Inf/NaN in cs2/gamma) mimicking pathologies found\n"
+        "                       in the real LS220/SRO tables\n"
         "\n"
         "options:\n"
         "  --level LEVEL        check level; only \"table\" is implemented (default).\n"
         "                       Other values exit 64 with a stub message (M2/M3 add\n"
         "                       \"adapter\" / \"con2prim\").\n"
         "  --write-synthetic PATH  write the generated synthetic table to PATH (only\n"
-        "                          valid together with --synthetic or\n"
-        "                          --synthetic-seeded)\n"
+        "                          valid together with --synthetic,\n"
+        "                          --synthetic-seeded, or --synthetic-dirty)\n"
         "  --csv PREFIX         for every check class with count > 0, write\n"
         "                       PREFIX_<class>.csv (header: irho,jT,kYe,rho,temp,ye,\n"
         "                       value), one row per worst-offender entry. The list\n"
@@ -83,6 +93,7 @@ struct ParsedArgs {
   std::string level = "table";
   bool synthetic = false;
   bool synthetic_seeded = false;
+  bool synthetic_dirty = false;
   std::string file_path;
   bool have_write_synthetic = false;
   std::string write_synthetic_path;
@@ -108,6 +119,8 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
       out.synthetic = true;
     } else if (a == "--synthetic-seeded") {
       out.synthetic_seeded = true;
+    } else if (a == "--synthetic-dirty") {
+      out.synthetic_dirty = true;
     } else if (a == "--level") {
       if (i + 1 >= args.size()) {
         std::cerr << "eos_test: option '--level' requires a value\n\n";
@@ -194,17 +207,18 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
   }
   out.file_path = out.positionals.empty() ? std::string() : out.positionals[0];
 
-  const int n_inputs =
-      (!out.file_path.empty() ? 1 : 0) + (out.synthetic ? 1 : 0) + (out.synthetic_seeded ? 1 : 0);
+  const int n_inputs = (!out.file_path.empty() ? 1 : 0) + (out.synthetic ? 1 : 0) +
+                       (out.synthetic_seeded ? 1 : 0) + (out.synthetic_dirty ? 1 : 0);
   if (n_inputs != 1) {
-    std::cerr << "eos_test: specify exactly one of FILE.h5, --synthetic, --synthetic-seeded\n\n";
+    std::cerr << "eos_test: specify exactly one of FILE.h5, --synthetic, --synthetic-seeded, "
+                 "--synthetic-dirty\n\n";
     print_usage(std::cerr);
     return false;
   }
 
-  if (out.have_write_synthetic && !(out.synthetic || out.synthetic_seeded)) {
-    std::cerr << "eos_test: --write-synthetic is only valid together with --synthetic or "
-                 "--synthetic-seeded\n\n";
+  if (out.have_write_synthetic && !(out.synthetic || out.synthetic_seeded || out.synthetic_dirty)) {
+    std::cerr << "eos_test: --write-synthetic is only valid together with --synthetic, "
+                 "--synthetic-seeded, or --synthetic-dirty\n\n";
     print_usage(std::cerr);
     return false;
   }
@@ -252,6 +266,35 @@ int main(int argc, char **argv) {
     eeos::RawTable table;
     if (!pa.file_path.empty()) {
       table = eeos::read_stellarcollapse(pa.file_path);
+    } else if (pa.synthetic_dirty) {
+      eeos::SyntheticOptions sopts = eeos::dirty_synthetic_options();
+      std::cout << "eos_test --synthetic-dirty: dirty_synthetic_options() ("
+                << sopts.flatten.size() << " flatten, " << sopts.wiggle.size() << " wiggle, "
+                << sopts.offset.size() << " offset, " << sopts.setvalue.size()
+                << " setvalue defect(s), aux fields "
+                << (sopts.with_aux_fields ? "on" : "off") << "):\n";
+      for (const eeos::FlattenDefect &d : sopts.flatten) {
+        std::cout << "  flatten " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
+                   << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1 << "]\n";
+      }
+      for (const eeos::WiggleDefect &d : sopts.wiggle) {
+        std::cout << "  wiggle " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
+                   << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1
+                   << "] amplitude=" << d.amplitude << " period=" << d.period << "\n";
+      }
+      for (const eeos::OffsetDefect &d : sopts.offset) {
+        std::cout << "  offset " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
+                   << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1
+                   << "] offset=" << d.offset << "\n";
+      }
+      for (const eeos::SetValue &v : sopts.setvalue) {
+        std::cout << "  setvalue " << v.field << " at (irho=" << v.irho << ", jT=" << v.jT
+                   << ", kYe=" << v.kYe << ") value=" << v.value << "\n";
+      }
+      table = eeos::make_synthetic_table(sopts);
+      if (pa.have_write_synthetic) {
+        eeos::write_stellarcollapse(pa.write_synthetic_path, table);
+      }
     } else {
       eeos::SyntheticOptions sopts; // defaults per CODE.md
       if (pa.synthetic_seeded) {

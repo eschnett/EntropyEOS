@@ -177,7 +177,20 @@ lives here, plus in `eos_repair --check-only`):
 for exactness and grid-convergence checks; `eos_test --synthetic` runs the whole suite
 against it (a clean synthetic table must report zero violations; deliberately seeded
 violations must be found and repaired). This makes M1 fully testable without any real
-table and without con2prim.
+table and without con2prim. A deterministic **dirty preset**
+(`eos_test --synthetic-dirty`) additionally fabricates the pathology patterns observed
+in the real tables — clustered non-monotone entropy across a T-window (LS220's nuclear
+transition), flat logenergy plateaus (SRO), a negative-entropy cold corner (SRO), and
+planted Inf/NaN in auxiliary fields (LS220's cs2/gamma) — so the full
+detect → repair → residual-classes-persist narrative runs in CI.
+
+**Real tables are local-only.** CI never downloads or stores the LS220/SRO files
+(~1 GB; Git LFS quotas and stellarcollapse.org bandwidth both rule it out);
+`tests/integration.sh` runs them when present under `tables/` (see
+`tables/README.md`) and skips them gracefully otherwise. Future options if per-PR
+real-data coverage is ever wanted: committed ~10 MB crops of the pathological regions
+(via an `eos_crop` tool with provenance attributes), and/or a scheduled weekly workflow
+restoring the full tables from the Actions cache.
 
 **Unit tests and CI:** doctest, as a single vendored header committed to `tests/` —
 nothing to install, fast to compile, and since `tests/` is not copied into downstream

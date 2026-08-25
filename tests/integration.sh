@@ -4,8 +4,15 @@
 #
 # Run from the repository root (paths below are relative to the CWD);
 # `make integration` does this after building the tools. Part A (synthetic)
-# is table-free and always runs, including in CI. Part B exercises the two
-# real stellarcollapse-format tables under tables/*.h5 when present on this
+# is table-free and always runs, including in CI. Its second half (steps
+# 8-11 below) drives --synthetic-dirty, a fixed deterministic defect preset
+# (entropy_eos/host/synthetic.hpp's dirty_synthetic_options()) that mirrors
+# pathologies actually found in the real LS220/SRO stellarcollapse tables --
+# a handful of non-finite cs2/gamma points, a clustered non-monotone-T
+# entropy patch, a near-flat logenergy plateau, and slightly negative
+# cold-corner entropies -- so CI (which has no tables/*.h5) still exercises
+# eos_test/eos_repair against them. Part B exercises the two real
+# stellarcollapse-format tables under tables/*.h5 when present on this
 # machine, and is skipped gracefully (not failed) when they are absent.
 
 set -euo pipefail
@@ -36,6 +43,7 @@ expect_exit() {
 
 echo "=== Part A: synthetic (table-free, CI-safe) ==="
 
+# 1-6: --synthetic-seeded (four seeded monotonicity violations) round trip.
 expect_exit 0 "$TEST" --synthetic
 expect_exit 1 "$TEST" --synthetic-seeded --write-synthetic "$T/seeded.h5"
 expect_exit 1 "$REPAIR" --check-only "$T/seeded.h5"
@@ -43,10 +51,37 @@ expect_exit 1 "$REPAIR" "$T/seeded.h5" "$T/repaired.h5" --log "$T/repair.log"
 expect_exit 0 "$TEST" "$T/repaired.h5"                     # clean after repair
 expect_exit 0 "$REPAIR" --check-only "$T/repaired.h5"      # idempotent through files
 
+# 7:
 if grep -q "logenergy" "$T/repair.log"; then
   echo "PASS: repair.log mentions a repaired field (logenergy)"
 else
   echo "FAIL: repair.log does not mention 'logenergy'"
+  exit 1
+fi
+
+# 8-11: --synthetic-dirty (LS220/SRO-mimicking defect preset) round trip.
+# Unlike the seeded case above, repair cannot make this table fully clean by
+# design: "entropy_negative" (the offset cold corner) and "nonfinite_cs2"/
+# "nonfinite_gamma" (the planted Inf/NaN) are untouched by repair_table(),
+# which only ever acts on "entropy"/"logenergy" monotonicity -- so eos_test
+# on the repaired table is expected to still exit 1, and its CSV dump is
+# used below to confirm exactly which classes persist.
+expect_exit 1 "$TEST" --synthetic-dirty --write-synthetic "$T/dirty.h5"
+expect_exit 1 "$REPAIR" "$T/dirty.h5" "$T/dirty_rep.h5"
+expect_exit 0 "$REPAIR" --check-only "$T/dirty_rep.h5"
+expect_exit 1 "$TEST" "$T/dirty_rep.h5" --csv "$T/dirty_rep"
+
+if [ -f "$T/dirty_rep_entropy_nonmonotone_T.csv" ] || [ -f "$T/dirty_rep_logenergy_nonmonotone_T.csv" ]; then
+  echo "FAIL: repaired dirty table still shows entropy/logenergy nonmonotone-T violations"
+  exit 1
+fi
+echo "PASS: repaired dirty table has zero entropy/logenergy nonmonotone-T violations"
+
+if [ -f "$T/dirty_rep_entropy_negative.csv" ] && [ -f "$T/dirty_rep_nonfinite_cs2.csv" ]; then
+  echo "PASS: repaired dirty table still reports entropy_negative and nonfinite_cs2, as designed" \
+    "(repair_table() never touches either)"
+else
+  echo "FAIL: expected dirty_rep_entropy_negative.csv and dirty_rep_nonfinite_cs2.csv to exist"
   exit 1
 fi
 

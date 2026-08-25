@@ -10,6 +10,7 @@
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/units.hpp"
 
+using eeos::dirty_synthetic_options;
 using eeos::RawTable;
 using eeos::SeededViolation;
 using eeos::SyntheticOptions;
@@ -237,4 +238,141 @@ TEST_CASE("synthetic table: multiple seeded violations are independent and local
   }
 
   CHECK(clean.field("logpress") == seeded.field("logpress"));
+}
+
+// --- (e) default options are unaffected by the new defect machinery --------
+
+TEST_CASE("synthetic table: default options (all defect vectors empty) are a no-op through the "
+          "defect-application code paths") {
+  SyntheticOptions defaults; // with_aux_fields=false, flatten/wiggle/offset/seed/setvalue all empty
+  RawTable a = eeos::make_synthetic_table(defaults);
+
+  // Same grid, but every defect vector cleared explicitly (redundant with
+  // the defaults above -- the point is to exercise apply_flatten/
+  // apply_wiggle/apply_offset/apply_setvalue with genuinely empty inputs and
+  // confirm they change nothing).
+  SyntheticOptions explicit_empty = defaults;
+  explicit_empty.flatten.clear();
+  explicit_empty.wiggle.clear();
+  explicit_empty.offset.clear();
+  explicit_empty.seed.clear();
+  explicit_empty.setvalue.clear();
+  RawTable b = eeos::make_synthetic_table(explicit_empty);
+
+  REQUIRE(a.field_names() == b.field_names());
+  for (const std::string &name : a.field_names()) {
+    CHECK(a.field(name) == b.field(name)); // vector<double>::operator== is bitwise exact
+  }
+  CHECK_FALSE(a.has_field("cs2"));
+  CHECK_FALSE(a.has_field("gamma"));
+  CHECK_FALSE(a.has_field("mu_e"));
+}
+
+// --- (f) dirty_synthetic_options(): the fixed LS220/SRO-mimicking preset ---
+//
+// Block coordinates below are the exact ones dirty_synthetic_options() uses
+// (see synthetic.cpp): wiggle on "entropy" over irho[30,35] x kYe[6,8] x
+// jT[10,20]; flatten on "logenergy" over irho[5,15] x kYe[2,4] x jT[3,12];
+// offset on "entropy" over irho[0,3] x kYe[0,2] x jT[0,2]; setvalue on "cs2"
+// at (20,15,5) (+Inf) and (21,16,5) (NaN), and on "gamma" at (20,15,5) (NaN).
+
+TEST_CASE("dirty_synthetic_options: default grid, aux fields present") {
+  RawTable table = eeos::make_synthetic_table(dirty_synthetic_options());
+  CHECK(table.nrho() == 40);
+  CHECK(table.ntemp() == 30);
+  CHECK(table.nye() == 10);
+  CHECK(table.has_field("cs2"));
+  CHECK(table.has_field("gamma"));
+  CHECK(table.has_field("mu_e"));
+}
+
+TEST_CASE("dirty_synthetic_options: planted Inf/NaN land at the exact coordinates") {
+  RawTable table = eeos::make_synthetic_table(dirty_synthetic_options());
+  const std::vector<double> &cs2 = table.field("cs2");
+  const std::vector<double> &gamma = table.field("gamma");
+
+  const double cs2_at_inf_point = cs2[table.index(20, 15, 5)];
+  CHECK(std::isinf(cs2_at_inf_point));
+  CHECK(cs2_at_inf_point > 0.0); // +Inf specifically, not -Inf
+  CHECK(std::isnan(cs2[table.index(21, 16, 5)]));
+  CHECK(std::isnan(gamma[table.index(20, 15, 5)]));
+}
+
+TEST_CASE("dirty_synthetic_options: offset block's entropy entries are all negative") {
+  RawTable table = eeos::make_synthetic_table(dirty_synthetic_options());
+  const std::vector<double> &entropy = table.field("entropy");
+  for (size_t kYe = 0; kYe <= 2; ++kYe) {
+    for (size_t irho = 0; irho <= 3; ++irho) {
+      for (size_t jT = 0; jT <= 2; ++jT) {
+        CHECK(entropy[table.index(irho, jT, kYe)] < 0.0);
+      }
+    }
+  }
+}
+
+TEST_CASE("dirty_synthetic_options: wiggle window has at least one decreasing adjacent T-pair in "
+          "entropy") {
+  RawTable table = eeos::make_synthetic_table(dirty_synthetic_options());
+  const std::vector<double> &entropy = table.field("entropy");
+
+  bool found_decreasing_pair = false;
+  for (size_t kYe = 6; kYe <= 8; ++kYe) {
+    for (size_t irho = 30; irho <= 35; ++irho) {
+      for (size_t jT = 10; jT < 20; ++jT) {
+        const double v0 = entropy[table.index(irho, jT, kYe)];
+        const double v1 = entropy[table.index(irho, jT + 1, kYe)];
+        if (v1 <= v0) {
+          found_decreasing_pair = true;
+        }
+      }
+    }
+  }
+  CHECK(found_decreasing_pair);
+}
+
+TEST_CASE("dirty_synthetic_options: flatten block is constant along its T-range") {
+  RawTable table = eeos::make_synthetic_table(dirty_synthetic_options());
+  const std::vector<double> &logenergy = table.field("logenergy");
+  for (size_t kYe = 2; kYe <= 4; ++kYe) {
+    for (size_t irho = 5; irho <= 15; ++irho) {
+      const double v0 = logenergy[table.index(irho, 3, kYe)];
+      for (size_t jT = 3; jT <= 12; ++jT) {
+        CHECK(logenergy[table.index(irho, jT, kYe)] == v0);
+      }
+    }
+  }
+}
+
+TEST_CASE("dirty_synthetic_options: no defects outside the specified blocks") {
+  // Same grid and aux fields, but no defects, for a fair bit-for-bit
+  // comparison against dirty_synthetic_options()'s table.
+  SyntheticOptions clean_opts;
+  clean_opts.with_aux_fields = true;
+  RawTable clean = eeos::make_synthetic_table(clean_opts);
+  RawTable dirty = eeos::make_synthetic_table(dirty_synthetic_options());
+
+  struct Point {
+    size_t irho, jT, kYe;
+  };
+  // Chosen to sit outside every defect block: flatten is irho[5,15] x
+  // kYe[2,4] x jT[3,12]; wiggle is irho[30,35] x kYe[6,8] x jT[10,20];
+  // offset is irho[0,3] x kYe[0,2] x jT[0,2]; setvalue hits exactly
+  // (20,15,5)/(21,16,5) in "cs2" and (20,15,5) in "gamma". Each point below
+  // fails at least one of the three range conditions for every block (a
+  // block only applies where irho, kYe, *and* jT are all in range at once),
+  // and none coincides with a setvalue point.
+  const std::vector<Point> far_points = {
+      {25, 25, 0}, {39, 0, 9}, {0, 29, 9}, {20, 0, 0}, {36, 20, 3}, {5, 20, 9},
+  };
+
+  const std::vector<std::string> field_names = {"entropy",   "logenergy", "logpress",
+                                                 "cs2",       "gamma",     "mu_e"};
+  for (const std::string &name : field_names) {
+    const std::vector<double> &clean_field = clean.field(name);
+    const std::vector<double> &dirty_field = dirty.field(name);
+    for (const Point &pt : far_points) {
+      const size_t idx = clean.index(pt.irho, pt.jT, pt.kYe);
+      CHECK(clean_field[idx] == dirty_field[idx]);
+    }
+  }
 }
