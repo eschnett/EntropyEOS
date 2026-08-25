@@ -1,26 +1,42 @@
-// tools/eos_test.cpp — M1 test harness, "--level table" (CODE.md "Test
-// harness"). One binary that will accrete "--level adapter" / "--level
-// con2prim" stages in M2/M3; this milestone implements only "table".
+// tools/eos_test.cpp — M1/M2c test harness: "--level table" (M1) and
+// "--level adapter" (M2c, CODE.md "Test harness" / eos-adapter-F-to-U.md
+// S10). One binary that will accrete a "--level con2prim" stage in M3; this
+// milestone implements "table" and "adapter".
 //
 // A thin main() over entropy_eos: loads a table (from a stellarcollapse
 // file, or an in-memory synthetic ideal-gas table, optionally with seeded
-// violations), runs check_table(), prints its report, optionally dumps the
-// worst offenders per class to CSV, and exits with a status summarizing
-// whether any hard violation was found. No physics or table logic lives here
-// -- see entropy_eos/host/{check,synthetic}.hpp for that.
+// violations or a fixed dirty-defect preset -- the same four input forms for
+// both levels), then either runs check_table() ("table") or repairs the
+// table in memory, builds an EntropyEOS, and runs check_adapter()
+// ("adapter"), printing a human-readable report and optionally dumping the
+// worst offenders per class to CSV. No physics or table logic lives here --
+// see entropy_eos/host/{check,adapter_audit,synthetic}.hpp for that.
 //
-//   eos_test [--level table] (FILE.h5 | --synthetic | --synthetic-seeded |
-//                              --synthetic-dirty)
+//   eos_test --level table (FILE.h5 | --synthetic | --synthetic-seeded |
+//                            --synthetic-dirty)
 //            [--write-synthetic PATH] [--csv PREFIX] [--tol X] [--worst N]
 //            [--m-B GRAMS]
+//   eos_test --level adapter (FILE.h5 | --synthetic | --synthetic-seeded |
+//                              --synthetic-dirty)
+//            [--write-synthetic PATH] [--csv PREFIX] [--worst N]
+//            [--no-repair] [--node-stride N] [--soak N]
 //
-// Exit codes: 2 = fatal structural problem; 1 = "entropy_negative",
+// Exit codes ("table"): 2 = fatal structural problem; 1 = "entropy_negative",
 // "entropy_nonmonotone_T", "logenergy_nonmonotone_T", or any
 // "nonfinite_<field>" class has count > 0 (the
 // Maxwell-consistency and cs2 classes are diagnostics only and never affect
 // the exit code); 0 = otherwise clean; 64 = usage error.
+//
+// Exit codes ("adapter"): 2 = build_entropy_eos() failed, or
+// check_adapter()'s report.status is fatal (a non-finite EOSPoint turned up
+// somewhere in the audit); 1 = adapter_needs_attention() (any monotonicity,
+// roundtrip_T, or physicality violation class has count > 0, or
+// maxiter_count > 0); 0 = otherwise clean; 64 = usage error. Like the table
+// level's Maxwell-consistency classes, "delta_T"/"delta_p" are diagnostics
+// only and never affect the exit code.
 
 #include "entropy_eos/entropy_eos.hpp"
+#include "entropy_eos/host/adapter_audit.hpp"
 
 #include <fstream>
 #include <iomanip>
@@ -37,15 +53,16 @@ constexpr int kExitUsage = 64;
 
 void print_usage(std::ostream &os) {
   os << "usage:\n"
-        "  eos_test [--level table] FILE.h5 [options]\n"
-        "  eos_test [--level table] --synthetic [options]\n"
-        "  eos_test [--level table] --synthetic-seeded [options]\n"
-        "  eos_test [--level table] --synthetic-dirty [options]\n"
+        "  eos_test [--level table|adapter] FILE.h5 [options]\n"
+        "  eos_test [--level table|adapter] --synthetic [options]\n"
+        "  eos_test [--level table|adapter] --synthetic-seeded [options]\n"
+        "  eos_test [--level table|adapter] --synthetic-dirty [options]\n"
         "\n"
-        "Runs check_table() (CODE.md \"Test harness\") against a stellarcollapse-\n"
-        "format table, an in-memory synthetic ideal-gas table, a synthetic table\n"
-        "with 4 deliberately seeded monotonicity violations, or a synthetic table\n"
-        "with a fixed set of deterministic defects mimicking real LS220/SRO table\n"
+        "Runs check_table() (\"--level table\", CODE.md \"Test harness\") or\n"
+        "check_adapter() (\"--level adapter\") against a stellarcollapse-format\n"
+        "table, an in-memory synthetic ideal-gas table, a synthetic table with 4\n"
+        "deliberately seeded monotonicity violations, or a synthetic table with a\n"
+        "fixed set of deterministic defects mimicking real LS220/SRO table\n"
         "pathologies, and prints a human-readable report to stdout.\n"
         "\n"
         "input (exactly one required):\n"
@@ -63,29 +80,54 @@ void print_usage(std::ostream &os) {
         "                       in the real LS220/SRO tables\n"
         "\n"
         "options:\n"
-        "  --level LEVEL        check level; only \"table\" is implemented (default).\n"
-        "                       Other values exit 64 with a stub message (M2/M3 add\n"
-        "                       \"adapter\" / \"con2prim\").\n"
+        "  --level LEVEL        check level: \"table\" (default) or \"adapter\".\n"
+        "                       \"con2prim\" is not implemented yet (M3): exits 64\n"
+        "                       with a stub message.\n"
         "  --write-synthetic PATH  write the generated synthetic table to PATH (only\n"
         "                          valid together with --synthetic,\n"
         "                          --synthetic-seeded, or --synthetic-dirty)\n"
         "  --csv PREFIX         for every check class with count > 0, write\n"
         "                       PREFIX_<class>.csv (header: irho,jT,kYe,rho,temp,ye,\n"
-        "                       value), one row per worst-offender entry. The list\n"
-        "                       is capped at --worst N; pass a large N for a full\n"
-        "                       dump.\n"
-        "  --tol X              CheckOptions::tol_consistency override\n"
-        "  --worst N            CheckOptions::worst_n override (also caps --csv)\n"
-        "  --m-B GRAMS          CheckOptions::m_B_g override\n"
+        "                       value), one row per worst-offender entry (--level\n"
+        "                       adapter's class A/C worst entries carry irho=jT=kYe=0,\n"
+        "                       since those audits are not evaluated at table nodes).\n"
+        "                       The list is capped at --worst N; pass a large N for a\n"
+        "                       full dump.\n"
+        "  --worst N            CheckOptions::worst_n / AdapterCheckOptions::worst_n\n"
+        "                       override (also caps --csv)\n"
+        "  --tol X              CheckOptions::tol_consistency override (--level table\n"
+        "                       only)\n"
+        "  --m-B GRAMS          CheckOptions::m_B_g override (--level table only)\n"
+        "  --no-repair          --level adapter only: skip the default in-memory\n"
+        "                       repair_table() pass and build directly from the\n"
+        "                       loaded table\n"
+        "  --node-stride N      --level adapter only: AdapterCheckOptions::node_stride\n"
+        "                       override (audit every Nth table node per axis;\n"
+        "                       default 1)\n"
+        "  --soak N             --level adapter only: AdapterCheckOptions::soak_n\n"
+        "                       override (physicality-soak sample count; default\n"
+        "                       200000)\n"
         "  -h, --help           print this message\n"
         "\n"
-        "exit codes:\n"
+        "exit codes (--level table):\n"
         "  0   status ok and no entropy/monotonicity violations\n"
         "  1   \"entropy_negative\", \"entropy_nonmonotone_T\",\n"
         "      \"logenergy_nonmonotone_T\", or any \"nonfinite_<field>\" class has\n"
         "      count > 0 (the Maxwell-consistency and cs2 classes are diagnostics\n"
         "      only and never affect the exit code)\n"
         "  2   fatal structural problem in the table (see the printed report)\n"
+        "  64  usage error\n"
+        "\n"
+        "exit codes (--level adapter):\n"
+        "  0   report.status ok and adapter_needs_attention() is false\n"
+        "  1   adapter_needs_attention(): any monotonicity ('spline_sigma_u_\n"
+        "      nonpositive', 'spline_L_u_nonpositive'), 'roundtrip_T', or\n"
+        "      physicality ('That_nonpositive', 'p_nonpositive', 'cs2_nonpositive',\n"
+        "      'cs2_acausal') class has count > 0, or the physicality soak hit the\n"
+        "      T-solve iteration cap at least once ('delta_T'/'delta_p' are\n"
+        "      diagnostics only and never affect the exit code)\n"
+        "  2   build_entropy_eos() failed (see stderr), or report.status is fatal\n"
+        "      (a non-finite EOSPoint turned up somewhere in the audit)\n"
         "  64  usage error\n";
 }
 
@@ -105,6 +147,11 @@ struct ParsedArgs {
   long long worst = 0;
   bool have_m_B = false;
   double m_B = 0.0;
+  bool no_repair = false;
+  bool have_node_stride = false;
+  long long node_stride = 0;
+  bool have_soak = false;
+  long long soak = 0;
   std::vector<std::string> positionals;
 };
 
@@ -191,6 +238,46 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
         return false;
       }
       out.have_m_B = true;
+    } else if (a == "--no-repair") {
+      out.no_repair = true;
+    } else if (a == "--node-stride") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_test: option '--node-stride' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.node_stride = std::stoll(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_test: invalid integer for --node-stride: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (out.node_stride < 1) {
+        std::cerr << "eos_test: --node-stride must be >= 1\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_node_stride = true;
+    } else if (a == "--soak") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_test: option '--soak' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.soak = std::stoll(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_test: invalid integer for --soak: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (out.soak < 0) {
+        std::cerr << "eos_test: --soak must be >= 0\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_soak = true;
     } else if (!a.empty() && a[0] == '-') {
       std::cerr << "eos_test: unknown option '" << a << "'\n\n";
       print_usage(std::cerr);
@@ -223,6 +310,12 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
     return false;
   }
 
+  if ((out.no_repair || out.have_node_stride || out.have_soak) && out.level != "adapter") {
+    std::cerr << "eos_test: --no-repair/--node-stride/--soak are only valid with --level adapter\n\n";
+    print_usage(std::cerr);
+    return false;
+  }
+
   return true;
 }
 
@@ -247,6 +340,165 @@ std::vector<eeos::SeededViolation> make_seeds(const eeos::SyntheticOptions &grid
   };
 }
 
+// Shared table loader for both --level table and --level adapter: exactly
+// one of FILE.h5 / --synthetic / --synthetic-seeded / --synthetic-dirty
+// (parse_args already enforced that), with the same stdout announcements
+// and optional --write-synthetic side effect either level produces.
+eeos::RawTable load_table(const ParsedArgs &pa) {
+  eeos::RawTable table;
+  if (!pa.file_path.empty()) {
+    table = eeos::read_stellarcollapse(pa.file_path);
+  } else if (pa.synthetic_dirty) {
+    eeos::SyntheticOptions sopts = eeos::dirty_synthetic_options();
+    std::cout << "eos_test --synthetic-dirty: dirty_synthetic_options() (" << sopts.flatten.size()
+              << " flatten, " << sopts.wiggle.size() << " wiggle, " << sopts.offset.size()
+              << " offset, " << sopts.setvalue.size() << " setvalue defect(s), aux fields "
+              << (sopts.with_aux_fields ? "on" : "off") << "):\n";
+    for (const eeos::FlattenDefect &d : sopts.flatten) {
+      std::cout << "  flatten " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
+                 << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1 << "]\n";
+    }
+    for (const eeos::WiggleDefect &d : sopts.wiggle) {
+      std::cout << "  wiggle " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
+                 << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1
+                 << "] amplitude=" << d.amplitude << " period=" << d.period << "\n";
+    }
+    for (const eeos::OffsetDefect &d : sopts.offset) {
+      std::cout << "  offset " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
+                 << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1
+                 << "] offset=" << d.offset << "\n";
+    }
+    for (const eeos::SetValue &v : sopts.setvalue) {
+      std::cout << "  setvalue " << v.field << " at (irho=" << v.irho << ", jT=" << v.jT
+                 << ", kYe=" << v.kYe << ") value=" << v.value << "\n";
+    }
+    table = eeos::make_synthetic_table(sopts);
+    if (pa.have_write_synthetic) {
+      eeos::write_stellarcollapse(pa.write_synthetic_path, table);
+    }
+  } else {
+    eeos::SyntheticOptions sopts; // defaults per CODE.md
+    if (pa.synthetic_seeded) {
+      sopts.seed = make_seeds(sopts);
+      std::cout << "eos_test --synthetic-seeded: seeding " << sopts.seed.size() << " violation(s):\n";
+      for (const eeos::SeededViolation &v : sopts.seed) {
+        std::cout << "  " << v.field << " at (irho=" << v.irho << ", jT=" << v.jT << ", kYe=" << v.kYe
+                   << ") delta=" << v.delta << "\n";
+      }
+    }
+    table = eeos::make_synthetic_table(sopts);
+    if (pa.have_write_synthetic) {
+      eeos::write_stellarcollapse(pa.write_synthetic_path, table);
+    }
+  }
+  return table;
+}
+
+// Shared CSV writer for both --level table (CheckReport::classes) and
+// --level adapter (AdapterReport::classes): one PREFIX_<class>.csv per class
+// with count > 0, one row per worst-offender entry (see print_usage()).
+void write_csv(const std::vector<eeos::CheckClassResult> &classes, const std::string &prefix) {
+  for (const eeos::CheckClassResult &c : classes) {
+    if (c.count == 0) {
+      continue;
+    }
+    const std::string path = prefix + "_" + c.name + ".csv";
+    std::ofstream csv(path);
+    if (!csv) {
+      throw std::runtime_error("could not open CSV file '" + path + "' for writing");
+    }
+    csv << "irho,jT,kYe,rho,temp,ye,value\n";
+    csv << std::setprecision(17);
+    for (const eeos::CheckClassResult::Loc &loc : c.worst) {
+      csv << loc.irho << "," << loc.jT << "," << loc.kYe << "," << loc.rho << "," << loc.temp << ","
+          << loc.ye << "," << loc.value << "\n";
+    }
+  }
+}
+
+int run_table_level(const ParsedArgs &pa) {
+  eeos::RawTable table = load_table(pa);
+
+  eeos::CheckOptions check_opts;
+  if (pa.have_m_B) {
+    check_opts.m_B_g = pa.m_B;
+  }
+  if (pa.have_tol) {
+    check_opts.tol_consistency = pa.tol;
+  }
+  if (pa.have_worst) {
+    check_opts.worst_n = static_cast<size_t>(pa.worst);
+  }
+
+  const eeos::CheckReport report = eeos::check_table(table, check_opts);
+  report.print(std::cout);
+
+  if (pa.have_csv) {
+    write_csv(report.classes, pa.csv_prefix);
+  }
+
+  if (report.status == eeos::Status::fatal) {
+    return kExitFatal;
+  }
+
+  bool hard_violation = false;
+  for (const eeos::CheckClassResult &c : report.classes) {
+    if (c.count == 0) {
+      continue;
+    }
+    if (c.name == "entropy_negative" || c.name == "entropy_nonmonotone_T" ||
+        c.name == "logenergy_nonmonotone_T" || c.name.rfind("nonfinite_", 0) == 0) {
+      hard_violation = true;
+    }
+  }
+  return hard_violation ? kExitViolation : kExitOk;
+}
+
+int run_adapter_level(const ParsedArgs &pa) {
+  eeos::RawTable table = load_table(pa);
+
+  if (!pa.no_repair) {
+    const eeos::RepairResult repair_result = eeos::repair_table(table);
+    std::cout << "repair (in-memory): status="
+              << (repair_result.status == eeos::Status::ok ? "ok" : "repaired")
+              << " entries=" << repair_result.entries.size();
+    for (const eeos::RepairResult::FieldSummary &s : repair_result.summaries) {
+      std::cout << " " << s.field << "_changed=" << s.modified;
+    }
+    std::cout << "\n";
+  } else {
+    std::cout << "repair (in-memory): skipped (--no-repair)\n";
+  }
+
+  // build_entropy_eos() failures propagate to main()'s catch block, which
+  // prints "eos_test: <message>" to stderr and exits kExitFatal (2) -- the
+  // "build failure -> message to stderr, exit 2" contract.
+  const eeos::EntropyEOS adapter = eeos::build_entropy_eos(table);
+
+  eeos::AdapterCheckOptions aopts;
+  if (pa.have_node_stride) {
+    aopts.node_stride = static_cast<size_t>(pa.node_stride);
+  }
+  if (pa.have_soak) {
+    aopts.soak_n = static_cast<size_t>(pa.soak);
+  }
+  if (pa.have_worst) {
+    aopts.worst_n = static_cast<size_t>(pa.worst);
+  }
+
+  const eeos::AdapterReport report = eeos::check_adapter(adapter, table, aopts);
+  report.print(std::cout);
+
+  if (pa.have_csv) {
+    write_csv(report.classes, pa.csv_prefix);
+  }
+
+  if (report.status == eeos::Status::fatal) {
+    return kExitFatal;
+  }
+  return eeos::adapter_needs_attention(report) ? kExitViolation : kExitOk;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -257,110 +509,16 @@ int main(int argc, char **argv) {
     return kExitUsage;
   }
 
-  if (pa.level != "table") {
-    std::cerr << "eos_test: level not implemented yet (lands with M2/M3)\n";
+  if (pa.level != "table" && pa.level != "adapter") {
+    std::cerr << "eos_test: level not implemented yet (lands with M3)\n";
     return kExitUsage;
   }
 
   try {
-    eeos::RawTable table;
-    if (!pa.file_path.empty()) {
-      table = eeos::read_stellarcollapse(pa.file_path);
-    } else if (pa.synthetic_dirty) {
-      eeos::SyntheticOptions sopts = eeos::dirty_synthetic_options();
-      std::cout << "eos_test --synthetic-dirty: dirty_synthetic_options() ("
-                << sopts.flatten.size() << " flatten, " << sopts.wiggle.size() << " wiggle, "
-                << sopts.offset.size() << " offset, " << sopts.setvalue.size()
-                << " setvalue defect(s), aux fields "
-                << (sopts.with_aux_fields ? "on" : "off") << "):\n";
-      for (const eeos::FlattenDefect &d : sopts.flatten) {
-        std::cout << "  flatten " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
-                   << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1 << "]\n";
-      }
-      for (const eeos::WiggleDefect &d : sopts.wiggle) {
-        std::cout << "  wiggle " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
-                   << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1
-                   << "] amplitude=" << d.amplitude << " period=" << d.period << "\n";
-      }
-      for (const eeos::OffsetDefect &d : sopts.offset) {
-        std::cout << "  offset " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
-                   << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1
-                   << "] offset=" << d.offset << "\n";
-      }
-      for (const eeos::SetValue &v : sopts.setvalue) {
-        std::cout << "  setvalue " << v.field << " at (irho=" << v.irho << ", jT=" << v.jT
-                   << ", kYe=" << v.kYe << ") value=" << v.value << "\n";
-      }
-      table = eeos::make_synthetic_table(sopts);
-      if (pa.have_write_synthetic) {
-        eeos::write_stellarcollapse(pa.write_synthetic_path, table);
-      }
-    } else {
-      eeos::SyntheticOptions sopts; // defaults per CODE.md
-      if (pa.synthetic_seeded) {
-        sopts.seed = make_seeds(sopts);
-        std::cout << "eos_test --synthetic-seeded: seeding " << sopts.seed.size()
-                  << " violation(s):\n";
-        for (const eeos::SeededViolation &v : sopts.seed) {
-          std::cout << "  " << v.field << " at (irho=" << v.irho << ", jT=" << v.jT
-                     << ", kYe=" << v.kYe << ") delta=" << v.delta << "\n";
-        }
-      }
-      table = eeos::make_synthetic_table(sopts);
-      if (pa.have_write_synthetic) {
-        eeos::write_stellarcollapse(pa.write_synthetic_path, table);
-      }
+    if (pa.level == "table") {
+      return run_table_level(pa);
     }
-
-    eeos::CheckOptions check_opts;
-    if (pa.have_m_B) {
-      check_opts.m_B_g = pa.m_B;
-    }
-    if (pa.have_tol) {
-      check_opts.tol_consistency = pa.tol;
-    }
-    if (pa.have_worst) {
-      check_opts.worst_n = static_cast<size_t>(pa.worst);
-    }
-
-    const eeos::CheckReport report = eeos::check_table(table, check_opts);
-    report.print(std::cout);
-
-    if (pa.have_csv) {
-      for (const eeos::CheckClassResult &c : report.classes) {
-        if (c.count == 0) {
-          continue;
-        }
-        const std::string path = pa.csv_prefix + "_" + c.name + ".csv";
-        std::ofstream csv(path);
-        if (!csv) {
-          throw std::runtime_error("could not open CSV file '" + path + "' for writing");
-        }
-        csv << "irho,jT,kYe,rho,temp,ye,value\n";
-        csv << std::setprecision(17);
-        for (const eeos::CheckClassResult::Loc &loc : c.worst) {
-          csv << loc.irho << "," << loc.jT << "," << loc.kYe << "," << loc.rho << "," << loc.temp
-              << "," << loc.ye << "," << loc.value << "\n";
-        }
-      }
-    }
-
-    if (report.status == eeos::Status::fatal) {
-      return kExitFatal;
-    }
-
-    bool hard_violation = false;
-    for (const eeos::CheckClassResult &c : report.classes) {
-      if (c.count == 0) {
-        continue;
-      }
-      if (c.name == "entropy_negative" || c.name == "entropy_nonmonotone_T" ||
-          c.name == "logenergy_nonmonotone_T" ||
-          c.name.rfind("nonfinite_", 0) == 0) {
-        hard_violation = true;
-      }
-    }
-    return hard_violation ? kExitViolation : kExitOk;
+    return run_adapter_level(pa);
   } catch (const std::exception &e) {
     std::cerr << "eos_test: " << e.what() << "\n";
     return kExitFatal;

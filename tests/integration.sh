@@ -85,6 +85,25 @@ else
   exit 1
 fi
 
+# 12-13: --level adapter, table-free (M2c). --synthetic is exactly consistent
+# and defect-free, so a clean report (exit 0) is required; --synthetic-dirty
+# plants monotonicity/physicality pathologies the in-memory repair pass
+# (auto-run by --level adapter) cannot fully clean up, so -- like Part B's
+# real tables below -- either "clean" (0) or "found something to flag" (1)
+# is an accepted outcome.
+expect_exit 0 "$TEST" --level adapter --synthetic
+set +e
+"$TEST" --level adapter --synthetic-dirty >"$T/dirty_adapter.report.txt"
+dirty_adapter_exit=$?
+set -e
+case "$dirty_adapter_exit" in
+  0 | 1) echo "PASS: eos_test --level adapter --synthetic-dirty exit=$dirty_adapter_exit" ;;
+  *)
+    echo "FAIL: eos_test --level adapter --synthetic-dirty exited $dirty_adapter_exit (expected 0 or 1)"
+    exit 1
+    ;;
+esac
+
 echo "=== Part B: real tables (skipped gracefully if absent) ==="
 
 # run_real_table PATH NAME -- exercises eos_test/eos_repair on one real
@@ -174,6 +193,26 @@ run_real_table() {
   fi
   echo "PASS: repaired $name has zero entropy/logenergy nonmonotone-T violations"
 
+  # --level adapter (M2c): auto-repair path (eos_test repairs in memory
+  # itself, from the *original* raw table -- not $rep -- since that is the
+  # tool's own documented default flow). "clean" (0) or "found something to
+  # flag" (1) are both accepted outcomes, exactly like the raw check_table
+  # run above; a real table's own audit statistics are pulled from the saved
+  # report below for the summary line.
+  local adapter_report="$T/${name}_adapter.report.txt"
+  local adapter_test_exit=0
+  set +e
+  "$TEST" --level adapter "$path" >"$adapter_report"
+  adapter_test_exit=$?
+  set -e
+  case "$adapter_test_exit" in
+    0 | 1) echo "PASS: eos_test --level adapter $name exit=$adapter_test_exit" ;;
+    *)
+      echo "FAIL: eos_test --level adapter $name exited $adapter_test_exit (expected 0 or 1)"
+      exit 1
+      ;;
+  esac
+
   # Best-effort extraction of "N value(s) changed" from eos_repair's summary
   # (RepairResult::print()'s "  <field>: N value(s) changed[, ...]" lines),
   # for the one-line summary below; "?" if the format ever changes.
@@ -183,8 +222,37 @@ run_real_table() {
   s_changed=${s_changed:-?}
   e_changed=${e_changed:-?}
 
+  # Best-effort extraction of the adapter report's headline numbers
+  # (AdapterReport::print()'s "kappa=...", "<class>: count=... max=...",
+  # and "physicality soak: ... maxiter_count=... evals_per_sec=..." lines),
+  # for the summary line below; "?" if a line is ever absent.
+  local a_kappa a_rt_count a_dT_max a_dp_max a_sigma_count a_maxiter a_evals
+  a_kappa=$( (grep -E '^kappa=' "$adapter_report" || true) | head -1 | cut -d= -f2)
+  a_rt_count=$( (grep -E '^roundtrip_T:' "$adapter_report" || true) | grep -oE 'count=[0-9]+' | head -1 |
+    cut -d= -f2)
+  a_dT_max=$( (grep -E '^delta_T:' "$adapter_report" || true) | grep -oE 'max=[0-9.eE+-]+' | head -1 |
+    cut -d= -f2)
+  a_dp_max=$( (grep -E '^delta_p:' "$adapter_report" || true) | grep -oE 'max=[0-9.eE+-]+' | head -1 |
+    cut -d= -f2)
+  a_sigma_count=$( (grep -E '^spline_sigma_u_nonpositive:' "$adapter_report" || true) |
+    grep -oE 'count=[0-9]+' | head -1 | cut -d= -f2)
+  a_maxiter=$( (grep -E '^physicality soak:' "$adapter_report" || true) | grep -oE 'maxiter_count=[0-9]+' |
+    head -1 | cut -d= -f2)
+  a_evals=$( (grep -E '^physicality soak:' "$adapter_report" || true) | grep -oE 'evals_per_sec=[0-9.eE+-]+' |
+    head -1 | cut -d= -f2)
+  a_kappa=${a_kappa:-?}
+  a_rt_count=${a_rt_count:-?}
+  a_dT_max=${a_dT_max:-?}
+  a_dp_max=${a_dp_max:-?}
+  a_sigma_count=${a_sigma_count:-?}
+  a_maxiter=${a_maxiter:-?}
+  a_evals=${a_evals:-?}
+
   echo "SUMMARY $name: eos_test(raw)=$test_exit eos_repair=$repair_exit" \
-    "eos_test(repaired)=$rep_test_exit entropy_repaired=$s_changed logenergy_repaired=$e_changed"
+    "eos_test(repaired)=$rep_test_exit entropy_repaired=$s_changed logenergy_repaired=$e_changed" \
+    "eos_test(adapter)=$adapter_test_exit kappa=$a_kappa roundtrip_T_count=$a_rt_count" \
+    "delta_T_max=$a_dT_max delta_p_max=$a_dp_max sigma_monotonicity_count=$a_sigma_count" \
+    "maxiter_count=$a_maxiter evals_per_sec=$a_evals"
 }
 
 run_real_table "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5" "LS220"

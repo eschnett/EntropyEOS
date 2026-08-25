@@ -1,0 +1,547 @@
+#include "entropy_eos/host/adapter_audit.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <limits>
+#include <ostream>
+#include <sstream>
+
+#include "entropy_eos/core/adapter_eval.hpp"
+#include "entropy_eos/host/units.hpp"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace eeos {
+
+namespace {
+
+using Loc = CheckClassResult::Loc;
+
+int max_threads() {
+#ifdef _OPENMP
+  return omp_get_max_threads();
+#else
+  return 1;
+#endif
+}
+
+int this_thread() {
+#ifdef _OPENMP
+  return omp_get_thread_num();
+#else
+  return 0;
+#endif
+}
+
+// --- TopK/Accum: same shape as host/check.cpp's (that file's copies are
+// anonymous-namespace-local to its own translation unit, so this audit --
+// a separate .cpp -- keeps its own; see host/adapter_build.cpp's
+// AuditAccum for the same "each host/*.cpp keeps its own small
+// per-thread-accumulator-then-merge helper" pattern). -------------------
+
+class TopK {
+public:
+  explicit TopK(size_t n) : n_(n) {}
+
+  void consider(const Loc &loc) {
+    if (n_ == 0) return;
+    if (items_.size() < n_) {
+      items_.push_back(loc);
+      return;
+    }
+    size_t min_idx = 0;
+    double min_abs = std::fabs(items_[0].value);
+    for (size_t i = 1; i < items_.size(); ++i) {
+      const double v = std::fabs(items_[i].value);
+      if (v < min_abs) {
+        min_abs = v;
+        min_idx = i;
+      }
+    }
+    if (std::fabs(loc.value) > min_abs) items_[min_idx] = loc;
+  }
+
+  void merge_from(const TopK &other) {
+    for (const Loc &l : other.items_) consider(l);
+  }
+
+  std::vector<Loc> sorted() const {
+    std::vector<Loc> v = items_;
+    std::sort(v.begin(), v.end(),
+              [](const Loc &a, const Loc &b) { return std::fabs(a.value) > std::fabs(b.value); });
+    return v;
+  }
+
+private:
+  size_t n_;
+  std::vector<Loc> items_;
+};
+
+// Running statistics for one CheckClassResult, accumulated per-thread and
+// merged afterward (see host/check.cpp's Accum, which this mirrors).
+struct Accum {
+  size_t count = 0;
+  double max_abs = 0.0;
+  double sum_sq = 0.0;
+  size_t n_points = 0;
+  TopK topk;
+
+  explicit Accum(size_t worst_n) : topk(worst_n) {}
+
+  // Violation class: only violating points feed count/max/rms/worst.
+  void add_violation(double metric, bool is_violation, const Loc &loc) {
+    ++n_points;
+    if (!is_violation) return;
+    ++count;
+    max_abs = std::max(max_abs, std::fabs(metric));
+    sum_sq += metric * metric;
+    topk.consider(loc);
+  }
+
+  // Diagnostic class: max/rms/worst over every point regardless of
+  // `is_violation`; only `count` is threshold-gated.
+  void add_diagnostic(double metric, bool is_violation, const Loc &loc) {
+    ++n_points;
+    if (is_violation) ++count;
+    max_abs = std::max(max_abs, std::fabs(metric));
+    sum_sq += metric * metric;
+    topk.consider(loc);
+  }
+
+  void merge_from(const Accum &other) {
+    count += other.count;
+    max_abs = std::max(max_abs, other.max_abs);
+    sum_sq += other.sum_sq;
+    n_points += other.n_points;
+    topk.merge_from(other.topk);
+  }
+
+  CheckClassResult finalize(const std::string &name) const {
+    CheckClassResult r;
+    r.name = name;
+    r.count = count;
+    r.max = max_abs;
+    r.rms = n_points > 0 ? std::sqrt(sum_sq / static_cast<double>(n_points)) : 0.0;
+    r.worst = topk.sorted();
+    return r;
+  }
+};
+
+// A CheckClassResult standing in for a class that could not be evaluated
+// (here: "delta_p" when "logpress" is absent from `table`) -- see
+// check.hpp's CheckClassResult doc comment for the NaN-max sentinel
+// convention print() recognizes.
+CheckClassResult skipped_class(const std::string &name) {
+  CheckClassResult r;
+  r.name = name;
+  r.count = 0;
+  r.max = std::numeric_limits<double>::quiet_NaN();
+  r.rms = std::numeric_limits<double>::quiet_NaN();
+  return r;
+}
+
+// --- deterministic per-sample PRNG for the class C soak -----------------
+//
+// No std::random_device anywhere (AdapterCheckOptions::soak_seed is the
+// sole source of randomness, so a report is exactly reproducible). Each
+// sampled point gets its own generator, seeded from (soak_seed, index) via
+// splitmix64 (the standard fixup for xorshift's weak-seed sensitivity),
+// so the soak loop has no state threaded across iterations -- trivially
+// OpenMP-parallel and bit-identical regardless of thread count/schedule.
+
+inline uint64_t splitmix64_step(uint64_t &state) {
+  uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+
+class SampleRng {
+public:
+  SampleRng(unsigned seed, size_t index) {
+    uint64_t mix = static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL + static_cast<uint64_t>(index) + 1;
+    state_ = splitmix64_step(mix);
+    if (state_ == 0) state_ = 0x9E3779B97F4A7C15ULL; // xorshift64* requires a nonzero state
+  }
+
+  // xorshift64* (Vigna): a fast, well-mixed generator once seeded via
+  // splitmix64 above.
+  double next_unit() {
+    state_ ^= state_ >> 12;
+    state_ ^= state_ << 25;
+    state_ ^= state_ >> 27;
+    const uint64_t r = state_ * 0x2545F4914F6CDD1DULL;
+    // Top 53 bits -> a double uniform in [0,1).
+    return static_cast<double>(r >> 11) * (1.0 / 9007199254740992.0); // 2^53
+  }
+
+private:
+  uint64_t state_;
+};
+
+bool eos_point_finite(const EOSPoint &pt) {
+  return std::isfinite(pt.U) && std::isfinite(pt.U_rho) && std::isfinite(pt.U_s) &&
+         std::isfinite(pt.U_rhorho) && std::isfinite(pt.U_rhos) && std::isfinite(pt.That) &&
+         std::isfinite(pt.p) && std::isfinite(pt.h) && std::isfinite(pt.cs2) &&
+         std::isfinite(pt.T_F_MeV) && std::isfinite(pt.mu_tilde) && std::isfinite(pt.u_solved);
+}
+
+// --- A. Monotonicity, from the build's stored audit (not recomputed) ----
+//
+// AuditLoc's (x,u,y) are the *unshifted* table's own (log10 rho, log10 T,
+// Ye) coordinates (see host/adapter_build.hpp's AuditLoc doc comment), so
+// converting to physical rho/T is a plain pow(10,.); no grid-node index
+// applies (the scan runs on a refined, off-node grid), so Loc::irho/jT/kYe
+// are left at their default 0.
+CheckClassResult class_from_monotonicity_audit(const MonotonicityAudit &audit, const std::string &name,
+                                                size_t worst_n) {
+  CheckClassResult r;
+  r.name = name;
+  r.count = audit.violation_count;
+  r.max = std::fabs(audit.min_value);
+  // Not tracked by the build-time scan (a running min, not a sum of
+  // squares) and not recomputed here per this module's contract -- left at
+  // 0 rather than a misleading placeholder.
+  r.rms = 0.0;
+
+  const size_t n = std::min(worst_n, audit.worst.size());
+  r.worst.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    const AuditLoc &loc = audit.worst[i];
+    Loc l;
+    l.rho = std::pow(10.0, loc.x);
+    l.temp = std::pow(10.0, loc.u);
+    l.ye = loc.y;
+    l.value = loc.value;
+    r.worst.push_back(l);
+  }
+  return r;
+}
+
+// --- B. Node round trip and fidelity -------------------------------------
+void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa, double conv_t,
+                  size_t node_stride, size_t worst_n, double tol_roundtrip, CheckClassResult &out_roundtrip,
+                  CheckClassResult &out_delta_T, CheckClassResult &out_delta_p, bool &any_fatal,
+                  std::vector<std::string> &fatal_messages) {
+  const size_t nrho = table.nrho();
+  const size_t ntemp = table.ntemp();
+  const size_t nye = table.nye();
+  const std::vector<double> &entropy = table.field("entropy");
+  const std::vector<double> &logtemp = table.logtemp();
+  const bool have_logpress = table.has_field("logpress");
+  const std::vector<double> *logpress = have_logpress ? &table.field("logpress") : nullptr;
+  const size_t stride = std::max<size_t>(node_stride, 1);
+  const double c2 = c_light_cm_s * c_light_cm_s;
+
+  const int nthreads = max_threads();
+  std::vector<Accum> local_rt(static_cast<size_t>(nthreads), Accum(worst_n));
+  std::vector<Accum> local_dT(static_cast<size_t>(nthreads), Accum(worst_n));
+  std::vector<Accum> local_dp(static_cast<size_t>(nthreads), Accum(worst_n));
+  std::vector<char> local_fatal(static_cast<size_t>(nthreads), 0);
+  std::vector<std::vector<std::string>> local_msgs(static_cast<size_t>(nthreads));
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (size_t kYe = 0; kYe < nye; kYe += stride) {
+    const size_t tid = static_cast<size_t>(this_thread());
+    for (size_t jT = 0; jT < ntemp; jT += stride) {
+      const double T_j = table.temp(jT);
+      const double u_guess = logtemp[jT];
+      for (size_t irho = 0; irho < nrho; irho += stride) {
+        const size_t idx = table.index(irho, jT, kYe);
+        const double s = entropy[idx];
+        const double rho_i = table.rho(irho);
+        const double ye_k = table.yev(kYe);
+
+        const EOSPoint pt = view.evaluate(kappa * rho_i, s, ye_k, u_guess);
+
+        if (!eos_point_finite(pt)) {
+          local_fatal[tid] = 1;
+          std::ostringstream msg;
+          msg << "non-finite EOSPoint at table node (irho=" << irho << ",jT=" << jT << ",kYe=" << kYe
+              << ") rho=" << rho_i << " T=" << T_j << " Ye=" << ye_k;
+          local_msgs[tid].push_back(msg.str());
+          continue;
+        }
+
+        Loc loc0;
+        loc0.irho = irho;
+        loc0.jT = jT;
+        loc0.kYe = kYe;
+        loc0.rho = rho_i;
+        loc0.temp = T_j;
+        loc0.ye = ye_k;
+
+        const double m_rt = std::fabs(pt.T_F_MeV / T_j - 1.0);
+        if (std::isfinite(m_rt)) {
+          Loc loc = loc0;
+          loc.value = m_rt;
+          local_rt[tid].add_violation(m_rt, m_rt > tol_roundtrip, loc);
+        }
+
+        const double m_dT = std::fabs(pt.That * kappa / (conv_t * T_j) - 1.0);
+        if (std::isfinite(m_dT)) {
+          Loc loc = loc0;
+          loc.value = m_dT;
+          local_dT[tid].add_diagnostic(m_dT, false, loc);
+        }
+
+        if (logpress != nullptr) {
+          const double p_table = std::pow(10.0, (*logpress)[idx]);
+          const double m_dp = std::fabs(pt.p * c2 / p_table - 1.0);
+          if (std::isfinite(m_dp)) {
+            Loc loc = loc0;
+            loc.value = m_dp;
+            local_dp[tid].add_diagnostic(m_dp, false, loc);
+          }
+        }
+      }
+    }
+  }
+
+  Accum acc_rt(worst_n), acc_dT(worst_n), acc_dp(worst_n);
+  for (int t = 0; t < nthreads; ++t) {
+    const size_t ti = static_cast<size_t>(t);
+    acc_rt.merge_from(local_rt[ti]);
+    acc_dT.merge_from(local_dT[ti]);
+    acc_dp.merge_from(local_dp[ti]);
+    if (local_fatal[ti]) any_fatal = true;
+    for (std::string &m : local_msgs[ti]) fatal_messages.push_back(std::move(m));
+  }
+  out_roundtrip = acc_rt.finalize("roundtrip_T");
+  out_delta_T = acc_dT.finalize("delta_T");
+  out_delta_p = acc_dp.finalize("delta_p");
+}
+
+// --- C. Physicality soak --------------------------------------------------
+void audit_soak(const EntropyEOSView &view, const AdapterCheckOptions &opts, CheckClassResult &out_that,
+                 CheckClassResult &out_p, CheckClassResult &out_cs2_pos, CheckClassResult &out_cs2_acaus,
+                 size_t &maxiter_count, size_t iters_hist[64], double &evals_per_sec, bool &any_fatal,
+                 std::vector<std::string> &fatal_messages) {
+  const size_t n = opts.soak_n;
+  const double x_lo = view.x_lo, x_hi = view.x_hi;
+  const double y_lo = view.y_lo, y_hi = view.y_hi;
+
+  // Pass 1 (untimed): generate every query point (rho*, s, Ye) up front --
+  // this is "PRNG/bookkeeping", not the evaluate() cost the soak measures.
+  std::vector<double> q_rho(n), q_s(n), q_ye(n);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (size_t k = 0; k < n; ++k) {
+    SampleRng rng(opts.soak_seed, k);
+    const double x = x_lo + rng.next_unit() * (x_hi - x_lo);
+    const double y = y_lo + rng.next_unit() * (y_hi - y_lo);
+    const double rho_star = std::pow(10.0, x);
+    const SRange sr = view.srange(rho_star, y);
+    const double s = sr.s_min + rng.next_unit() * (sr.s_max - sr.s_min);
+    q_rho[k] = rho_star;
+    q_ye[k] = y;
+    q_s[k] = s;
+  }
+
+  const int nthreads = max_threads();
+  std::vector<Accum> local_that(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+  std::vector<Accum> local_p(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+  std::vector<Accum> local_cs2_pos(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+  std::vector<Accum> local_cs2_acaus(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+  std::vector<size_t> local_maxiter(static_cast<size_t>(nthreads), 0);
+  std::vector<std::vector<size_t>> local_hist(static_cast<size_t>(nthreads), std::vector<size_t>(64, 0));
+  std::vector<char> local_fatal(static_cast<size_t>(nthreads), 0);
+  std::vector<std::vector<std::string>> local_msgs(static_cast<size_t>(nthreads));
+
+  const double nan_guess = std::numeric_limits<double>::quiet_NaN();
+
+  // Pass 2 (timed): cold-start evaluate() calls only.
+  const auto t0 = std::chrono::steady_clock::now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (size_t k = 0; k < n; ++k) {
+    const size_t tid = static_cast<size_t>(this_thread());
+    const EOSPoint pt = view.evaluate(q_rho[k], q_s[k], q_ye[k], nan_guess);
+
+    if (!eos_point_finite(pt)) {
+      local_fatal[tid] = 1;
+      std::ostringstream msg;
+      msg << "non-finite EOSPoint in physicality soak at rho*=" << q_rho[k] << " s=" << q_s[k]
+          << " Ye=" << q_ye[k];
+      local_msgs[tid].push_back(msg.str());
+      continue;
+    }
+
+    const size_t hb = std::min<size_t>(static_cast<size_t>(pt.iters < 0 ? 0 : pt.iters), 63);
+    ++local_hist[tid][hb];
+    if (pt.flags & flag_maxiter) ++local_maxiter[tid];
+
+    Loc loc;
+    loc.rho = q_rho[k];
+    loc.temp = pt.T_F_MeV;
+    loc.ye = q_ye[k];
+
+    {
+      Loc l = loc;
+      l.value = pt.That;
+      local_that[tid].add_violation(pt.That, pt.That <= 0.0, l);
+    }
+    {
+      Loc l = loc;
+      l.value = pt.p;
+      local_p[tid].add_violation(pt.p, pt.p <= 0.0, l);
+    }
+    {
+      Loc l = loc;
+      l.value = pt.cs2;
+      local_cs2_pos[tid].add_violation(pt.cs2, pt.cs2 <= 0.0, l);
+    }
+    {
+      Loc l = loc;
+      l.value = pt.cs2 - 1.0;
+      local_cs2_acaus[tid].add_violation(pt.cs2 - 1.0, pt.cs2 >= 1.0, l);
+    }
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  const double seconds = std::chrono::duration<double>(t1 - t0).count();
+  evals_per_sec = static_cast<double>(n) / std::max(seconds, 1e-12);
+
+  Accum acc_that(opts.worst_n), acc_p(opts.worst_n), acc_cs2_pos(opts.worst_n), acc_cs2_acaus(opts.worst_n);
+  maxiter_count = 0;
+  for (size_t i = 0; i < 64; ++i) iters_hist[i] = 0;
+  for (int t = 0; t < nthreads; ++t) {
+    const size_t ti = static_cast<size_t>(t);
+    acc_that.merge_from(local_that[ti]);
+    acc_p.merge_from(local_p[ti]);
+    acc_cs2_pos.merge_from(local_cs2_pos[ti]);
+    acc_cs2_acaus.merge_from(local_cs2_acaus[ti]);
+    maxiter_count += local_maxiter[ti];
+    for (size_t i = 0; i < 64; ++i) iters_hist[i] += local_hist[ti][i];
+    if (local_fatal[ti]) any_fatal = true;
+    for (std::string &m : local_msgs[ti]) fatal_messages.push_back(std::move(m));
+  }
+  out_that = acc_that.finalize("That_nonpositive");
+  out_p = acc_p.finalize("p_nonpositive");
+  out_cs2_pos = acc_cs2_pos.finalize("cs2_nonpositive");
+  out_cs2_acaus = acc_cs2_acaus.finalize("cs2_acausal");
+}
+
+} // namespace
+
+AdapterReport check_adapter(const EntropyEOS &adapter, const RawTable &table,
+                             const AdapterCheckOptions &opts) {
+  AdapterReport report;
+  report.kappa = adapter.kappa();
+  report.m_B_star_g = adapter.m_B_star_g();
+  report.soak_n = opts.soak_n;
+
+  const EntropyEOSView view = adapter.view();
+
+  // Reconstruct conv_t (== MeV_to_erg / (m_B_table_g * c^2)) from the two
+  // scalars the report itself carries (kappa, m_B_star_g) rather than
+  // reaching back into `adapter` for its own conv_t()/m_B_table_g() --
+  // this is the delta_T fidelity metric's reference m_B*/consistency
+  // conversion (eos-adapter-F-to-U.md S10, CODE.md "M2 design notes").
+  const double m_B_table_g = adapter.m_B_star_g() / adapter.kappa();
+  const double conv_t = MeV_to_erg / (m_B_table_g * c_light_cm_s * c_light_cm_s);
+
+  bool any_fatal = false;
+  std::vector<std::string> fatal_messages;
+
+  // --- A. Monotonicity (stored build audit) -------------------------------
+  report.classes.push_back(
+      class_from_monotonicity_audit(adapter.audit().sigma_u, "spline_sigma_u_nonpositive", opts.worst_n));
+  report.classes.push_back(
+      class_from_monotonicity_audit(adapter.audit().L_u, "spline_L_u_nonpositive", opts.worst_n));
+
+  // --- B. Node round trip and fidelity -------------------------------------
+  CheckClassResult roundtrip_T, delta_T, delta_p;
+  audit_nodes(view, table, adapter.kappa(), conv_t, opts.node_stride, opts.worst_n, opts.tol_roundtrip,
+              roundtrip_T, delta_T, delta_p, any_fatal, fatal_messages);
+  report.classes.push_back(std::move(roundtrip_T));
+  report.classes.push_back(std::move(delta_T));
+  if (table.has_field("logpress")) {
+    report.classes.push_back(std::move(delta_p));
+  } else {
+    report.classes.push_back(skipped_class("delta_p"));
+  }
+
+  // --- C. Physicality soak --------------------------------------------------
+  CheckClassResult that_np, p_np, cs2_pos, cs2_acaus;
+  audit_soak(view, opts, that_np, p_np, cs2_pos, cs2_acaus, report.maxiter_count, report.iters_hist,
+             report.evals_per_sec, any_fatal, fatal_messages);
+  report.classes.push_back(std::move(that_np));
+  report.classes.push_back(std::move(p_np));
+  report.classes.push_back(std::move(cs2_pos));
+  report.classes.push_back(std::move(cs2_acaus));
+
+  report.fatal_messages = std::move(fatal_messages);
+  report.status = any_fatal ? Status::fatal : Status::ok;
+  return report;
+}
+
+bool adapter_needs_attention(const AdapterReport &report) {
+  if (report.maxiter_count > 0) return true;
+  static const char *const kRelevant[] = {"spline_sigma_u_nonpositive", "spline_L_u_nonpositive",
+                                           "roundtrip_T",                "That_nonpositive",
+                                           "p_nonpositive",              "cs2_nonpositive",
+                                           "cs2_acausal"};
+  for (const CheckClassResult &c : report.classes) {
+    for (const char *name : kRelevant) {
+      if (c.name == name && c.count > 0) return true;
+    }
+  }
+  return false;
+}
+
+void AdapterReport::print(std::ostream &os) const {
+  const std::ios::fmtflags saved_flags = os.flags();
+  const std::streamsize saved_precision = os.precision();
+
+  os << "check_adapter report: status="
+     << (status == Status::ok ? "ok" : status == Status::repaired ? "repaired" : "fatal") << "\n";
+  os << "kappa=" << std::scientific << std::setprecision(15) << kappa << "\n";
+  os << "m_B_star_g=" << m_B_star_g << "\n";
+
+  if (!fatal_messages.empty()) {
+    os << "fatal problems (non-finite EOSPoint):\n";
+    for (const std::string &msg : fatal_messages) {
+      os << "  - " << msg << "\n";
+    }
+  }
+
+  for (const CheckClassResult &c : classes) {
+    os << "\n" << c.name << ": count=" << c.count;
+    if (std::isnan(c.max)) {
+      os << " (skipped: required field not present)\n";
+      continue;
+    }
+    os << " max=" << std::scientific << std::setprecision(6) << c.max << " rms=" << c.rms << "\n";
+    if (!c.worst.empty()) {
+      os << "  worst offenders (rho [g/cc], T [MeV], Ye : value):\n";
+      for (const CheckClassResult::Loc &loc : c.worst) {
+        os << "    rho=" << std::scientific << std::setprecision(6) << loc.rho << " T=" << loc.temp
+           << " Ye=" << std::fixed << std::setprecision(4) << loc.ye << " : value=" << std::scientific
+           << std::setprecision(6) << loc.value << "\n";
+      }
+    }
+  }
+
+  os << "\nphysicality soak: n=" << soak_n << " maxiter_count=" << maxiter_count
+     << " evals_per_sec=" << std::scientific << std::setprecision(6) << evals_per_sec << " evals/sec\n";
+  os << "  cold-start iteration histogram:\n";
+  for (size_t i = 0; i < 64; ++i) {
+    if (iters_hist[i] > 0) {
+      os << "    iters=" << i << ": " << iters_hist[i] << "\n";
+    }
+  }
+
+  os.flags(saved_flags);
+  os.precision(saved_precision);
+}
+
+} // namespace eeos
