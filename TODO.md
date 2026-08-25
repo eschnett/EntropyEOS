@@ -25,3 +25,7 @@
 - generic "check state" and "project to valid state" functions, to be
   called after initial conditions, prolongating, reconstructing at
   cell faces, etc. (some work on cons, other on prims.)
+
+- `using real = double` should imply that `real` is used everywhere, not `double`. (watch literal constants.)
+
+- use only F from F table
