@@ -385,7 +385,13 @@ void audit_soak(const EntropyEOSView &view, const AdapterCheckOptions &opts, Che
                  size_t &maxiter_count, size_t iters_hist[64], double &evals_per_sec, bool &any_fatal,
                  std::vector<std::string> &fatal_messages) {
   const size_t n = opts.soak_n;
-  const double x_lo = view.x_lo, x_hi = view.x_hi;
+  // M2d-2: opts.soak_extended widens the sampled box to the S7 extension
+  // zones (EntropyEOSView::x_ext_lo/hi and srange_extended()) instead of
+  // the physical one -- everything below (finiteness, flag_maxiter, the
+  // physicality classes) is unchanged and now exercises the domain
+  // extensions themselves.
+  const double x_lo = opts.soak_extended ? view.x_ext_lo : view.x_lo;
+  const double x_hi = opts.soak_extended ? view.x_ext_hi : view.x_hi;
   const double y_lo = view.y_lo, y_hi = view.y_hi;
 
   // Pass 1 (untimed): generate every query point (rho*, s, Ye) up front --
@@ -399,7 +405,7 @@ void audit_soak(const EntropyEOSView &view, const AdapterCheckOptions &opts, Che
     const double x = x_lo + rng.next_unit() * (x_hi - x_lo);
     const double y = y_lo + rng.next_unit() * (y_hi - y_lo);
     const double rho_star = std::pow(10.0, x);
-    const SRange sr = view.srange(rho_star, y);
+    const SRange sr = opts.soak_extended ? view.srange_extended(rho_star, y) : view.srange(rho_star, y);
     const double s = sr.s_min + rng.next_unit() * (sr.s_max - sr.s_min);
     q_rho[k] = rho_star;
     q_ye[k] = y;
@@ -490,6 +496,102 @@ void audit_soak(const EntropyEOSView &view, const AdapterCheckOptions &opts, Che
   out_cs2_acaus = acc_cs2_acaus.finalize("cs2_acausal");
 }
 
+// --- D. Extension seam continuity (diagnostic only, M2d-2) ----------------
+//
+// See check_adapter()'s doc comment for the design: a ~40x20 grid per seam
+// (all four of u_lo, u_hi, x_lo, x_hi) across the seam's two non-seam axes,
+// evaluating U/U_s just inside/outside the seam (offset kOffset in the seam
+// coordinate) through the *public* evaluate()/sigma_extended() API -- the
+// same interface a con2prim caller sees, so this measures what the caller
+// actually experiences at the seam, not an internal spline detail.
+// sigma_extended() converts a chosen u just inside/outside a u_lo/u_hi seam
+// (or, for an x_lo/x_hi seam, a u picked anywhere in the physical range)
+// into the matching s, so both the "inside" and "outside" evaluate() calls
+// land at the intended (x,u) pair via the same T-solve path a real caller
+// takes -- not a back door into the spline internals.
+void audit_seam_jumps(const EntropyEOSView &view, size_t worst_n, CheckClassResult &out) {
+  constexpr double kOffset = 1e-7;
+  constexpr int kNa = 40, kNb = 20;
+  constexpr double kTiny = 1e-300;
+  const double nan_guess = std::numeric_limits<double>::quiet_NaN();
+
+  const int nthreads = max_threads();
+  std::vector<Accum> local(static_cast<size_t>(nthreads), Accum(worst_n));
+
+  // Evaluates just inside/outside one seam point and records the worse of
+  // U's and U_s's relative jump (diagnostic: never a "violation", count
+  // stays 0 -- see Accum::add_diagnostic()). Skips a point outright if
+  // either side is non-finite (that is B/C's fatal-detection job, not this
+  // diagnostic's).
+  auto record = [&](Accum &acc, double rho_in, double s_in, double rho_out, double s_out, double ye,
+                     double rho_loc, double temp_loc) {
+    const EOSPoint pin = view.evaluate(rho_in, s_in, ye, nan_guess);
+    const EOSPoint pout = view.evaluate(rho_out, s_out, ye, nan_guess);
+    if (!eos_point_finite(pin) || !eos_point_finite(pout)) return;
+    const double jump_U = std::fabs(pout.U - pin.U) / std::max(std::fabs(pin.U), kTiny);
+    const double jump_Us = std::fabs(pout.U_s - pin.U_s) / std::max(std::fabs(pin.U_s), kTiny);
+    const double metric = std::max(jump_U, jump_Us);
+    Loc loc;
+    loc.rho = rho_loc;
+    loc.temp = temp_loc;
+    loc.ye = ye;
+    loc.value = metric;
+    acc.add_diagnostic(metric, false, loc);
+  };
+
+  // u_lo / u_hi seams: grid over (x* in [x_lo,x_hi], Ye in [y_lo,y_hi]); Ye
+  // varies inside the parallel-for so both seams share the same rho column.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int ia = 0; ia < kNa; ++ia) {
+    Accum &acc = local[static_cast<size_t>(this_thread())];
+    const double x =
+        view.x_lo + (view.x_hi - view.x_lo) * (static_cast<double>(ia) + 0.5) / static_cast<double>(kNa);
+    const double rho = std::pow(10.0, x);
+    for (int side = 0; side < 2; ++side) {
+      const double u_seam = side == 0 ? view.u_lo : view.u_hi;
+      const double u_in = side == 0 ? u_seam + kOffset : u_seam - kOffset;
+      const double u_out = side == 0 ? u_seam - kOffset : u_seam + kOffset;
+      for (int ib = 0; ib < kNb; ++ib) {
+        const double ye = view.y_lo +
+                           (view.y_hi - view.y_lo) * (static_cast<double>(ib) + 0.5) / static_cast<double>(kNb);
+        const double s_in = view.sigma_extended(rho, u_in, ye);
+        const double s_out = view.sigma_extended(rho, u_out, ye);
+        record(acc, rho, s_in, rho, s_out, ye, rho, std::pow(10.0, u_seam));
+      }
+    }
+  }
+
+  // x_lo / x_hi seams: grid over (u=log10(T) in [u_lo,u_hi], Ye).
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int ia = 0; ia < kNa; ++ia) {
+    Accum &acc = local[static_cast<size_t>(this_thread())];
+    const double u =
+        view.u_lo + (view.u_hi - view.u_lo) * (static_cast<double>(ia) + 0.5) / static_cast<double>(kNa);
+    for (int side = 0; side < 2; ++side) {
+      const double x_seam = side == 0 ? view.x_lo : view.x_hi;
+      const double rho_seam = std::pow(10.0, x_seam);
+      const double rho_in =
+          side == 0 ? std::pow(10.0, x_seam + kOffset) : std::pow(10.0, x_seam - kOffset);
+      const double rho_out =
+          side == 0 ? std::pow(10.0, x_seam - kOffset) : std::pow(10.0, x_seam + kOffset);
+      for (int ib = 0; ib < kNb; ++ib) {
+        const double ye = view.y_lo +
+                           (view.y_hi - view.y_lo) * (static_cast<double>(ib) + 0.5) / static_cast<double>(kNb);
+        const double s = view.sigma_extended(rho_seam, u, ye);
+        record(acc, rho_in, s, rho_out, s, ye, rho_seam, std::pow(10.0, u));
+      }
+    }
+  }
+
+  Accum total(worst_n);
+  for (int t = 0; t < nthreads; ++t) total.merge_from(local[static_cast<size_t>(t)]);
+  out = total.finalize("extension_seam_jump");
+}
+
 } // namespace
 
 AdapterReport check_adapter(const EntropyEOS &adapter, const RawTable &table,
@@ -539,6 +641,11 @@ AdapterReport check_adapter(const EntropyEOS &adapter, const RawTable &table,
   report.classes.push_back(std::move(p_np));
   report.classes.push_back(std::move(cs2_pos));
   report.classes.push_back(std::move(cs2_acaus));
+
+  // --- D. Extension seam continuity (diagnostic only, M2d-2) ---------------
+  CheckClassResult seam_jump;
+  audit_seam_jumps(view, opts.worst_n, seam_jump);
+  report.classes.push_back(std::move(seam_jump));
 
   report.fatal_messages = std::move(fatal_messages);
   report.status = any_fatal ? Status::fatal : Status::ok;

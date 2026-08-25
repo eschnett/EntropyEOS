@@ -9,11 +9,14 @@
 #include "doctest.h"
 
 #include <cmath>
+#include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 
 #include "entropy_eos/host/adapter_audit.hpp"
 #include "entropy_eos/host/adapter_build.hpp"
+#include "entropy_eos/host/io_stellarcollapse.hpp"
 #include "entropy_eos/host/repair.hpp"
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
@@ -48,7 +51,13 @@ TEST_CASE("check_adapter: clean synthetic (default grid) reports zero violations
   SyntheticOptions opts; // default 40x30x10, no defects
   RawTable table = eeos::make_synthetic_table(opts);
   EntropyEOS adapter = eeos::build_entropy_eos(table);
-  CHECK(adapter.kappa() == 1.0);
+  // M2d-2: kappa is close to but no longer exactly 1.0 even on a table
+  // that is eps>0 everywhere *physically* -- the eps-floor scan now also
+  // covers the S7 extension zones, where the designed L u-low tail can dip
+  // eps_hat slightly below the table's own minimum (see
+  // tests/test_adapter.cpp test 1's doc comment).
+  CHECK(adapter.kappa() > 1.0 - 1e-2);
+  CHECK(adapter.kappa() <= 1.0);
 
   const AdapterReport report = eeos::check_adapter(adapter, table);
 
@@ -313,4 +322,111 @@ TEST_CASE("AdapterReport::print: mentions kappa, every class name, evals/sec") {
   CHECK(text.find("quantiles") != std::string::npos);
   CHECK(text.find("p50=") != std::string::npos);
   CHECK(text.find("p999=") != std::string::npos);
+}
+
+// ==========================================================================
+// 6. M2d-2: extension_seam_jump is present and small, and soak_extended
+//    runs clean, on the clean synthetic table.
+// ==========================================================================
+
+TEST_CASE("check_adapter: extension_seam_jump small and soak_extended clean on synthetic") {
+  SyntheticOptions opts; // default 40x30x10, no defects
+  RawTable table = eeos::make_synthetic_table(opts);
+  EntropyEOS adapter = eeos::build_entropy_eos(table);
+
+  AdapterCheckOptions aopts;
+  aopts.soak_n = 20000;
+  aopts.soak_extended = true;
+  const AdapterReport report = eeos::check_adapter(adapter, table, aopts);
+
+  CHECK(report.status == eeos::Status::ok);
+  CHECK(report.fatal_messages.empty());
+
+  // "extension_seam_jump" (M2d-2's class D): diagnostic only -- never a
+  // violation (count stays 0 regardless of magnitude) -- but small on a
+  // clean table, since the tails are C2 by construction (see
+  // core/adapter_eval.hpp's TAIL MATHEMATICS; the guard/slope-zero
+  // overrides that would drop to C1/C0 do not activate on this table's
+  // comfortably-positive boundary slopes).
+  const CheckClassResult &seam = find_class(report, "extension_seam_jump");
+  MESSAGE("test_adapter_audit 6: extension_seam_jump max = " << seam.max);
+  CHECK(seam.count == 0);
+  CHECK(seam.max <= 1e-6);
+
+  // soak_extended (opts.soak_extended=true): the S7/M2d-2 extension zones
+  // must be finite (status==ok already established that: a non-finite
+  // EOSPoint anywhere would have flipped it to fatal) and monotone-solvable
+  // -- zero maxiter_count, and the iteration histogram accounts for every
+  // sampled point.
+  CHECK(report.maxiter_count == 0);
+  size_t hist_sum = 0;
+  for (size_t i = 0; i < 64; ++i) hist_sum += report.iters_hist[i];
+  CHECK(hist_sum == aopts.soak_n);
+
+  // Physicality in the extension zone is not guaranteed by design (it is an
+  // escape hatch for the solver, not a claim of physical validity far from
+  // the table -- eos-adapter-F-to-U.md S7) so these are reported, not
+  // asserted zero.
+  MESSAGE("test_adapter_audit 6: soak_extended That_nonpositive="
+          << find_class(report, "That_nonpositive").count
+          << " p_nonpositive=" << find_class(report, "p_nonpositive").count
+          << " cs2_nonpositive=" << find_class(report, "cs2_nonpositive").count
+          << " cs2_acausal=" << find_class(report, "cs2_acausal").count);
+}
+
+// ==========================================================================
+// 7. M2d-2: real tables (guarded, like tests/test_adapter.cpp test 8) --
+//    soak_extended and the extension-seam-jump max.
+// ==========================================================================
+
+namespace {
+
+const std::string kLS220Path = "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5";
+const std::string kSROPath = "tables/LS220_3335_rho391_temp163_ye66.h5";
+
+bool table_exists(const std::string &path) {
+  std::ifstream f(path, std::ios::binary);
+  return static_cast<bool>(f);
+}
+
+void run_real_table_soak_extended(const std::string &path, const char *label) {
+  if (!table_exists(path)) {
+    WARN_MESSAGE(false, label << " table not found at '" << path << "' -- skipped ('skipped')");
+    return;
+  }
+
+  RawTable table = eeos::read_stellarcollapse(path);
+  const eeos::RepairResult repair_result = eeos::repair_table(table);
+  (void)repair_result;
+  EntropyEOS adapter = eeos::build_entropy_eos(table);
+
+  // A real table's node grid is ~1e5-1e6 points; a large node_stride keeps
+  // this guarded, local-only smoke test's class B pass fast while still
+  // exercising it (unlike tests/test_adapter.cpp test 8, whose job is the
+  // evaluate()-level soak, this test's job is check_adapter()'s new
+  // soak_extended path and the seam-jump diagnostic, not a from-scratch
+  // full audit -- that is tools/eos_test --level adapter's job, see
+  // tests/integration.sh).
+  AdapterCheckOptions aopts;
+  aopts.node_stride = 25;
+  aopts.soak_n = 20000;
+  aopts.soak_extended = true;
+  const AdapterReport report = eeos::check_adapter(adapter, table, aopts);
+
+  CHECK(report.status != eeos::Status::fatal);
+
+  const CheckClassResult &seam = find_class(report, "extension_seam_jump");
+  std::cout << "test_adapter_audit 7 (" << label << "): kappa=" << adapter.kappa()
+            << " extension_seam_jump max=" << seam.max
+            << " soak_extended maxiter_count=" << report.maxiter_count << "/" << aopts.soak_n << "\n";
+}
+
+} // namespace
+
+TEST_CASE("check_adapter: LS220 real table, soak_extended + extension_seam_jump (guarded)") {
+  run_real_table_soak_extended(kLS220Path, "LS220");
+}
+
+TEST_CASE("check_adapter: SRO real table, soak_extended + extension_seam_jump (guarded)") {
+  run_real_table_soak_extended(kSROPath, "SRO");
 }

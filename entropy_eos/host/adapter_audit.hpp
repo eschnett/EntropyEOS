@@ -53,6 +53,14 @@ struct AdapterCheckOptions {
   // Relative threshold for "roundtrip_T" (|T_F/T_node - 1|) entering the
   // violation class.
   double tol_roundtrip = 1e-8;
+
+  // M2d-2: when true, the class C physicality soak samples the *extended*
+  // box (EntropyEOSView::x_ext_lo/hi, srange_extended()) instead of the
+  // physical one -- exercising the eos-adapter-F-to-U.md S7 domain
+  // extensions themselves (finite, monotone-solvable, zero maxiter is the
+  // bar; see AdapterReport's soak fields). Off by default so existing
+  // callers/reports are unaffected.
+  bool soak_extended = false;
 };
 
 // Robust distribution summary for a diagnostic metric collected at every
@@ -89,6 +97,8 @@ struct AdapterReport {
   //      (diagnostic), "delta_p" (diagnostic; the check.hpp NaN-sentinel "skipped" class if the
   //      table has no "logpress")
   //   C. "That_nonpositive", "p_nonpositive", "cs2_nonpositive", "cs2_acausal" (violations)
+  //   D. "extension_seam_jump" (diagnostic; M2d-2, never affects
+  //      adapter_needs_attention() -- see check_adapter()'s doc comment)
   std::vector<CheckClassResult> classes;
 
   // Quantiles {p50,p90,p99,p999,max} of "delta_T"/"delta_p" over every
@@ -135,11 +145,25 @@ struct AdapterReport {
 //      to the max/rms being dominated by a single leftover pocket).
 //   C. Physicality soak: opts.soak_n deterministic random cold-start
 //      evaluate() calls uniform in the adapter's physical (x*, Ye) box and
-//      in the pointwise entropy range from srange(); "That_nonpositive",
-//      "p_nonpositive", "cs2_nonpositive", "cs2_acausal" violation classes,
-//      flag_maxiter counted into maxiter_count, an iters_hist histogram, and
-//      evals_per_sec timing (point generation is excluded from the timed
-//      region; only the evaluate() calls are timed).
+//      in the pointwise entropy range from srange() -- or, if
+//      opts.soak_extended is set (M2d-2), the *extended* box/
+//      srange_extended(), to exercise the S7 domain extensions themselves;
+//      "That_nonpositive", "p_nonpositive", "cs2_nonpositive",
+//      "cs2_acausal" violation classes, flag_maxiter counted into
+//      maxiter_count, an iters_hist histogram, and evals_per_sec timing
+//      (point generation is excluded from the timed region; only the
+//      evaluate() calls are timed).
+//   D. Extension seam continuity (M2d-2, diagnostic only -- never affects
+//      exit): at a deterministic ~40x20 grid of points per seam (all four
+//      of u_lo, u_hi, x_lo, x_hi, across the other two axes), evaluates U
+//      and U_s just inside and just outside the seam (offset 1e-7 in the
+//      seam coordinate, via EntropyEOSView::sigma_extended() to convert a u
+//      offset into the matching s) and records
+//      max(|Delta U|/max(|U_inside|,tiny), |Delta U_s|/max(|U_s_inside|,tiny))
+//      as "extension_seam_jump" -- small on a clean table (the tails are
+//      designed C2, C1 only where the monotonicity/slope-zero overrides
+//      activate), never a violation (count stays 0; see
+//      adapter_needs_attention()).
 //
 // Never throws on its own account: a non-finite EOSPoint anywhere in B or C
 // is recorded in fatal_messages (status becomes Status::fatal) and that

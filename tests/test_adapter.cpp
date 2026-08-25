@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -144,15 +145,26 @@ void print_iters_histogram(const std::string &label, const std::vector<int> &ite
 } // namespace
 
 // ==========================================================================
-// 1. kappa exactness on the synthetic table
+// 1. kappa near 1.0 on the synthetic table (eps > 0 everywhere physically)
 // ==========================================================================
 
-TEST_CASE("build_entropy_eos: synthetic table gives kappa == 1.0 exactly (eps > 0 everywhere)") {
-  SyntheticOptions opts; // default grid, no defects: eps > 0 everywhere
+TEST_CASE("build_entropy_eos: synthetic table gives kappa close to 1.0 (eps > 0 everywhere physically)") {
+  SyntheticOptions opts; // default grid, no defects: eps > 0 everywhere in the physical box
   EntropyEOS adapter = build_synthetic(opts);
 
-  CHECK(adapter.kappa() == 1.0);
-  CHECK(adapter.m_B_star_g() == eeos::m_amu_g);
+  // M2d-2: the eps-floor scan now also samples the S7 extension zones
+  // (host/adapter_build.hpp's build_entropy_eos() step 3 doc comment), and
+  // the L u-low tail's designed decay can dip eps_hat *there* below the
+  // table's own (physical) minimum by a bounded amount even on an
+  // everywhere-positive table -- so kappa is no longer exactly 1.0 in
+  // general, only close to it (see test 3 below: "U >= 0 over the extended
+  // box" is the real invariant this scan protects, not kappa==1 on a clean
+  // table).
+  CHECK(adapter.kappa() > 0.0);
+  CHECK(adapter.kappa() <= 1.0);
+  CHECK(adapter.kappa() > 1.0 - 1e-2);
+  CHECK(std::isfinite(adapter.m_B_star_g()));
+  CHECK(rel_err(adapter.m_B_star_g(), eeos::m_amu_g) <= 1e-2);
 }
 
 // ==========================================================================
@@ -170,6 +182,7 @@ TEST_CASE("EntropyEOSView::evaluate: node round trip at every 5th table node") {
   const std::vector<double> &logenergy = table.field("logenergy");
   const double shift_cgs = table.energy_shift();
   const double inv_c2 = 1.0 / (eeos::c_light_cm_s * eeos::c_light_cm_s);
+  const double kappa = adapter.kappa();
 
   int n_checked = 0;
   for (size_t k = 0; k < table.nye(); k += 5) {
@@ -180,14 +193,20 @@ TEST_CASE("EntropyEOSView::evaluate: node round trip at every 5th table node") {
         const double ye = table.yev(k);
         const size_t idx = table.index(i, j, k);
         const double s = entropy[idx];
-        // U at a node equals eps_hat exactly (kappa==1): eps_hat =
-        // (10^logenergy - energy_shift_cgs) / c^2.
+        // U at a node equals eps_hat exactly, transformed by the S5
+        // kappa re-zeroing (eos-adapter-F-to-U.md S5): eps_hat =
+        // (10^logenergy - energy_shift_cgs) / c^2, U = (1+eps_hat)/kappa-1.
         const double eps_hat_node = (std::pow(10.0, logenergy[idx]) - shift_cgs) * inv_c2;
+        const double U_expected = (1.0 + eps_hat_node) / kappa - 1.0;
 
-        const EOSPoint pt = view.evaluate(rho, s, ye, nan_guess());
+        // The adapter's evaluate() takes rho* = kappa*rho (S5's "from here
+        // on, all solver-facing formulas say rho and mean rho*"), not the
+        // table's raw physical rho -- see adapter_audit.cpp's audit_nodes()
+        // for the same convention.
+        const EOSPoint pt = view.evaluate(kappa * rho, s, ye, nan_guess());
 
         CHECK(rel_err(pt.T_F_MeV, T_j) <= 1e-10);
-        CHECK(rel_err(pt.U, eps_hat_node) <= 1e-12);
+        CHECK(rel_err(pt.U, U_expected) <= 1e-12);
         ++n_checked;
       }
     }
@@ -210,30 +229,45 @@ struct SampleStats {
 };
 
 SampleStats run_closed_form_samples(const EntropyEOSView &view, const SyntheticOptions &opts,
-                                     double conv_t, int npts, unsigned seed) {
+                                     double conv_t, double kappa, int npts, unsigned seed) {
   InteriorSampler sampler(opts, seed);
   SampleStats st;
   st.iters_cold.reserve(static_cast<size_t>(npts));
 
   for (int k = 0; k < npts; ++k) {
     const double rho = sampler.rho();
+    const double rho_star = kappa * rho; // evaluate()/srange() take rho* (S5), not physical rho
     const double ye = sampler.ye();
-    const SRange sr = view.srange(rho, ye);
+    const SRange sr = view.srange(rho_star, ye);
     const double s = sampler.s_in(sr, /*s_margin_frac=*/0.05);
 
-    const EOSPoint pt = view.evaluate(rho, s, ye, nan_guess());
+    const EOSPoint pt = view.evaluate(rho_star, s, ye, nan_guess());
     st.iters_cold.push_back(pt.iters);
     if (pt.flags & eeos::flag_maxiter) st.any_maxiter = true;
 
+    // closed_form()'s fields are the *pre-kappa* (Uh-like) quantities (see
+    // its doc comment); apply the same S5 Stage C transform evaluate()
+    // itself applies before comparing against pt's fields. T_F is
+    // unaffected by kappa (it depends only on the solved u, and rho*'s
+    // x-label shift by log10(kappa) exactly cancels against the spline's
+    // own x0-shift by the same amount -- see build_entropy_eos()).
     const ClosedForm cf = closed_form(rho, s, ye, opts, conv_t);
+    const double U_exp = (1.0 + cf.U) / kappa - 1.0;
+    const double Urho_exp = cf.U_rho / kappa;
+    const double Us_exp = cf.U_s / kappa;
+    const double Urhorho_exp = cf.U_rhorho / kappa;
+    const double Urhos_exp = cf.U_rhos / kappa;
+    const double mu_exp = cf.mu_tilde / kappa;
+    const double h_exp = 1.0 + U_exp + rho_star * Urho_exp;
+    const double cs2_exp = (2.0 * rho_star * Urho_exp + rho_star * rho_star * Urhorho_exp) / h_exp;
 
-    st.max_rel_U = std::max(st.max_rel_U, rel_err(pt.U, cf.U));
-    st.max_rel_U_rho = std::max(st.max_rel_U_rho, rel_err(pt.U_rho, cf.U_rho));
-    st.max_rel_U_s = std::max(st.max_rel_U_s, rel_err(pt.U_s, cf.U_s));
-    st.max_rel_U_rhorho = std::max(st.max_rel_U_rhorho, rel_err(pt.U_rhorho, cf.U_rhorho));
-    st.max_rel_U_rhos = std::max(st.max_rel_U_rhos, rel_err(pt.U_rhos, cf.U_rhos));
-    st.max_rel_mu = std::max(st.max_rel_mu, rel_err(pt.mu_tilde, cf.mu_tilde));
-    st.max_rel_cs2 = std::max(st.max_rel_cs2, rel_err(pt.cs2, cf.cs2));
+    st.max_rel_U = std::max(st.max_rel_U, rel_err(pt.U, U_exp));
+    st.max_rel_U_rho = std::max(st.max_rel_U_rho, rel_err(pt.U_rho, Urho_exp));
+    st.max_rel_U_s = std::max(st.max_rel_U_s, rel_err(pt.U_s, Us_exp));
+    st.max_rel_U_rhorho = std::max(st.max_rel_U_rhorho, rel_err(pt.U_rhorho, Urhorho_exp));
+    st.max_rel_U_rhos = std::max(st.max_rel_U_rhos, rel_err(pt.U_rhos, Urhos_exp));
+    st.max_rel_mu = std::max(st.max_rel_mu, rel_err(pt.mu_tilde, mu_exp));
+    st.max_rel_cs2 = std::max(st.max_rel_cs2, rel_err(pt.cs2, cs2_exp));
     st.max_rel_TF = std::max(st.max_rel_TF, rel_err(pt.T_F_MeV, cf.T_F_MeV));
   }
   return st;
@@ -267,10 +301,10 @@ TEST_CASE("EntropyEOSView::evaluate: closed-form comparison and grid convergence
   const EntropyEOSView view_fine = adapter_fine.view();
 
   const int npts = 500;
-  const SampleStats st_default =
-      run_closed_form_samples(view_default, opts_default, adapter_default.conv_t(), npts, 20260825u);
-  const SampleStats st_fine =
-      run_closed_form_samples(view_fine, opts_fine, adapter_fine.conv_t(), npts, 20260826u);
+  const SampleStats st_default = run_closed_form_samples(
+      view_default, opts_default, adapter_default.conv_t(), adapter_default.kappa(), npts, 20260825u);
+  const SampleStats st_fine = run_closed_form_samples(view_fine, opts_fine, adapter_fine.conv_t(),
+                                                        adapter_fine.kappa(), npts, 20260826u);
 
   print_sample_stats("test_adapter 3: default-grid (40x30x10) max relative errors", st_default);
   print_sample_stats("test_adapter 3: fine-grid (120x120x12) max relative errors", st_fine);
@@ -450,17 +484,38 @@ TEST_CASE("EntropyEOSView::evaluate: out-of-range flags, always finite") {
   const SRange sr_mid = view.srange(rho_mid, ye_mid);
   const double s_mid = 0.5 * (sr_mid.s_min + sr_mid.s_max);
 
-  SUBCASE("s below range -> flag_ext_s_low, u_solved == u_lo") {
+  // M2d-2: a moderately out-of-range s now lands the T-solve *inside* the
+  // designed extension zone (a genuine root of sigma_ext, not pinned at the
+  // physical edge) -- see tests/test_adapter.cpp test 9 below for the full
+  // extended-T-solve round trip. Only an s beyond even the extended bracket
+  // hard-clamps at the extended edge.
+  SUBCASE("s below range -> flag_ext_s_low, u_solved in the extension zone") {
     const EOSPoint pt = view.evaluate(rho_mid, sr_mid.s_min - 1.0, ye_mid, nan_guess());
     CHECK((pt.flags & eeos::flag_ext_s_low) != 0);
-    CHECK(pt.u_solved == view.u_lo);
+    CHECK(pt.u_solved < view.u_lo);
+    CHECK(pt.u_solved >= view.u_ext_lo);
     check_finite(pt);
   }
 
-  SUBCASE("s above range -> flag_ext_s_high, u_solved == u_hi") {
+  SUBCASE("s far below the extended bracket -> hard clamp at u_ext_lo") {
+    const EOSPoint pt = view.evaluate(rho_mid, sr_mid.s_min - 1.0e6, ye_mid, nan_guess());
+    CHECK((pt.flags & eeos::flag_ext_s_low) != 0);
+    CHECK(pt.u_solved == view.u_ext_lo);
+    check_finite(pt);
+  }
+
+  SUBCASE("s above range -> flag_ext_s_high, u_solved in the extension zone") {
     const EOSPoint pt = view.evaluate(rho_mid, sr_mid.s_max + 1.0, ye_mid, nan_guess());
     CHECK((pt.flags & eeos::flag_ext_s_high) != 0);
-    CHECK(pt.u_solved == view.u_hi);
+    CHECK(pt.u_solved > view.u_hi);
+    CHECK(pt.u_solved <= view.u_ext_hi);
+    check_finite(pt);
+  }
+
+  SUBCASE("s far above the extended bracket -> hard clamp at u_ext_hi") {
+    const EOSPoint pt = view.evaluate(rho_mid, sr_mid.s_max + 1.0e6, ye_mid, nan_guess());
+    CHECK((pt.flags & eeos::flag_ext_s_high) != 0);
+    CHECK(pt.u_solved == view.u_ext_hi);
     check_finite(pt);
   }
 
@@ -487,6 +542,34 @@ TEST_CASE("EntropyEOSView::evaluate: out-of-range flags, always finite") {
   SUBCASE("Ye above range -> flag_clamp_ye") {
     const EOSPoint pt = view.evaluate(rho_mid, s_mid, view.y_hi + 0.1, nan_guess());
     CHECK((pt.flags & eeos::flag_clamp_ye) != 0);
+    check_finite(pt);
+  }
+
+  // M2d-2 corner case: both rho *and* s outside the physical box at once
+  // (the "apply the u-tail first at the x-clamped seam, then the x-tail on
+  // the resulting tracks" composition order -- core/adapter_eval.hpp's
+  // aeval_extended()) still returns a finite, correctly-flagged, monotone
+  // (U_s > 0) point.
+  SUBCASE("corner: rho below grid AND s below range -> both flags, finite") {
+    const double rho_below = std::pow(10.0, view.x_lo) * 1e-2; // 2 decades below x_lo
+    // A generously large s offset: the x-low tail's entropy grows without
+    // bound as rho drops (S7's "sigma_x -> const < 0", entropy increases
+    // as density decreases), so sr_mid's *physical-x* s_min is not a tight
+    // local bound this far into the x-tail -- 100 kB/baryon comfortably
+    // clears any such shift for this synthetic table's O(10) entropy scale.
+    const EOSPoint pt = view.evaluate(rho_below, sr_mid.s_min - 100.0, ye_mid, nan_guess());
+    CHECK((pt.flags & eeos::flag_ext_rho_low) != 0);
+    CHECK((pt.flags & eeos::flag_ext_s_low) != 0);
+    CHECK(pt.U_s > 0.0);
+    check_finite(pt);
+  }
+
+  SUBCASE("corner: rho above grid AND s above range -> both flags, finite") {
+    const double rho_above = std::pow(10.0, view.x_hi) * 1e2; // 2 decades above x_hi
+    const EOSPoint pt = view.evaluate(rho_above, sr_mid.s_max + 100.0, ye_mid, nan_guess());
+    CHECK((pt.flags & eeos::flag_oob_rho_high) != 0);
+    CHECK((pt.flags & eeos::flag_ext_s_high) != 0);
+    CHECK(pt.U_s > 0.0);
     check_finite(pt);
   }
 }
@@ -530,11 +613,15 @@ TEST_CASE("EntropyEOSView::srange: matches closed-form s(rho, T_min/T_max, Ye) a
   EntropyEOS adapter = eeos::build_entropy_eos(table);
   const EntropyEOSView view = adapter.view();
 
+  const double kappa = adapter.kappa();
   for (size_t i = 0; i < table.nrho(); ++i) {
     const double rho = table.rho(i);
     for (size_t k = 0; k < table.nye(); ++k) {
       const double ye = table.yev(k);
-      const SRange sr = view.srange(rho, ye);
+      // srange() takes rho* = kappa*rho (S5); sigma itself (entropy) is not
+      // transformed by kappa -- only the x-label is shifted -- so the
+      // closed-form s reference stays a function of the physical rho.
+      const SRange sr = view.srange(kappa * rho, ye);
 
       const double s_lo_ref = eeos::synthetic_s(rho, opts.temp_min_MeV, ye, opts);
       const double s_hi_ref = eeos::synthetic_s(rho, opts.temp_max_MeV, ye, opts);
@@ -645,4 +732,236 @@ TEST_CASE("build_entropy_eos + evaluate: LS220 real table (guarded)") {
 
 TEST_CASE("build_entropy_eos + evaluate: SRO real table (guarded)") {
   run_real_table_adapter_test(kSROPath, "SRO", 0x5502001u);
+}
+
+// ==========================================================================
+// 9. M2d-2: seam continuity -- FD across each of u_lo, u_hi, x_lo at
+//    offsets +-1e-7 in the seam coordinate, both grids where cheap.
+// ==========================================================================
+//
+// The designed tails match value/1st/2nd derivative to the boundary spline
+// sample exactly at the seam (d=0) by construction (core/adapter_eval.hpp's
+// aeval_ramp_track()); they are not built to make U(seam+eps)-U(seam-eps)
+// vanish, since U (and U_s/U_rho) generically has a nonzero derivative
+// right at the seam -- a symmetric offset of eps=1e-7 straddling it moves U
+// by O(eps * dU/d(seam coord)), which is *not* zero for a physically
+// sensible EOS (verified empirically on the default grid: relative jumps
+// of a few e-7 for U, U_s, and U_rho alike at all three seams -- consistent
+// with the ~O(1) log-axis sensitivities of this table, not a defect). What
+// a broken (non-C2, e.g. clamp-and-flag or a corner-composition-order bug)
+// implementation would instead show is a jump *independent* of eps (an
+// O(1) discontinuity) or several orders of magnitude larger than this
+// natural first-derivative-driven scale; kTol below is set with generous
+// (~30-300x) headroom above the observed natural scale so it stays
+// meaningful without being flaky.
+namespace {
+
+constexpr double kSeamOffset = 1e-7;
+constexpr double kSeamTol = 1e-5;
+
+void check_seam_continuity(const EntropyEOSView &view, const char *label) {
+  std::mt19937 rng(0x5EA30001u ^ static_cast<unsigned>(std::hash<std::string>{}(label)));
+  const double x_margin = 0.1 * (view.x_hi - view.x_lo);
+  std::uniform_real_distribution<double> xq(view.x_lo + x_margin, view.x_hi - x_margin);
+  std::uniform_real_distribution<double> yq(view.y_lo, view.y_hi);
+
+  auto check_pair = [](const EOSPoint &pin, const EOSPoint &pout, const char *seam) {
+    CAPTURE(seam);
+    CHECK(std::isfinite(pin.U));
+    CHECK(std::isfinite(pout.U));
+    CHECK(rel_err(pout.U, pin.U) <= kSeamTol);
+    CHECK(rel_err(pout.U_s, pin.U_s) <= kSeamTol);
+    CHECK(rel_err(pout.U_rho, pin.U_rho) <= kSeamTol);
+  };
+
+  const int npts = 20;
+  for (int k = 0; k < npts; ++k) {
+    const double x = xq(rng);
+    const double ye = yq(rng);
+    const double rho_star = std::pow(10.0, x);
+    const double u_mid = 0.5 * (view.u_lo + view.u_hi);
+
+    // u_lo seam: inside = u_lo + eps (physical side), outside = u_lo - eps.
+    {
+      const double s_in = view.sigma_extended(rho_star, view.u_lo + kSeamOffset, ye);
+      const double s_out = view.sigma_extended(rho_star, view.u_lo - kSeamOffset, ye);
+      const EOSPoint pin = view.evaluate(rho_star, s_in, ye, nan_guess());
+      const EOSPoint pout = view.evaluate(rho_star, s_out, ye, nan_guess());
+      CHECK((pout.flags & eeos::flag_ext_s_low) != 0);
+      check_pair(pin, pout, "u_lo");
+    }
+    // u_hi seam: inside = u_hi - eps, outside = u_hi + eps.
+    {
+      const double s_in = view.sigma_extended(rho_star, view.u_hi - kSeamOffset, ye);
+      const double s_out = view.sigma_extended(rho_star, view.u_hi + kSeamOffset, ye);
+      const EOSPoint pin = view.evaluate(rho_star, s_in, ye, nan_guess());
+      const EOSPoint pout = view.evaluate(rho_star, s_out, ye, nan_guess());
+      CHECK((pout.flags & eeos::flag_ext_s_high) != 0);
+      check_pair(pin, pout, "u_hi");
+    }
+    // x_lo seam: inside = x_lo + eps, outside = x_lo - eps, at a fixed u
+    // well inside the physical range (only x crosses a seam here).
+    {
+      const double rho_in = std::pow(10.0, view.x_lo + kSeamOffset);
+      const double rho_out = std::pow(10.0, view.x_lo - kSeamOffset);
+      const double s = view.sigma_extended(rho_in, u_mid, ye);
+      const EOSPoint pin = view.evaluate(rho_in, s, ye, nan_guess());
+      const EOSPoint pout = view.evaluate(rho_out, s, ye, nan_guess());
+      CHECK((pout.flags & eeos::flag_ext_rho_low) != 0);
+      check_pair(pin, pout, "x_lo");
+    }
+
+    // Deep in the tails: finite and flagged correctly (u_lo tail, halfway
+    // to the extended edge).
+    {
+      const double u_deep = view.u_lo - 0.5 * (view.u_lo - view.u_ext_lo);
+      const double s_deep = view.sigma_extended(rho_star, u_deep, ye);
+      const EOSPoint pt = view.evaluate(rho_star, s_deep, ye, nan_guess());
+      CHECK(std::isfinite(pt.U));
+      CHECK(std::isfinite(pt.U_s));
+      CHECK(pt.U_s > 0.0);
+      CHECK((pt.flags & eeos::flag_ext_s_low) != 0);
+    }
+  }
+}
+
+} // namespace
+
+TEST_CASE("EntropyEOSView::evaluate: seam continuity across u_lo/u_hi/x_lo (M2d-2 C2 tails)") {
+  SyntheticOptions opts_default; // 40x30x10
+  SyntheticOptions opts_fine = opts_default;
+  opts_fine.nrho = 120;
+  opts_fine.ntemp = 120;
+  opts_fine.nye = 12;
+
+  EntropyEOS adapter_default = build_synthetic(opts_default);
+  EntropyEOS adapter_fine = build_synthetic(opts_fine);
+
+  check_seam_continuity(adapter_default.view(), "default");
+  check_seam_continuity(adapter_fine.view(), "fine");
+}
+
+// ==========================================================================
+// 10. M2d-2: extended T-solve -- s beyond the physical range still solves
+//     to a finite, correctly-flagged point, and evaluate() round-trips a
+//     point chosen inside the extension zone via sigma_extended().
+// ==========================================================================
+
+TEST_CASE("EntropyEOSView::evaluate: extended T-solve (s beyond range; round trip in the extension)") {
+  SyntheticOptions opts; // default grid
+  EntropyEOS adapter = build_synthetic(opts);
+  const EntropyEOSView view = adapter.view();
+  const double kappa = adapter.kappa();
+
+  InteriorSampler sampler(opts, 0x31415926u);
+  const int npts = 30;
+  for (int k = 0; k < npts; ++k) {
+    const double rho = sampler.rho();
+    const double ye = sampler.ye();
+    const double rho_star = kappa * rho;
+    const SRange sr = view.srange(rho_star, ye);
+
+    // s_min(rho,Ye) - 2 kB / s_max + 2 kB.
+    {
+      const double s = sr.s_min - 2.0;
+      const EOSPoint pt = view.evaluate(rho_star, s, ye, nan_guess());
+      CHECK((pt.flags & eeos::flag_ext_s_low) != 0);
+      CHECK(std::isfinite(pt.U));
+      CHECK(std::isfinite(pt.U_s));
+      CHECK(pt.U_s > 0.0);
+      CHECK(pt.T_F_MeV < opts.temp_min_MeV);
+      CHECK(pt.u_solved < view.u_lo);
+    }
+    {
+      const double s = sr.s_max + 2.0;
+      const EOSPoint pt = view.evaluate(rho_star, s, ye, nan_guess());
+      CHECK((pt.flags & eeos::flag_ext_s_high) != 0);
+      CHECK(std::isfinite(pt.U));
+      CHECK(std::isfinite(pt.U_s));
+      CHECK(pt.U_s > 0.0);
+      CHECK(pt.T_F_MeV > opts.temp_max_MeV);
+      CHECK(pt.u_solved > view.u_hi);
+    }
+
+    // Round trip within the extension: pick u_ext strictly inside the
+    // extension zone on each side, get s_ext via sigma_extended() (the
+    // audit/testing hook -- eos-adapter-F-to-U.md S7 / core/adapter_eval.hpp),
+    // then evaluate(rho_star, s_ext, ye) must return u_solved == u_ext to
+    // 1e-10.
+    const double u_ext_below = view.u_lo - 0.5 * (view.u_lo - view.u_ext_lo);
+    const double s_ext_below = view.sigma_extended(rho_star, u_ext_below, ye);
+    const EOSPoint pt_below = view.evaluate(rho_star, s_ext_below, ye, nan_guess());
+    CHECK(rel_err(pt_below.u_solved, u_ext_below) <= 1e-10);
+    CHECK((pt_below.flags & eeos::flag_ext_s_low) != 0);
+
+    const double u_ext_above = view.u_hi + 0.5 * (view.u_ext_hi - view.u_hi);
+    const double s_ext_above = view.sigma_extended(rho_star, u_ext_above, ye);
+    const EOSPoint pt_above = view.evaluate(rho_star, s_ext_above, ye, nan_guess());
+    CHECK(rel_err(pt_above.u_solved, u_ext_above) <= 1e-10);
+    CHECK((pt_above.flags & eeos::flag_ext_s_high) != 0);
+  }
+}
+
+// ==========================================================================
+// 11. M2d-2: U >= 0 over the extended box (the kappa scan now covers the
+//     extensions too -- host/adapter_build.cpp's scan_extended_eps_floor()).
+// ==========================================================================
+
+TEST_CASE("EntropyEOSView::evaluate: U >= 0 over the extended box (synthetic table)") {
+  SyntheticOptions opts; // default grid
+  EntropyEOS adapter = build_synthetic(opts);
+  const EntropyEOSView view = adapter.view();
+
+  std::mt19937 rng(0xE1E5F100u);
+  std::uniform_real_distribution<double> xq(view.x_ext_lo, view.x_ext_hi);
+  std::uniform_real_distribution<double> uq(view.u_ext_lo, view.u_ext_hi);
+  std::uniform_real_distribution<double> yq(view.y_lo, view.y_hi);
+
+  const int npts = 20000;
+  int n_checked = 0;
+  for (int k = 0; k < npts; ++k) {
+    const double x = xq(rng);
+    const double u = uq(rng);
+    const double ye = yq(rng);
+    const double rho_star = std::pow(10.0, x);
+    const double s = view.sigma_extended(rho_star, u, ye);
+
+    const EOSPoint pt = view.evaluate(rho_star, s, ye, nan_guess());
+    CHECK(std::isfinite(pt.U));
+    CHECK(pt.U >= 0.0);
+    ++n_checked;
+  }
+  CHECK(n_checked == npts);
+}
+
+// ==========================================================================
+// 12. M2d-2: sigma_extended() is strictly monotone increasing in u across
+//     the whole extended range (finite differences, random (rho,Ye) lines).
+// ==========================================================================
+
+TEST_CASE("EntropyEOSView::sigma_extended: strictly monotone increasing in u across the extended range") {
+  SyntheticOptions opts; // default grid
+  EntropyEOS adapter = build_synthetic(opts);
+  const EntropyEOSView view = adapter.view();
+
+  std::mt19937 rng(0x11235813u);
+  std::uniform_real_distribution<double> xq(view.x_lo, view.x_hi);
+  std::uniform_real_distribution<double> yq(view.y_lo, view.y_hi);
+
+  const int nlines = 20;
+  const int nsteps = 400;
+  for (int line = 0; line < nlines; ++line) {
+    const double x = xq(rng);
+    const double ye = yq(rng);
+    const double rho_star = std::pow(10.0, x);
+
+    double prev = view.sigma_extended(rho_star, view.u_ext_lo, ye);
+    for (int i = 1; i <= nsteps; ++i) {
+      const double u =
+          view.u_ext_lo + (view.u_ext_hi - view.u_ext_lo) * static_cast<double>(i) / static_cast<double>(nsteps);
+      const double cur = view.sigma_extended(rho_star, u, ye);
+      CHECK(cur > prev);
+      prev = cur;
+    }
+  }
 }

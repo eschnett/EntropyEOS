@@ -128,6 +128,60 @@ struct ScanResult {
   AdapterAudit audit;
 };
 
+// M2d-2: min eps_hat over the *extended* box (opts.ext_cells grid cells
+// beyond the physical box on every side of x and u), sampled at the same
+// refinement as scan_refined_grid() below but through the designed-tail
+// evaluator evaluate() itself uses (core/adapter_eval.hpp's
+// detail::aeval_extended()) instead of a plain bspline_eval3() -- see
+// build_entropy_eos()'s step 3 doc comment for why this must run (the L
+// u-low tail can dip eps_hat below the table's own minimum) and why it is
+// safe to run with the *unshifted* x0 (kappa is not yet known at this
+// point in build_entropy_eos()). Only L is needed (eps_hat is purely a
+// function of it); sigma does not participate in the eps floor.
+double scan_extended_eps_floor(const BsplineView3 &L_view, double x0, double hx, int nx, double u0,
+                                double hu, int nu, double y0, double hy, int ny, int refine, int ext_cells,
+                                double slope_floor_L, double shift_hat, double inv_c2) {
+  const double x_lo = x0, x_hi = x0 + static_cast<double>(nx - 1) * hx;
+  const double u_lo = u0, u_hi = u0 + static_cast<double>(nu - 1) * hu;
+  const double x_ext_lo = x_lo - static_cast<double>(ext_cells) * hx;
+  const double u_ext_lo = u_lo - static_cast<double>(ext_cells) * hu;
+
+  const int rx = (nx - 1 + 2 * ext_cells) * refine + 1;
+  const int ru = (nu - 1 + 2 * ext_cells) * refine + 1;
+  const int ry = (ny - 1) * refine + 1;
+  const double dx = hx / static_cast<double>(refine);
+  const double du = hu / static_cast<double>(refine);
+  const double dy = hy / static_cast<double>(refine);
+
+  const int nthreads = max_threads();
+  std::vector<double> local_min(static_cast<std::size_t>(nthreads), std::numeric_limits<double>::infinity());
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int ky = 0; ky < ry; ++ky) {
+    const int tid = this_thread();
+    const double y = y0 + static_cast<double>(ky) * dy;
+    double &m = local_min[static_cast<std::size_t>(tid)];
+
+    for (int ju = 0; ju < ru; ++ju) {
+      const double u = u_ext_lo + static_cast<double>(ju) * du;
+      for (int ix = 0; ix < rx; ++ix) {
+        const double x = x_ext_lo + static_cast<double>(ix) * dx;
+
+        const BsplineEval3 Lv =
+            detail::aeval_extended(L_view, x, u, y, x_lo, x_hi, u_lo, u_hi, slope_floor_L, /*x_low_slope_zero=*/true);
+        const double eps_hat = std::pow(10.0, Lv.f) * inv_c2 - shift_hat;
+        if (eps_hat < m) m = eps_hat;
+      }
+    }
+  }
+
+  double result = std::numeric_limits<double>::infinity();
+  for (int t = 0; t < nthreads; ++t) result = std::min(result, local_min[static_cast<std::size_t>(t)]);
+  return result;
+}
+
 // One pass over a refine-times-refined grid spanning the whole (unshifted)
 // physical box, evaluating both fitted splines at every sample point:
 // tracks the running minimum of eps_hat (for the S5 kappa floor) and the
@@ -195,10 +249,14 @@ ScanResult scan_refined_grid(const BsplineView3 &sigma_view, const BsplineView3 
 
 EntropyEOS::EntropyEOS(Bspline3 sigma, Bspline3 L, double kappa, double m_B_star_g, double m_B_table_g,
                         double shift_hat, double conv_t, double x_lo, double x_hi, double u_lo, double u_hi,
-                        double y_lo, double y_hi, AdapterAudit audit, int max_iter)
+                        double y_lo, double y_hi, double x_ext_lo, double x_ext_hi, double u_ext_lo,
+                        double u_ext_hi, double ext_slope_floor_sigma, double ext_slope_floor_L,
+                        AdapterAudit audit, int max_iter)
     : sigma_(std::move(sigma)), L_(std::move(L)), kappa_(kappa), m_B_star_g_(m_B_star_g),
       m_B_table_g_(m_B_table_g), shift_hat_(shift_hat), conv_t_(conv_t), x_lo_(x_lo), x_hi_(x_hi),
-      u_lo_(u_lo), u_hi_(u_hi), y_lo_(y_lo), y_hi_(y_hi), max_iter_(max_iter), audit_(std::move(audit)) {}
+      u_lo_(u_lo), u_hi_(u_hi), y_lo_(y_lo), y_hi_(y_hi), x_ext_lo_(x_ext_lo), x_ext_hi_(x_ext_hi),
+      u_ext_lo_(u_ext_lo), u_ext_hi_(u_ext_hi), ext_slope_floor_sigma_(ext_slope_floor_sigma),
+      ext_slope_floor_L_(ext_slope_floor_L), max_iter_(max_iter), audit_(std::move(audit)) {}
 
 EntropyEOSView EntropyEOS::view() const {
   EntropyEOSView v;
@@ -214,6 +272,12 @@ EntropyEOSView EntropyEOS::view() const {
   v.u_hi = u_hi_;
   v.y_lo = y_lo_;
   v.y_hi = y_hi_;
+  v.x_ext_lo = x_ext_lo_;
+  v.x_ext_hi = x_ext_hi_;
+  v.u_ext_lo = u_ext_lo_;
+  v.u_ext_hi = u_ext_hi_;
+  v.ext_slope_floor_sigma = ext_slope_floor_sigma_;
+  v.ext_slope_floor_L = ext_slope_floor_L_;
   v.max_iter = max_iter_;
   return v;
 }
@@ -269,9 +333,17 @@ EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
   const ScanResult scan = scan_refined_grid(sigma_raw.view(), L_raw.view(), x0, hx, inx, u0, hu, inu, y0,
                                              hy, iny, opts.refine, shift_hat, inv_c2);
 
+  // M2d-2: the eps floor must also cover the extension zones (build_entropy_eos()'s
+  // doc comment step 3) -- scan the extended box too, with the unshifted x0
+  // (kappa-independent, see that comment), and fold its min in alongside
+  // the physical-box scan's own.
+  const double ext_eps_min =
+      scan_extended_eps_floor(L_raw.view(), x0, hx, inx, u0, hu, inu, y0, hy, iny, opts.refine,
+                               opts.ext_cells, opts.ext_slope_floor_L, shift_hat, inv_c2);
+  const double eps_hat_min = std::min(scan.eps_hat_min, ext_eps_min);
+
   const double eps_floor =
-      std::min(0.0, scan.eps_hat_min - (opts.kappa_margin_abs +
-                                         opts.kappa_margin_rel * std::fabs(scan.eps_hat_min)));
+      std::min(0.0, eps_hat_min - (opts.kappa_margin_abs + opts.kappa_margin_rel * std::fabs(eps_hat_min)));
   const double kappa = 1.0 + eps_floor;
   const double m_B_star_g = kappa * opts.m_B_table_g;
   const double x0_star = x0 + std::log10(kappa);
@@ -289,8 +361,18 @@ EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
   const double y_lo = y0;
   const double y_hi = y0 + static_cast<double>(nye - 1) * hy;
 
+  // M2d-2 extended box: same log10(kappa) shift as x_lo/x_hi above (the
+  // extension's blend width and extent are physical grid-cell counts, so
+  // they ride along with the relabeling unchanged).
+  const double x_ext_lo = x_lo - static_cast<double>(opts.ext_cells) * hx;
+  const double x_ext_hi = x_hi + static_cast<double>(opts.ext_cells) * hx;
+  const double u_ext_lo = u_lo - static_cast<double>(opts.ext_cells) * hu;
+  const double u_ext_hi = u_hi + static_cast<double>(opts.ext_cells) * hu;
+
   return EntropyEOS(std::move(sigma_final), std::move(L_final), kappa, m_B_star_g, opts.m_B_table_g,
-                     shift_hat, conv_t, x_lo, x_hi, u_lo, u_hi, y_lo, y_hi, scan.audit, /*max_iter=*/50);
+                     shift_hat, conv_t, x_lo, x_hi, u_lo, u_hi, y_lo, y_hi, x_ext_lo, x_ext_hi, u_ext_lo,
+                     u_ext_hi, opts.ext_slope_floor_sigma, opts.ext_slope_floor_L, scan.audit,
+                     /*max_iter=*/50);
 }
 
 } // namespace eeos
