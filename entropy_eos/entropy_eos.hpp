@@ -12,7 +12,9 @@
 // IWYU pragma: begin_exports
 #include "entropy_eos/core/adapter_eval.hpp"
 #include "entropy_eos/core/bspline_eval.hpp"
+#include "entropy_eos/core/con2prim.hpp"
 #include "entropy_eos/core/defs.hpp"
+#include "entropy_eos/core/prim2con.hpp"
 
 #include "entropy_eos/host/adapter_build.hpp"
 #include "entropy_eos/host/bspline_fit.hpp"
