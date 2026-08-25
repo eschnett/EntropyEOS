@@ -16,8 +16,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <unistd.h> // mkdtemp (POSIX; macOS declares it in unistd.h, glibc in stdlib.h)
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,13 +38,28 @@ using eeos::SyntheticOptions;
 
 namespace {
 
-// Scratch files go here, per the task's sandboxing convention -- never into
-// the repo's own tables/ or tests/ directories.
-const std::string kScratchDir =
-    "/private/tmp/claude-505/-Users-eschnett-src-EntropyEOS/934472f4-9180-46bf-b6f7-d5c721742315/"
-    "scratchpad/";
-
-std::string scratch_path(const std::string &name) { return kScratchDir + name; }
+// Scratch files go into a per-run temporary directory (mkdtemp under
+// $TMPDIR, falling back to /tmp) -- never into the repo's own tables/ or
+// tests/ directories, and never a machine-specific absolute path, so the
+// suite runs anywhere (in particular in CI). The directory is created once
+// per process and intentionally left behind: HDF5 files from a failed run
+// are exactly what one wants to inspect, and the OS reaps its temp dirs.
+std::string scratch_path(const std::string &name) {
+  static const std::string dir = [] {
+    const char *tmp = std::getenv("TMPDIR");
+    std::string tmpl = (tmp != nullptr && *tmp != '\0' ? std::string(tmp) : std::string("/tmp"));
+    if (tmpl.back() != '/') tmpl += '/';
+    tmpl += "eeos_test_io_XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (mkdtemp(buf.data()) == nullptr) {
+      std::perror("test_io_stellarcollapse: mkdtemp");
+      std::abort();
+    }
+    return std::string(buf.data()) + "/";
+  }();
+  return dir + name;
+}
 
 // The two real ground-truth files (see the task description); tests that
 // use them are guarded by table_exists() so CI (which has no tables/)
