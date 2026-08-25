@@ -97,7 +97,10 @@ void print_usage(std::ostream &os) {
         "                       override (also caps --csv)\n"
         "  --tol X              CheckOptions::tol_consistency override (--level table\n"
         "                       only)\n"
-        "  --m-B GRAMS          CheckOptions::m_B_g override (--level table only)\n"
+        "  --m-B GRAMS          the table's baryon-mass convention: CheckOptions::m_B_g\n"
+        "                       (--level table) or BuildOptions::m_B_table_g (--level\n"
+        "                       adapter). Default is the amu; SRO tables empirically\n"
+        "                       use the neutron mass 1.67492749804e-24 g (see CODE.md)\n"
         "  --no-repair          --level adapter only: skip the default in-memory\n"
         "                       repair_table() pass and build directly from the\n"
         "                       loaded table\n"
@@ -473,7 +476,14 @@ int run_adapter_level(const ParsedArgs &pa) {
   // build_entropy_eos() failures propagate to main()'s catch block, which
   // prints "eos_test: <message>" to stderr and exits kExitFatal (2) -- the
   // "build failure -> message to stderr, exit 2" contract.
-  const eeos::EntropyEOS adapter = eeos::build_entropy_eos(table);
+  eeos::BuildOptions bopts;
+  if (pa.have_m_B) {
+    // The table's baryon-mass convention. Empirically (delta_T quantile
+    // collapse, CODE.md "M2 design notes"): SRO tables use the neutron mass
+    // m_neutron_g; pass --m-B 1.67492749804e-24 for those.
+    bopts.m_B_table_g = pa.m_B;
+  }
+  const eeos::EntropyEOS adapter = eeos::build_entropy_eos(table, bopts);
 
   eeos::AdapterCheckOptions aopts;
   if (pa.have_node_stride) {

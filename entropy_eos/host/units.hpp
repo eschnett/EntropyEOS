@@ -21,6 +21,13 @@ constexpr double c_light_cm_s = 2.99792458e10;
 // Atomic mass unit, g. CODATA 2018: 1 u = 1.66053906892e-27 kg = 1.66053906892e-24 g.
 constexpr double m_amu_g = 1.66053906892e-24;
 
+// Neutron mass (CODATA 2022). Empirically the baryon-mass convention of the
+// SRO (Schneider-Roberts-Ott) tables: rebuilding the adapter with this m_B
+// collapses the delta_T fidelity quantiles from a flat ~8.7e-3 (the m_n/m_u
+// ratio) to ~1.6e-5 -- see CODE.md "M2 design notes" and the adapter doc's
+// remark that the delta_T audit measures the table's true m_B.
+constexpr double m_neutron_g = 1.67492749804e-24;
+
 // Default baryon mass used to convert between per-baryon and per-gram
 // quantities when a table does not declare its own convention.
 //

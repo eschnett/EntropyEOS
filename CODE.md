@@ -226,8 +226,31 @@ and OpenMP builds).
   (b) adapter core — κ re-zeroing, warm-started monotone T-solve, chain rule, EOSPoint,
   srange, flags — with out-of-range s/ρ *clamped and flagged* as a stopgap;
   (c) `eos_test --level adapter` audit suite (the adapter doc §10 list), validated
-  against the closed-form U(ρ,s,Ye) of the synthetic gas; (d) the smooth C¹/C²
+  against the closed-form U(ρ,s,Ye) of the synthetic gas; (c′) spline-safe repair —
+  the §4 audit-driven diffusion loop, per T-column; (d) the smooth C¹/C²
   domain extensions of adapter doc §7 replacing the clamps, re-audited.
+
+**M2 empirical findings (LS220-2009 and SRO-LS220):**
+
+- **m_B convention measured**: with m_B = amu, SRO's δ_T fidelity quantiles sit *flat*
+  at ~8.7e-3 = m_n/m_u − 1; rebuilding with the neutron mass collapses them to
+  p50 = 1.6e-5, p90 = 1.3e-3 — **SRO's baryon mass is m_n** (`units.hpp
+  m_neutron_g`; pass `--m-B` / `BuildOptions::m_B_table_g`). LS220-2009's convention is
+  indeterminate: its intrinsic inconsistency floor (δ_T p50 ≈ 0.5–0.9% either way,
+  p90 ≈ 40%) buries the signal.
+- **Fidelity verdict (the quintic free-energy question)**: SRO is thermodynamically
+  consistent at the 1e-5–1e-3 level in the bulk (δ_p p50 = 3e-5) — the two-cubic-spline
+  design stands, no quintic refit warranted. LS220-2009 carries genuine percent-level
+  inconsistency with heavy tails; a refit would *redefine* its p/T rather than fix
+  anything — prefer SRO-family tables for production, LS220-2009 for benchmarks.
+- **Residual spline pathologies after spline-safe repair** (per-column loop is 100%
+  clean; these are cross-column ρ/Ye tensor-blending artifacts a per-column repair
+  cannot reach): LS220 275 σ_u / 20650 L_u refined-sample violations, SRO 6201/221537;
+  cold-start round trips land on wrong roots at 11 (LS220) / 711 (SRO) of ~4M nodes;
+  soak physicality: T̂≤0 and cs²≤0 at ≤1 random point per 50k, cs²≥1 at ~4% of
+  uniform-in-log samples (concentrated at the extreme-ρ corner — map before M3).
+  Addressing the residual (2D/3D audit-driven smoothing vs. flag-and-guard in
+  con2prim) is folded into stage (d).
 
 ## Milestones
 
@@ -244,8 +267,13 @@ and OpenMP builds).
 
 ## Open decisions
 
-1. Repair min-slope defaults (inspect actual LS220 violations first).
-2. m_B convention source per table family (file attribute where present, else a
-   documented per-format constant — see Data model).
+1. ~~Repair min-slope defaults~~ — superseded: the spline-safe audit-driven loop (M2c′)
+   adapts to local jump sizes, which no fixed min-slope could; the strict-slope floors
+   remain as cheap placeholders beneath it.
+2. ~~m_B convention~~ — resolved empirically for SRO (neutron mass; see M2 findings);
+   LS220-2009 indeterminate below its own inconsistency floor. Default stays amu;
+   per-table override via `BuildOptions::m_B_table_g` / `eos_test --m-B`.
 3. Whether/when an `extern "C"` shim for C/Fortran consumers is warranted (not before a
    concrete consumer asks).
+4. Residual cross-column spline violations and multi-root pockets: 2D/3D audit-driven
+   smoothing vs. flag-and-guard in con2prim — decide in M2 stage (d).
