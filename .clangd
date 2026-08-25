@@ -1,0 +1,4 @@
+If:
+  PathMatch: entropy_eos/entropy_eos\.hpp
+Diagnostics:
+  UnusedIncludes: None
