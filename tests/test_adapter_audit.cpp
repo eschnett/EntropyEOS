@@ -58,6 +58,11 @@ TEST_CASE("check_adapter: clean synthetic (default grid) reports zero violations
   CHECK(find_class(report, "spline_sigma_u_nonpositive").count == 0);
   CHECK(find_class(report, "spline_L_u_nonpositive").count == 0);
 
+  // roundtrip_T is now audited cold-start (u_guess = NaN, not warm-started
+  // at the node's own T -- see adapter_audit.cpp's audit_nodes()): the
+  // exact synthetic gas's safeguarded Newton/bisection solve still
+  // converges to near machine precision regardless of the starting guess,
+  // so this stays fully green (count 0) even without a warm start.
   const CheckClassResult &roundtrip = find_class(report, "roundtrip_T");
   CHECK(roundtrip.count == 0);
   CHECK(roundtrip.max <= 1e-9);
@@ -68,6 +73,24 @@ TEST_CASE("check_adapter: clean synthetic (default grid) reports zero violations
                                                   << " (default 40x30x10 grid, pure spline error)");
   CHECK(delta_T.max <= 3e-3);
   CHECK(delta_p.max <= 3e-3);
+
+  // Quantiles present (finite) and ordered p50 <= p90 <= p99 <= p999 <= max
+  // for both fidelity diagnostics (see QuantileStats's doc comment).
+  for (const eeos::QuantileStats &q : {report.delta_T_quantiles, report.delta_p_quantiles}) {
+    CHECK(std::isfinite(q.p50));
+    CHECK(std::isfinite(q.p90));
+    CHECK(std::isfinite(q.p99));
+    CHECK(std::isfinite(q.p999));
+    CHECK(std::isfinite(q.max));
+    CHECK(q.p50 <= q.p90);
+    CHECK(q.p90 <= q.p99);
+    CHECK(q.p99 <= q.p999);
+    CHECK(q.p999 <= q.max);
+  }
+  // The quantiles' own max must agree with the CheckClassResult's max (both
+  // are the same underlying metric's maximum over the same audited nodes).
+  CHECK(report.delta_T_quantiles.max == delta_T.max);
+  CHECK(report.delta_p_quantiles.max == delta_p.max);
 
   CHECK(find_class(report, "That_nonpositive").count == 0);
   CHECK(find_class(report, "p_nonpositive").count == 0);
@@ -156,11 +179,28 @@ TEST_CASE("check_adapter: dirty synthetic, repaired in memory, builds and audits
   // Monotonicity/roundtrip classes are allowed to be nonzero here (the
   // wiggle/flatten/offset defects, even after repair, can leave localized
   // spline overshoot) -- only finiteness is asserted, per this module's
-  // contract.
+  // contract. roundtrip_T in particular is audited cold-start now (see
+  // test case 1 above), so a nonzero count here is expected, not a
+  // regression.
   std::cout << "test_adapter_audit 3: spline_sigma_u_nonpositive.count="
             << find_class(report, "spline_sigma_u_nonpositive").count
             << " spline_L_u_nonpositive.count=" << find_class(report, "spline_L_u_nonpositive").count
             << " roundtrip_T.count=" << find_class(report, "roundtrip_T").count << "\n";
+
+  // The dirty preset always carries "logpress" (dirty_synthetic_options()
+  // always fills the core fields), so both quantile structs must be
+  // present (finite) and ordered, same as test case 1.
+  for (const eeos::QuantileStats &q : {report.delta_T_quantiles, report.delta_p_quantiles}) {
+    CHECK(std::isfinite(q.p50));
+    CHECK(std::isfinite(q.p90));
+    CHECK(std::isfinite(q.p99));
+    CHECK(std::isfinite(q.p999));
+    CHECK(std::isfinite(q.max));
+    CHECK(q.p50 <= q.p90);
+    CHECK(q.p90 <= q.p99);
+    CHECK(q.p99 <= q.p999);
+    CHECK(q.p999 <= q.max);
+  }
 
   std::ostringstream oss;
   report.print(oss);
@@ -268,4 +308,9 @@ TEST_CASE("AdapterReport::print: mentions kappa, every class name, evals/sec") {
     CHECK_MESSAGE(text.find(c.name) != std::string::npos,
                   "AdapterReport::print() is missing class name '" << c.name << "'");
   }
+
+  // The delta_T/delta_p quantiles line (see QuantileStats's doc comment).
+  CHECK(text.find("quantiles") != std::string::npos);
+  CHECK(text.find("p50=") != std::string::npos);
+  CHECK(text.find("p999=") != std::string::npos);
 }

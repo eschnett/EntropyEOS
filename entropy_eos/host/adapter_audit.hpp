@@ -55,6 +55,20 @@ struct AdapterCheckOptions {
   double tol_roundtrip = 1e-8;
 };
 
+// Robust distribution summary for a diagnostic metric collected at every
+// audited node (currently "delta_T"/"delta_p" -- see AdapterReport below).
+// CheckClassResult's max/rms are dominated by any single remaining
+// sigma_T~0 pocket (a delta_T/delta_p spike there can be many orders of
+// magnitude above the bulk); these quantiles answer the "how good is the
+// table fidelity, typically" question without being swamped by that one
+// pocket. All fields are NaN together iff the underlying class was skipped
+// (delta_p with no "logpress" -- see check.hpp's NaN-sentinel "skipped"
+// convention, which this mirrors) or, degenerately, zero nodes were
+// audited.
+struct QuantileStats {
+  double p50 = 0.0, p90 = 0.0, p99 = 0.0, p999 = 0.0, max = 0.0;
+};
+
 // Result of check_adapter(). `status` is `fatal` only if some evaluate()
 // call in the audit produced a non-finite EOSPoint member (see
 // `fatal_messages` for where); everything else -- monotonicity violations,
@@ -71,10 +85,19 @@ struct AdapterReport {
 
   // One CheckClassResult per audit below, in this fixed order:
   //   A. "spline_sigma_u_nonpositive", "spline_L_u_nonpositive"   (violation; from the stored build audit)
-  //   B. "roundtrip_T" (violation), "delta_T" (diagnostic), "delta_p" (diagnostic;
-  //      the check.hpp NaN-sentinel "skipped" class if the table has no "logpress")
+  //   B. "roundtrip_T" (violation, cold-start -- see check_adapter()'s doc comment), "delta_T"
+  //      (diagnostic), "delta_p" (diagnostic; the check.hpp NaN-sentinel "skipped" class if the
+  //      table has no "logpress")
   //   C. "That_nonpositive", "p_nonpositive", "cs2_nonpositive", "cs2_acausal" (violations)
   std::vector<CheckClassResult> classes;
+
+  // Quantiles {p50,p90,p99,p999,max} of "delta_T"/"delta_p" over every
+  // finite-metric audited node (not just the CheckClassResult's worst_n
+  // list) -- see QuantileStats's doc comment. delta_p_quantiles is the
+  // all-NaN sentinel whenever the "delta_p" class itself is (no
+  // "logpress" field).
+  QuantileStats delta_T_quantiles;
+  QuantileStats delta_p_quantiles;
 
   // Physicality-soak statistics (class C).
   size_t soak_n = 0;
@@ -83,8 +106,9 @@ struct AdapterReport {
   double evals_per_sec = 0.0;
 
   // Human-readable summary: status, kappa/m_B*, any fatal messages, each
-  // class's count/max/rms and worst offenders (physical rho/T/Ye), then the
-  // soak statistics and iteration histogram.
+  // class's count/max/rms and worst offenders (physical rho/T/Ye), the
+  // delta_T/delta_p quantiles, then the soak statistics and iteration
+  // histogram.
   void print(std::ostream &os) const;
 };
 
@@ -98,10 +122,17 @@ struct AdapterReport {
 //   A. Monotonicity (from the build's stored audit, not recomputed):
 //      sigma_u/L_u minima, violation counts, worst locations (converted to
 //      physical rho/T/Ye).
-//   B. Node round trip and fidelity, every node_stride-th table node:
+//   B. Node round trip and fidelity, every node_stride-th table node,
+//      evaluate() called *cold* (u_guess = NaN, not warm-started at the
+//      node's own T -- see adapter_audit.cpp's audit_nodes() for why: a
+//      warm start at the exact answer made this class trivially green
+//      regardless of solver robustness):
 //      "roundtrip_T" (|T_F/T_node - 1| against opts.tol_roundtrip),
 //      "delta_T" and "delta_p" (m_B*/consistency fidelity diagnostics of
-//      eos-adapter-F-to-U.md S10, never affecting adapter_needs_attention()).
+//      eos-adapter-F-to-U.md S10, never affecting adapter_needs_attention();
+//      AdapterReport::delta_T_quantiles/delta_p_quantiles report their
+//      {p50,p90,p99,p999,max} distribution over every audited node, robust
+//      to the max/rms being dominated by a single leftover pocket).
 //   C. Physicality soak: opts.soak_n deterministic random cold-start
 //      evaluate() calls uniform in the adapter's physical (x*, Ye) box and
 //      in the pointwise entropy range from srange(); "That_nonpositive",

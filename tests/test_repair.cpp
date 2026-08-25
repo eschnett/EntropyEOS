@@ -4,6 +4,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "entropy_eos/core/bspline_eval.hpp"
+#include "entropy_eos/host/bspline_fit.hpp"
 #include "entropy_eos/host/repair.hpp"
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
@@ -421,4 +424,184 @@ TEST_CASE("RepairResult::print: produces non-empty, sane output") {
   std::ostringstream clean_out;
   clean_result.print(clean_out);
   CHECK(clean_out.str().find("no changes") != std::string::npos);
+}
+
+// --- (9) M2c-prime spline-safe repair ---------------------------------------
+//
+// RepairOptions::spline_safe defaults to true (see repair.hpp); every test
+// above already runs with it on and still passes, so it is not disabled
+// anywhere in this file per this milestone's instructions ("if any existing
+// test's expectations depend on plain PAVA output, set spline_safe=false
+// there explicitly" -- none do here: the small hand-worked/synthetic
+// columns above are all too short or too far from a plateau-then-jump shape
+// to trigger the loop, so its presence changes nothing for them).
+
+namespace {
+
+// A single-(irho,kYe)-column table (nrho=1, nye=1, ntemp=col.size()) holding
+// `col` under `field`, for tests that only care about repair_table()'s
+// per-column behavior in isolation.
+RawTable make_single_column_table(const std::string &field, const std::vector<double> &col) {
+  const std::vector<double> logrho = {5.0};
+  const std::vector<double> ye = {0.2};
+  std::vector<double> logtemp(col.size());
+  for (size_t j = 0; j < col.size(); ++j) {
+    logtemp[j] = -1.0 + 0.1 * static_cast<double>(j);
+  }
+
+  RawTable t;
+  t.set_axes(logrho, logtemp, ye);
+  t.add_field(field, col);
+  return t;
+}
+
+// The minimum S' of `data`'s fresh not-a-knot cubic B-spline fit (unit
+// spacing, x0=0, h=1 -- same convention repair.cpp's spline-safe loop uses)
+// over the same refined-sample set repair.hpp's doc comment describes:
+// j + m/refine for j = 0..n-2, m = 0..refine-1, plus the last node.
+double fresh_fit_min_slope(const std::vector<double> &data, int refine = 4) {
+  const int n = static_cast<int>(data.size());
+  const std::vector<double> coeffs = eeos::fit_bspline_1d(data);
+  const eeos::BsplineView1 view{coeffs.data(), n, 0.0, 1.0};
+
+  double min_fx = std::numeric_limits<double>::infinity();
+  for (int j = 0; j + 1 < n; ++j) {
+    for (int m = 0; m < refine; ++m) {
+      const double x = static_cast<double>(j) + static_cast<double>(m) / static_cast<double>(refine);
+      min_fx = std::min(min_fx, eeos::bspline_eval1(view, x).fx);
+    }
+  }
+  min_fx = std::min(min_fx, eeos::bspline_eval1(view, static_cast<double>(n - 1)).fx);
+  return min_fx;
+}
+
+// Hand-built column: a short smooth ramp, a long near-plateau (20 equal
+// values -- PAVA leaves it flat, strictification only adds a
+// min_slope-sized staircase), an abrupt +1.0 jump, then another short
+// smooth ramp. This is the motivating pattern from eos-adapter-F-to-U.md
+// S4 / the M2c-prime work order: the raw data is (after repair_column())
+// strictly increasing, but the near-zero-slope plateau sits immediately
+// next to a much steeper recovery, and a C^2 not-a-knot cubic B-spline fit
+// of that shape rings non-monotone between nodes right at the boundary.
+std::vector<double> plateau_then_jump_column() {
+  std::vector<double> col;
+  double v = 0.0;
+  for (int i = 0; i < 5; ++i) {
+    col.push_back(v);
+    v += 0.05;
+  }
+  const double plateau_val = v;
+  for (int i = 0; i < 20; ++i) {
+    col.push_back(plateau_val);
+  }
+  col.push_back(plateau_val + 1.0);
+  v = plateau_val + 1.0;
+  for (int i = 0; i < 5; ++i) {
+    v += 0.05;
+    col.push_back(v);
+  }
+  return col;
+}
+
+} // namespace
+
+TEST_CASE("repair_table: spline-safe removes a plateau-then-jump spline-monotonicity violation "
+          "that plain PAVA + strictify leaves behind") {
+  const std::vector<double> col = plateau_then_jump_column();
+
+  // Sanity: the pattern is real, i.e. a *plain* repair_column() pass alone
+  // (spline_safe's raw material) already produces a fresh fit with a
+  // non-positive minimum slope -- otherwise this test would not be
+  // exercising anything.
+  {
+    std::vector<double> base = col;
+    eeos::repair_column(base, 1e-8);
+    CHECK(fresh_fit_min_slope(base) <= 0.0);
+  }
+
+  // spline_safe = false: repair_table() only runs the base PAVA +
+  // strictify pass, so the violation survives.
+  {
+    RawTable table = make_single_column_table("entropy", col);
+    RepairOptions opts;
+    opts.fields = {"entropy"};
+    opts.spline_safe = false;
+    eeos::repair_table(table, opts);
+    CHECK(fresh_fit_min_slope(table.field("entropy")) <= 0.0);
+  }
+
+  // spline_safe = true (default): the smoothing loop removes it -- a fresh
+  // fit of the repaired column has S' > spline_slope_floor (0.0) at every
+  // refined sample.
+  {
+    RawTable table = make_single_column_table("entropy", col);
+    RepairOptions opts;
+    opts.fields = {"entropy"};
+    opts.spline_safe = true;
+    const RepairResult result = eeos::repair_table(table, opts);
+    CHECK(fresh_fit_min_slope(table.field("entropy")) > 0.0);
+
+    // The loop actually ran and reports it in the summary.
+    REQUIRE(result.summaries.size() == 1);
+    CHECK(result.summaries[0].spline_columns_smoothed == 1);
+    CHECK(result.summaries[0].spline_rounds_used_max > 0);
+    CHECK(result.summaries[0].spline_columns_still_violating == 0);
+  }
+}
+
+TEST_CASE("repair_table: idempotent with spline_safe on (repair_table() and a synthetic-dirty "
+          "end-to-end)") {
+  // (a) repair_table() applied twice to the same seeded-violation table.
+  {
+    SyntheticOptions opts;
+    opts.nrho = 8;
+    opts.ntemp = 10;
+    opts.nye = 3;
+    opts.seed = {
+        SeededViolation{"entropy", 4, 4, 1, -500.0},
+        SeededViolation{"logenergy", 2, 6, 0, -20.0},
+    };
+    RawTable table = eeos::make_synthetic_table(opts);
+
+    const RepairOptions ropts; // spline_safe = true (default)
+    const RepairResult first = eeos::repair_table(table, ropts);
+    CHECK_FALSE(first.entries.empty());
+
+    const RawTable after_first = table;
+    const RepairResult second = eeos::repair_table(table, ropts);
+    CHECK(second.entries.empty());
+    CHECK(second.status == eeos::Status::ok);
+    CHECK(fields_bit_identical(after_first, table, "entropy"));
+    CHECK(fields_bit_identical(after_first, table, "logenergy"));
+  }
+
+  // (b) synthetic-dirty end-to-end: the fixed LS220/SRO-mimicking defect
+  // preset (near-plateaus, wiggle clusters, ...) is exactly the kind of
+  // input the spline-safe loop targets, so this exercises idempotence
+  // through the loop itself, not just the base pass.
+  {
+    RawTable table = eeos::make_synthetic_table(eeos::dirty_synthetic_options());
+    const RepairResult first = eeos::repair_table(table);
+    CHECK_FALSE(first.entries.empty());
+
+    const RawTable after_first = table;
+    const RepairResult second = eeos::repair_table(table);
+    CHECK(second.entries.empty());
+    CHECK(second.status == eeos::Status::ok);
+    CHECK(fields_bit_identical(after_first, table, "entropy"));
+    CHECK(fields_bit_identical(after_first, table, "logenergy"));
+  }
+}
+
+TEST_CASE("repair_table: deterministic with spline_safe on (synthetic-dirty, independent builds)") {
+  RawTable table_a = eeos::make_synthetic_table(eeos::dirty_synthetic_options());
+  RawTable table_b = eeos::make_synthetic_table(eeos::dirty_synthetic_options());
+
+  const RepairResult result_a = eeos::repair_table(table_a);
+  const RepairResult result_b = eeos::repair_table(table_b);
+
+  CHECK_FALSE(result_a.entries.empty());
+  CHECK(entries_equal(result_a.entries, result_b.entries));
+  CHECK(fields_bit_identical(table_a, table_b, "entropy"));
+  CHECK(fields_bit_identical(table_a, table_b, "logenergy"));
 }

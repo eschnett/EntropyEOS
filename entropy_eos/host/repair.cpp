@@ -5,6 +5,9 @@
 #include <stdexcept>
 #include <utility>
 
+#include "entropy_eos/core/bspline_eval.hpp"
+#include "entropy_eos/host/bspline_fit.hpp"
+
 namespace eeos {
 
 void repair_column(std::vector<double> &col, double min_slope) {
@@ -73,6 +76,129 @@ double min_slope_for(const std::string &field, const RepairOptions &options) {
                                "' (only \"entropy\" and \"logenergy\" are supported)");
 }
 
+// --- M2c-prime spline-safe smoothing loop (repair.hpp step 1) --------------
+
+// Fits `col` at unit spacing (x0=0, h=1) and samples S' at every audit point
+// (repair.hpp's repair_table() doc comment, step 1b): cell j = 0..n-2 at j +
+// m/refine for m = 0..refine-1, plus the column's last node. Sets
+// offending[j] whenever any sample inside cell j has S' <= floor; returns
+// true iff at least one cell was marked.
+bool spline_audit_column(const std::vector<double> &col, int refine, double slope_floor,
+                          std::vector<char> &offending) {
+  const int n = static_cast<int>(col.size());
+  offending.assign(static_cast<size_t>(n > 0 ? n - 1 : 0), 0);
+  if (n < 2) {
+    return false;
+  }
+
+  const std::vector<double> coeffs = fit_bspline_1d(col);
+  const BsplineView1 view{coeffs.data(), n, 0.0, 1.0};
+
+  bool any = false;
+  const int refine_clamped = std::max(refine, 1);
+  for (int j = 0; j + 1 < n; ++j) {
+    for (int m = 0; m < refine_clamped; ++m) {
+      const double x =
+          static_cast<double>(j) + static_cast<double>(m) / static_cast<double>(refine_clamped);
+      const BsplineEval1 e = bspline_eval1(view, x);
+      if (e.fx <= slope_floor) {
+        offending[static_cast<size_t>(j)] = 1;
+        any = true;
+      }
+    }
+  }
+  // The last node (x = n-1) is never hit by the j+m/refine sweep above (its
+  // m only reaches (refine-1)/refine within the last cell) -- sample it
+  // explicitly, attributed to the last cell.
+  {
+    const BsplineEval1 e = bspline_eval1(view, static_cast<double>(n - 1));
+    if (e.fx <= slope_floor) {
+      offending[static_cast<size_t>(n - 2)] = 1;
+      any = true;
+    }
+  }
+  return any;
+}
+
+// One Jacobi diffusion step (repair.hpp step 1d), applied in place to every
+// *interior* index marked in `marked` (column endpoints never move, even if
+// marked): v_j <- v_j + alpha*(v_{j-1} - 2*v_j + v_{j+1}), using the
+// pre-step snapshot on the right-hand side so the result does not depend on
+// the order marked indices are visited in.
+void jacobi_diffuse_step(std::vector<double> &col, const std::vector<char> &marked, double alpha) {
+  const size_t n = col.size();
+  if (n < 3) {
+    return;
+  }
+  const std::vector<double> before = col;
+  for (size_t j = 1; j + 1 < n; ++j) {
+    if (!marked[j]) {
+      continue;
+    }
+    col[j] = before[j] + alpha * (before[j - 1] - 2.0 * before[j] + before[j + 1]);
+  }
+}
+
+// Per-column outcome of the spline-safe loop, folded into
+// RepairResult::FieldSummary by repair_table().
+struct SplineSafeStats {
+  int rounds_used = 0;        // smoothing rounds actually run on this column
+  bool needed_smoothing = false;
+  bool still_violating = false; // cap reached with an audit violation remaining
+};
+
+// Runs the spline-safe smoothing loop on `col` in place (repair.hpp's
+// repair_table() doc comment, step 1); `col` must already have passed
+// through repair_column(col, min_slope) once (the base pass, step 0). No-op
+// (returns default-constructed stats) if fit_bspline_1d() cannot fit the
+// column (n < 4) -- too short to safely audit/smooth.
+SplineSafeStats spline_safe_column(std::vector<double> &col, double min_slope,
+                                    const RepairOptions &options) {
+  SplineSafeStats stats;
+  const int n = static_cast<int>(col.size());
+  if (n < 4) {
+    return stats;
+  }
+
+  // spline_rounds_max+1 audits bracket spline_rounds_max diffusion rounds,
+  // so the *last* diffusion round's effect is itself audited before giving
+  // up -- otherwise "still violating" could be wrong for a column that
+  // happens to become clean on exactly the last permitted round.
+  std::vector<char> offending;
+  for (int round = 0; round <= options.spline_rounds_max; ++round) {
+    const bool any = spline_audit_column(col, options.spline_refine, options.spline_slope_floor, offending);
+    if (!any) {
+      return stats; // clean: done (rounds_used/needed_smoothing reflect prior rounds, if any)
+    }
+    if (round == options.spline_rounds_max) {
+      break; // cap reached; the loop above already confirmed a violation remains
+    }
+
+    stats.needed_smoothing = true;
+    stats.rounds_used = round + 1;
+
+    std::vector<char> marked(static_cast<size_t>(n), 0);
+    for (int j = 0; j + 1 < n; ++j) {
+      if (!offending[static_cast<size_t>(j)]) {
+        continue;
+      }
+      const int lo = std::max(j - options.diffuse_window, 0);
+      const int hi = std::min(j + 1 + options.diffuse_window, n - 1);
+      for (int i = lo; i <= hi; ++i) {
+        marked[static_cast<size_t>(i)] = 1;
+      }
+    }
+    marked[0] = 0;                              // column endpoints never move
+    marked[static_cast<size_t>(n - 1)] = 0;
+
+    jacobi_diffuse_step(col, marked, options.diffuse_alpha);
+    repair_column(col, min_slope); // restores monotonicity the diffusion may have nudged
+  }
+
+  stats.still_violating = true;
+  return stats;
+}
+
 } // namespace
 
 RepairResult repair_table(RawTable &table, const RepairOptions &options) {
@@ -108,6 +234,7 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
     // the order required of RepairResult::entries -- regardless of how an
     // OpenMP schedule interleaves the parallel loop below.
     std::vector<std::vector<RepairEntry>> per_column(ncol);
+    std::vector<SplineSafeStats> per_column_spline(ncol);
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -122,8 +249,17 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
       }
       const std::vector<double> original = column;
 
+      // Step 0: base pass (PAVA + strictify).
       repair_column(column, min_slope);
 
+      // Step 1: spline-safe smoothing loop (repair.hpp doc comment).
+      if (options.spline_safe) {
+        per_column_spline[icol] = spline_safe_column(column, min_slope, options);
+      }
+
+      // Step 2: diff the FINAL column against the ORIGINAL input, not
+      // incrementally against the step-0 output, so the log stays
+      // meaningful across smoothing rounds (repair.hpp step 2).
       std::vector<RepairEntry> &entries = per_column[icol];
       for (size_t jT = 0; jT < ntemp; ++jT) {
         if (column[jT] != original[jT]) {
@@ -131,8 +267,8 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
         }
       }
       // Write back every value, not just the changed ones: entries that
-      // repair_column left untouched keep the exact same bits, so this
-      // cannot perturb them.
+      // neither pass touched keep the exact same bits, so this cannot
+      // perturb them.
       for (size_t jT = 0; jT < ntemp; ++jT) {
         data[table.index(irho, jT, kYe)] = column[jT];
       }
@@ -141,6 +277,9 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
     RepairResult::FieldSummary summary;
     summary.field = field;
     double sum_sq = 0.0;
+    if (options.spline_safe) {
+      summary.spline_rounds_histogram.assign(static_cast<size_t>(options.spline_rounds_max) + 1, 0);
+    }
     for (size_t icol = 0; icol < ncol; ++icol) {
       for (const RepairEntry &e : per_column[icol]) {
         result.entries.push_back(e);
@@ -148,6 +287,17 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
         const double abs_change = std::fabs(e.new_value - e.old_value);
         summary.max_abs_change = std::max(summary.max_abs_change, abs_change);
         sum_sq += abs_change * abs_change;
+      }
+      const SplineSafeStats &s = per_column_spline[icol];
+      summary.spline_rounds_used_max = std::max(summary.spline_rounds_used_max, s.rounds_used);
+      if (s.needed_smoothing) {
+        ++summary.spline_columns_smoothed;
+      }
+      if (s.still_violating) {
+        ++summary.spline_columns_still_violating;
+      }
+      if (options.spline_safe) {
+        ++summary.spline_rounds_histogram[static_cast<size_t>(s.rounds_used)];
       }
     }
     summary.rms_change =
@@ -168,6 +318,18 @@ void RepairResult::print(std::ostream &os) const {
       os << ", max |change| = " << s.max_abs_change << ", rms change = " << s.rms_change;
     }
     os << "\n";
+    os << "    spline-safe: rounds_used(max)=" << s.spline_rounds_used_max
+       << " columns_smoothed=" << s.spline_columns_smoothed
+       << " columns_still_violating=" << s.spline_columns_still_violating << "\n";
+    if (!s.spline_rounds_histogram.empty()) {
+      os << "    spline-safe rounds histogram:";
+      for (size_t r = 0; r < s.spline_rounds_histogram.size(); ++r) {
+        if (s.spline_rounds_histogram[r] > 0) {
+          os << " rounds=" << r << ":" << s.spline_rounds_histogram[r];
+        }
+      }
+      os << "\n";
+    }
   }
 }
 

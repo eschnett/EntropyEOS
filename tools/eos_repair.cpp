@@ -7,8 +7,10 @@
 // or table logic lives here -- see entropy_eos/host/{check,repair}.hpp for
 // that.
 //
-//   eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X] [--log FILE]
+//   eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]
+//              [--no-spline-safe] [--log FILE]
 //   eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]
+//              [--no-spline-safe]
 //
 // Exit codes: 0 = already clean, 1 = repaired (or would repair, under
 // --check-only), 2 = fatal structural problem or other runtime error,
@@ -35,16 +37,25 @@ const char *const kToolVersion = "entropy_eos eos_repair 0.1";
 
 void print_usage(std::ostream &os) {
   os << "usage:\n"
-        "  eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X] [--log FILE]\n"
+        "  eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]\n"
+        "             [--no-spline-safe] [--log FILE]\n"
         "  eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]\n"
+        "             [--no-spline-safe]\n"
         "\n"
         "Repairs a stellarcollapse-format EOS table so that \"entropy\" and\n"
         "\"logenergy\" are strictly monotone increasing in temperature at every\n"
         "(rho, Ye): L2 isotonic regression (PAVA) followed by a minimum-slope\n"
-        "strictification pass (see CODE.md \"Repair harness\"). Structural\n"
-        "problems (bad axes, non-finite values, missing required fields or\n"
-        "attributes) are fatal and are never repaired -- they indicate a broken\n"
-        "file, not physics noise.\n"
+        "strictification pass (see CODE.md \"Repair harness\"), then -- unless\n"
+        "--no-spline-safe -- an audit-driven smoothing loop (M2c-prime,\n"
+        "eos-adapter-F-to-U.md S4) that fits the same C^2 not-a-knot cubic\n"
+        "B-spline the adapter build uses and nudges any cell where the fitted\n"
+        "spline's derivative dips to <= 0 between nodes (a near-plateau\n"
+        "immediately adjacent to a steep recovery can ring the spline non-\n"
+        "monotone there even though the raw data is monotone), then re-runs\n"
+        "PAVA + strictification and re-audits, up to a bounded number of\n"
+        "rounds. Structural problems (bad axes, non-finite values, missing\n"
+        "required fields or attributes) are fatal and are never repaired --\n"
+        "they indicate a broken file, not physics noise.\n"
         "\n"
         "positional arguments:\n"
         "  IN.h5               input table (stellarcollapse.org / O'Connor-Ott\n"
@@ -57,6 +68,9 @@ void print_usage(std::ostream &os) {
         "                      kB/baryon; default: RepairOptions::min_slope_entropy)\n"
         "  --min-slope-loge X  minimum logenergy slope per T grid step (absolute,\n"
         "                      log10(erg/g); default: RepairOptions::min_slope_logenergy)\n"
+        "  --no-spline-safe    skip the spline-safe smoothing loop (RepairOptions::\n"
+        "                      spline_safe = false); repair is then plain PAVA +\n"
+        "                      strictification, as before M2c-prime. On by default.\n"
         "  --log FILE          write a human-readable repair log to FILE (not\n"
         "                      valid together with --check-only)\n"
         "  -h, --help          print this message\n"
@@ -74,6 +88,7 @@ struct ParsedArgs {
   double min_slope_s = 0.0;
   bool have_min_slope_loge = false;
   double min_slope_loge = 0.0;
+  bool no_spline_safe = false;
   bool have_log = false;
   std::string log_path;
   std::vector<std::string> positionals;
@@ -119,6 +134,8 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
         return false;
       }
       out.have_min_slope_loge = true;
+    } else if (a == "--no-spline-safe") {
+      out.no_spline_safe = true;
     } else if (a == "--log") {
       if (i + 1 >= args.size()) {
         std::cerr << "eos_repair: option '--log' requires a value\n\n";
@@ -186,6 +203,7 @@ void write_log(const std::string &log_path, const std::string &in_path, const st
       << std::dec << std::setfill(' ') << "\n";
   log << "min_slope_entropy:   " << options.min_slope_entropy << "\n";
   log << "min_slope_logenergy: " << options.min_slope_logenergy << "\n";
+  log << "spline_safe:         " << (options.spline_safe ? "on" : "off") << "\n";
   log << "timestamp:           " << std::put_time(&now_tm, "%Y-%m-%dT%H:%M:%SZ") << "\n";
   log << "\n";
 
@@ -237,6 +255,9 @@ int main(int argc, char **argv) {
     }
     if (pa.have_min_slope_loge) {
       repair_opts.min_slope_logenergy = pa.min_slope_loge;
+    }
+    if (pa.no_spline_safe) {
+      repair_opts.spline_safe = false;
     }
 
     eeos::RepairResult result = eeos::repair_table(table, repair_opts);

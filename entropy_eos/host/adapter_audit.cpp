@@ -145,6 +145,43 @@ CheckClassResult skipped_class(const std::string &name) {
   return r;
 }
 
+// The all-NaN QuantileStats sentinel (see its doc comment): a skipped class,
+// or degenerately zero finite-metric values collected.
+QuantileStats skipped_quantiles() {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  return QuantileStats{nan, nan, nan, nan, nan};
+}
+
+// Nearest-rank quantile of `values` at probability p in [0,1]: values must
+// already be sorted ascending and non-empty. Deterministic, and monotone
+// non-decreasing in p by construction, so a QuantileStats built by calling
+// this at increasing p is ordered by construction (p50 <= p90 <= ... <=
+// max), as tests/test_adapter_audit.cpp checks.
+double nearest_rank_quantile(const std::vector<double> &sorted_values, double p) {
+  const size_t n = sorted_values.size();
+  size_t rank = static_cast<size_t>(std::ceil(p * static_cast<double>(n)));
+  rank = std::max<size_t>(rank, 1);
+  rank = std::min(rank, n);
+  return sorted_values[rank - 1];
+}
+
+// Builds the {p50,p90,p99,p999,max} QuantileStats over every value in
+// `values` (order not required on entry; sorted in place). Returns the
+// all-NaN sentinel if `values` is empty (see skipped_quantiles()).
+QuantileStats compute_quantiles(std::vector<double> &values) {
+  if (values.empty()) {
+    return skipped_quantiles();
+  }
+  std::sort(values.begin(), values.end());
+  QuantileStats q;
+  q.p50 = nearest_rank_quantile(values, 0.50);
+  q.p90 = nearest_rank_quantile(values, 0.90);
+  q.p99 = nearest_rank_quantile(values, 0.99);
+  q.p999 = nearest_rank_quantile(values, 0.999);
+  q.max = values.back();
+  return q;
+}
+
 // --- deterministic per-sample PRNG for the class C soak -----------------
 //
 // No std::random_device anywhere (AdapterCheckOptions::soak_seed is the
@@ -226,17 +263,28 @@ CheckClassResult class_from_monotonicity_audit(const MonotonicityAudit &audit, c
 // --- B. Node round trip and fidelity -------------------------------------
 void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa, double conv_t,
                   size_t node_stride, size_t worst_n, double tol_roundtrip, CheckClassResult &out_roundtrip,
-                  CheckClassResult &out_delta_T, CheckClassResult &out_delta_p, bool &any_fatal,
+                  CheckClassResult &out_delta_T, CheckClassResult &out_delta_p,
+                  QuantileStats &out_delta_T_q, QuantileStats &out_delta_p_q, bool &any_fatal,
                   std::vector<std::string> &fatal_messages) {
   const size_t nrho = table.nrho();
   const size_t ntemp = table.ntemp();
   const size_t nye = table.nye();
   const std::vector<double> &entropy = table.field("entropy");
-  const std::vector<double> &logtemp = table.logtemp();
   const bool have_logpress = table.has_field("logpress");
   const std::vector<double> *logpress = have_logpress ? &table.field("logpress") : nullptr;
   const size_t stride = std::max<size_t>(node_stride, 1);
   const double c2 = c_light_cm_s * c_light_cm_s;
+  // Cold start (u_guess = NaN, EntropyEOSView::evaluate()'s documented
+  // "no warm start" sentinel -- see core/adapter_eval.hpp's
+  // detail::aeval_is_nan() branch): warm-starting the T-solve at the exact
+  // node answer (u_guess = table.logtemp()[jT]) made this audit trivially
+  // green regardless of solver robustness -- every solve started already
+  // converged. Cold starts instead exercise the same secant-then-Newton
+  // path a real out-of-nowhere evaluate() call takes, so this audit
+  // actually probes solve robustness in wiggle regions (a spline-safe
+  // repair's near-flat pockets, extension seams, ...), not just the chain
+  // rule at a point already found.
+  const double u_guess = std::numeric_limits<double>::quiet_NaN();
 
   const int nthreads = max_threads();
   std::vector<Accum> local_rt(static_cast<size_t>(nthreads), Accum(worst_n));
@@ -244,6 +292,12 @@ void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa
   std::vector<Accum> local_dp(static_cast<size_t>(nthreads), Accum(worst_n));
   std::vector<char> local_fatal(static_cast<size_t>(nthreads), 0);
   std::vector<std::vector<std::string>> local_msgs(static_cast<size_t>(nthreads));
+  // Every finite delta_T/delta_p metric value, one double per audited node
+  // (host-side memory, acceptable per eos-adapter-F-to-U.md S10's robust-
+  // fidelity-statistics ask), collected per-thread and merged/sorted below
+  // into the report's {p50,p90,p99,p999,max} quantiles.
+  std::vector<std::vector<double>> local_dT_vals(static_cast<size_t>(nthreads));
+  std::vector<std::vector<double>> local_dp_vals(static_cast<size_t>(nthreads));
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -252,7 +306,6 @@ void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa
     const size_t tid = static_cast<size_t>(this_thread());
     for (size_t jT = 0; jT < ntemp; jT += stride) {
       const double T_j = table.temp(jT);
-      const double u_guess = logtemp[jT];
       for (size_t irho = 0; irho < nrho; irho += stride) {
         const size_t idx = table.index(irho, jT, kYe);
         const double s = entropy[idx];
@@ -290,6 +343,7 @@ void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa
           Loc loc = loc0;
           loc.value = m_dT;
           local_dT[tid].add_diagnostic(m_dT, false, loc);
+          local_dT_vals[tid].push_back(m_dT);
         }
 
         if (logpress != nullptr) {
@@ -299,6 +353,7 @@ void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa
             Loc loc = loc0;
             loc.value = m_dp;
             local_dp[tid].add_diagnostic(m_dp, false, loc);
+            local_dp_vals[tid].push_back(m_dp);
           }
         }
       }
@@ -306,17 +361,22 @@ void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa
   }
 
   Accum acc_rt(worst_n), acc_dT(worst_n), acc_dp(worst_n);
+  std::vector<double> all_dT_vals, all_dp_vals;
   for (int t = 0; t < nthreads; ++t) {
     const size_t ti = static_cast<size_t>(t);
     acc_rt.merge_from(local_rt[ti]);
     acc_dT.merge_from(local_dT[ti]);
     acc_dp.merge_from(local_dp[ti]);
+    all_dT_vals.insert(all_dT_vals.end(), local_dT_vals[ti].begin(), local_dT_vals[ti].end());
+    all_dp_vals.insert(all_dp_vals.end(), local_dp_vals[ti].begin(), local_dp_vals[ti].end());
     if (local_fatal[ti]) any_fatal = true;
     for (std::string &m : local_msgs[ti]) fatal_messages.push_back(std::move(m));
   }
   out_roundtrip = acc_rt.finalize("roundtrip_T");
   out_delta_T = acc_dT.finalize("delta_T");
   out_delta_p = acc_dp.finalize("delta_p");
+  out_delta_T_q = compute_quantiles(all_dT_vals);
+  out_delta_p_q = have_logpress ? compute_quantiles(all_dp_vals) : skipped_quantiles();
 }
 
 // --- C. Physicality soak --------------------------------------------------
@@ -461,7 +521,8 @@ AdapterReport check_adapter(const EntropyEOS &adapter, const RawTable &table,
   // --- B. Node round trip and fidelity -------------------------------------
   CheckClassResult roundtrip_T, delta_T, delta_p;
   audit_nodes(view, table, adapter.kappa(), conv_t, opts.node_stride, opts.worst_n, opts.tol_roundtrip,
-              roundtrip_T, delta_T, delta_p, any_fatal, fatal_messages);
+              roundtrip_T, delta_T, delta_p, report.delta_T_quantiles, report.delta_p_quantiles, any_fatal,
+              fatal_messages);
   report.classes.push_back(std::move(roundtrip_T));
   report.classes.push_back(std::move(delta_T));
   if (table.has_field("logpress")) {
@@ -521,6 +582,11 @@ void AdapterReport::print(std::ostream &os) const {
       continue;
     }
     os << " max=" << std::scientific << std::setprecision(6) << c.max << " rms=" << c.rms << "\n";
+    if (c.name == "delta_T" || c.name == "delta_p") {
+      const QuantileStats &q = c.name == "delta_T" ? delta_T_quantiles : delta_p_quantiles;
+      os << "  quantiles: p50=" << std::scientific << std::setprecision(6) << q.p50 << " p90=" << q.p90
+         << " p99=" << q.p99 << " p999=" << q.p999 << " max=" << q.max << "\n";
+    }
     if (!c.worst.empty()) {
       os << "  worst offenders (rho [g/cc], T [MeV], Ye : value):\n";
       for (const CheckClassResult::Loc &loc : c.worst) {

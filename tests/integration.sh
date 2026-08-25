@@ -224,15 +224,24 @@ run_real_table() {
 
   # Best-effort extraction of the adapter report's headline numbers
   # (AdapterReport::print()'s "kappa=...", "<class>: count=... max=...",
-  # and "physicality soak: ... maxiter_count=... evals_per_sec=..." lines),
-  # for the summary line below; "?" if a line is ever absent.
-  local a_kappa a_rt_count a_dT_max a_dp_max a_sigma_count a_maxiter a_evals
+  # its "  quantiles: p50=... p90=... p99=... p999=... max=..." follow-up
+  # line for delta_T/delta_p (see QuantileStats), and "physicality soak:
+  # ... maxiter_count=... evals_per_sec=..." lines), for the summary line
+  # below; "?" if a line is ever absent.
+  local a_kappa a_rt_count a_dT_max a_dp_max a_dT_p99 a_dp_p99 a_sigma_count a_maxiter a_evals
   a_kappa=$( (grep -E '^kappa=' "$adapter_report" || true) | head -1 | cut -d= -f2)
   a_rt_count=$( (grep -E '^roundtrip_T:' "$adapter_report" || true) | grep -oE 'count=[0-9]+' | head -1 |
     cut -d= -f2)
   a_dT_max=$( (grep -E '^delta_T:' "$adapter_report" || true) | grep -oE 'max=[0-9.eE+-]+' | head -1 |
     cut -d= -f2)
   a_dp_max=$( (grep -E '^delta_p:' "$adapter_report" || true) | grep -oE 'max=[0-9.eE+-]+' | head -1 |
+    cut -d= -f2)
+  # p99 comes from the "quantiles:" line immediately following the
+  # "delta_T:"/"delta_p:" header line -- -A1 grabs both lines, and "p99="
+  # cannot match inside "p999=" (different key), so this is unambiguous.
+  a_dT_p99=$( (grep -A1 -E '^delta_T:' "$adapter_report" || true) | grep -oE 'p99=[0-9.eE+-]+' | head -1 |
+    cut -d= -f2)
+  a_dp_p99=$( (grep -A1 -E '^delta_p:' "$adapter_report" || true) | grep -oE 'p99=[0-9.eE+-]+' | head -1 |
     cut -d= -f2)
   a_sigma_count=$( (grep -E '^spline_sigma_u_nonpositive:' "$adapter_report" || true) |
     grep -oE 'count=[0-9]+' | head -1 | cut -d= -f2)
@@ -244,6 +253,8 @@ run_real_table() {
   a_rt_count=${a_rt_count:-?}
   a_dT_max=${a_dT_max:-?}
   a_dp_max=${a_dp_max:-?}
+  a_dT_p99=${a_dT_p99:-?}
+  a_dp_p99=${a_dp_p99:-?}
   a_sigma_count=${a_sigma_count:-?}
   a_maxiter=${a_maxiter:-?}
   a_evals=${a_evals:-?}
@@ -251,8 +262,8 @@ run_real_table() {
   echo "SUMMARY $name: eos_test(raw)=$test_exit eos_repair=$repair_exit" \
     "eos_test(repaired)=$rep_test_exit entropy_repaired=$s_changed logenergy_repaired=$e_changed" \
     "eos_test(adapter)=$adapter_test_exit kappa=$a_kappa roundtrip_T_count=$a_rt_count" \
-    "delta_T_max=$a_dT_max delta_p_max=$a_dp_max sigma_monotonicity_count=$a_sigma_count" \
-    "maxiter_count=$a_maxiter evals_per_sec=$a_evals"
+    "delta_T_max=$a_dT_max delta_T_p99=$a_dT_p99 delta_p_max=$a_dp_max delta_p_p99=$a_dp_p99" \
+    "sigma_monotonicity_count=$a_sigma_count maxiter_count=$a_maxiter evals_per_sec=$a_evals"
 }
 
 run_real_table "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5" "LS220"
