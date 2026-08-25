@@ -14,10 +14,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
 
       - name: Build and run tests (OpenMP)
-        run: make test OPENMP=-fopenmp CXX=g++
+        run: >
+          make test OPENMP=-fopenmp CXX=g++
+          HDF5_INC="-I/usr/include/hdf5/serial"
+          HDF5_LIB="-L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5"
 
       - name: Clean
         run: make clean
 
       - name: Build and run tests (OpenMP + ASan/UBSan)
-        run: make test SAN=1 OPENMP=-fopenmp CXX=g++
+        run: >
+          make test SAN=1 OPENMP=-fopenmp CXX=g++
+          HDF5_INC="-I/usr/include/hdf5/serial"
+          HDF5_LIB="-L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5"

@@ -16,15 +16,22 @@ CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra
 # libomp, so OpenMP is opt-in. Set OPENMP=-fopenmp with gcc (e.g. in CI).
 OPENMP ?=
 
-# Unused until the io_stellarcollapse/io_compose modules land; declared here
-# so consumers can already pin it in their build without a later edit.
-HDF5_DIR ?=
+# HDF5_DIR/HDF5_INC/HDF5_LIB wire up io_stellarcollapse's only external
+# dependency (see CODE.md "Environment"). HDF5_DIR's default is MacPorts'
+# install location on the dev machine; override it (or HDF5_INC/HDF5_LIB
+# directly) per system -- e.g. Debian/Ubuntu's libhdf5-dev uses split
+# include/lib paths that don't fit a single -dir variable, so CI passes
+# HDF5_INC/HDF5_LIB explicitly instead (see .github/workflows/ci.yml).
+HDF5_DIR ?= /opt/local
+HDF5_INC ?= -I$(HDF5_DIR)/include
+HDF5_LIB ?= -L$(HDF5_DIR)/lib -lhdf5
 
 PREFIX ?= /usr/local
 
-CPPFLAGS += -I.
+CPPFLAGS += -I. $(HDF5_INC)
 ALL_CXXFLAGS = $(CXXFLAGS) $(OPENMP)
 LDFLAGS ?=
+LDFLAGS += $(HDF5_LIB)
 
 # SAN=1 turns on ASan+UBSan for both compiling and linking.
 ifeq ($(SAN),1)

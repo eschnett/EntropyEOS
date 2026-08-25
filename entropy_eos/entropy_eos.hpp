@@ -13,6 +13,7 @@
 #include "entropy_eos/core/defs.hpp"
 
 #include "entropy_eos/host/check.hpp"
+#include "entropy_eos/host/io_stellarcollapse.hpp"
 #include "entropy_eos/host/repair.hpp"
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
