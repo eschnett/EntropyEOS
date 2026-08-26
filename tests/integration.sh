@@ -118,14 +118,42 @@ case "$dirty_adapter_exit" in
     ;;
 esac
 
-# 14-15: --level con2prim, table-free (M3b). Same pattern as the adapter
-# pair above: --synthetic is exactly consistent and defect-free (a clean
-# round trip is required), --synthetic-dirty plants pathologies the
-# in-memory repair pass cannot fully clean up, so either outcome is
-# accepted. --states 4000 keeps the clean run's Newton/fallback/round-trip
-# statistics directly comparable to tests/test_con2prim_audit.cpp's own
-# n_states=4000 acceptance test.
-expect_exit 0 "$TEST" --level con2prim --synthetic --states 4000
+# 14-16: --level con2prim, table-free (M3b, plus the M3e policy section).
+# Same pattern as the adapter pair above: --synthetic is exactly consistent
+# and defect-free (a clean round trip is required), --synthetic-dirty plants
+# pathologies the in-memory repair pass cannot fully clean up, so either
+# outcome is accepted. --states 4000 keeps the clean run's Newton/fallback/
+# round-trip statistics directly comparable to
+# tests/test_con2prim_audit.cpp's own n_states=4000 acceptance test. The
+# clean run's report is saved so step 16 can check the policy section
+# explicitly (its own exit code is asserted by hand right below, since
+# expect_exit cannot capture stdout).
+set +e
+"$TEST" --level con2prim --synthetic --states 4000 >"$T/clean_con2prim.report.txt"
+clean_con2prim_exit=$?
+set -e
+if [ "$clean_con2prim_exit" -eq 0 ]; then
+  echo "PASS (exit 0): $TEST --level con2prim --synthetic --states 4000"
+else
+  echo "FAIL (expected exit 0, got $clean_con2prim_exit): $TEST --level con2prim --synthetic --states 4000"
+  exit 1
+fi
+
+# 16 (M3e): the invalid-state policy section of that same clean run
+# (entropy_eos/core/state_policy.hpp, reported by check_con2prim()). On a
+# defect-free synthetic table the policy layer must be completely transparent
+# on the sampled (valid) states AND its broken-state battery must pass; both
+# already feed the exit code above via con2prim_needs_attention(), so this
+# only pins down WHICH of the two would have failed if it ever does.
+if grep -q '^policy battery result: PASS' "$T/clean_con2prim.report.txt" &&
+  grep -q '^policy warm-set: n_valid_touched=0 ' "$T/clean_con2prim.report.txt"; then
+  echo "PASS: --level con2prim --synthetic policy section clean (battery PASS, zero false positives)"
+else
+  echo "FAIL: --level con2prim --synthetic policy section not clean:"
+  grep -E '^policy' "$T/clean_con2prim.report.txt" || true
+  exit 1
+fi
+
 set +e
 "$TEST" --level con2prim --synthetic-dirty >"$T/dirty_con2prim.report.txt"
 dirty_con2prim_exit=$?
@@ -366,6 +394,27 @@ run_real_table() {
   c_solves_warm=${c_solves_warm:-?}
   c_solves_cold=${c_solves_cold:-?}
 
+  # M3e policy section of the same con2prim report
+  # (Con2PrimReport::print()'s "policy: ...", "policy warm-set: ..." and
+  # "policy battery result: PASS|FAIL|EMPTY" lines). All best-effort, "?" if
+  # a line is ever absent -- e.g. if the policy pass is ever turned off.
+  # Interventions on a real table are EXPECTED to be nonzero (they absorb the
+  # solver's own documented failure tail, CODE.md M3 open item (i)); the two
+  # that must stay clean are the false-positive count and the battery, and
+  # both already feed eos_test's exit code through
+  # con2prim_needs_attention(), so this is a reporting line, not a second
+  # gate.
+  local c_pol_interv c_pol_fp c_pol_battery
+  c_pol_interv=$( (grep -E '^policy warm-set: n_interventions=' "$con2prim_report" || true) |
+    grep -oE 'n_interventions=[0-9]+' | head -1 | cut -d= -f2)
+  c_pol_fp=$( (grep -E '^policy warm-set: n_valid_touched=' "$con2prim_report" || true) |
+    grep -oE 'n_valid_touched=[0-9]+' | head -1 | cut -d= -f2)
+  c_pol_battery=$( (grep -E '^policy battery result:' "$con2prim_report" || true) |
+    grep -oE 'result: [A-Z]+' | head -1 | cut -d' ' -f2)
+  c_pol_interv=${c_pol_interv:-?}
+  c_pol_fp=${c_pol_fp:-?}
+  c_pol_battery=${c_pol_battery:-?}
+
   echo "SUMMARY $name: eos_test(raw)=$test_exit eos_repair=$repair_exit" \
     "eos_test(repaired)=$rep_test_exit entropy_repaired=$s_changed logenergy_repaired=$e_changed" \
     "violations3d_remaining_entropy=$s_v3d violations3d_remaining_logenergy=$e_v3d" \
@@ -374,7 +423,9 @@ run_real_table() {
     "sigma_monotonicity_count=$a_sigma_count maxiter_count=$a_maxiter evals_per_sec=$a_evals" \
     "eos_test(con2prim)=$con2prim_test_exit c2p_newton=$c_newton c2p_fallback=$c_fallback" \
     "c2p_failed=$c_failed rt_tau_p99=$c_rt_tau_p99 rt_tau_max=$c_rt_tau_max" \
-    "solves_per_sec_warm=$c_solves_warm solves_per_sec_cold=$c_solves_cold"
+    "solves_per_sec_warm=$c_solves_warm solves_per_sec_cold=$c_solves_cold" \
+    "policy_interventions=$c_pol_interv policy_false_positives=$c_pol_fp" \
+    "policy_battery=$c_pol_battery"
 }
 
 run_real_table "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5" "LS220"

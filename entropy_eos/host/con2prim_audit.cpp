@@ -200,6 +200,210 @@ bool prim2con_out_finite(const Prim2ConOut &out) {
          std::isfinite(out.S_par) && std::isfinite(out.S_perp) && std::isfinite(out.B2);
 }
 
+// --- M3e policy section helpers (core/state_policy.hpp) -------------------
+
+// Re-solves `back` with the PLAIN solver and returns the conservative-space
+// round-trip error of its answer. `ok` reports whether the re-solve converged
+// to a finite state at all; the returned error is +Inf when it did not.
+//
+// The forward map here is the SOLVER'S OWN -- (D, tau, S_par, S_perp) rebuilt
+// from the recovered (rho, w, v_par, v_perp, eos) by the design doc's S4/S5/S7
+// formulas -- rather than a prim2con() call with cos_vB reconstructed from
+// v_par/V, which is what pass 4 below uses for the sampled warm states. The
+// reason is specific to the states this section feeds it: an excised or
+// ceiling-projected state can have V of order 1e-12 (a collapse state with
+// almost no momentum relative to the ceiling inertia), and there the
+// reconstruction V > 1e-10 ? v_par/V : 0 degenerates exactly as
+// prim2con.hpp's own note says it must -- it puts all of the (negligible)
+// momentum into S_perp and none into S_par, which shows up as a RELATIVE
+// S_par error of 1 even though both values are numerically nothing. (Measured
+// on LS220: this alone failed the "collapse_ceiling_D_only" battery case.)
+// The solver's own forward map has no such degeneracy, and is exactly the
+// construction tests/test_con2prim.cpp's run_one() uses, for the same reason.
+//
+// The per-component denominators carry the same D-scaled floor as
+// tests/test_con2prim.cpp's run_one(): a momentum component that is genuinely
+// negligible next to D must not dominate the metric.
+double policy_resolve_err(const EntropyEOSView &view, const Con2PrimOptions &solver,
+                          const Con2PrimIn &back, double s_g, double w_g, double u_g, bool &ok) {
+  const double inf = std::numeric_limits<double>::infinity();
+  const Con2PrimOut re = con2prim(view, back, solver, s_g, w_g, u_g);
+  ok = (re.result == C2PResult::converged_newton || re.result == C2PResult::converged_fallback) &&
+       c2p_out_finite(re);
+  if (!ok) return inf;
+
+  const double W = re.W;
+  const double D = re.rho * W;
+  const double z = re.rho * re.eos.h * W * W;
+  const double v2 = re.v_par * re.v_par + re.v_perp * re.v_perp;
+  const double half_sinh = std::sinh(0.5 * re.w);
+  const double sinh_w = std::sinh(re.w);
+  const double tau = 2.0 * D * half_sinh * half_sinh + re.rho * re.eos.U * W * W +
+                     re.eos.p * sinh_w * sinh_w + 0.5 * back.B2 * (1.0 + v2) -
+                     0.5 * back.B2 * re.v_par * re.v_par;
+  const Prim2ConOut fw{D, tau, D * re.ye, z * re.v_par, (z + back.B2) * re.v_perp, back.B2};
+  if (!prim2con_out_finite(fw)) {
+    ok = false;
+    return inf;
+  }
+
+  const double scale = 1e-12 * std::max(std::fabs(back.D), 1e-300);
+  double m = 0.0;
+  m = std::max(m, std::fabs(fw.D - back.D) / std::max(std::fabs(back.D), scale));
+  m = std::max(m, std::fabs(fw.tau - back.tau) / std::max(std::fabs(back.tau), scale));
+  m = std::max(m, std::fabs(fw.S_par - back.S_par) / std::max(std::fabs(back.S_par), scale));
+  m = std::max(m, std::fabs(fw.S_perp - back.S_perp) / std::max(std::fabs(back.S_perp), scale));
+  return m;
+}
+
+// "Is this con2prim_safe() output acceptable?" -- the never-fails contract,
+// checked mechanically.
+struct PolicyJudge {
+  bool valid = false;   // finite, D > 0, and the returned primitives are policy-valid
+  bool flagged = false; // the policy actually reported what it did
+  bool warm_ok = false; // the returned conservatives re-solve when warm-started
+  bool cold_ok = false; // ... and when cold-started (diagnostic only, see the header)
+  double warm_err = 0.0;
+};
+
+PolicyJudge judge_policy_output(const EntropyEOSView &view, const PolicyOptions &pol,
+                                const Con2PrimOptions &solver, const Con2PrimSafeOut &so) {
+  PolicyJudge j;
+  j.flagged = so.policy_flags != 0u;
+
+  const PrimState ps{so.base.rho, so.base.s, so.base.ye, so.base.w};
+  j.valid = c2p_out_finite(so.base) && prim2con_out_finite(so.cons) && so.cons.D > 0.0 &&
+            check_prim_state(view, ps, pol) == 0u;
+
+  const Con2PrimIn back{so.cons.D, so.cons.tau, so.cons.D_Y, so.cons.S_par, so.cons.S_perp, so.cons.B2};
+  j.warm_err = policy_resolve_err(view, solver, back, so.base.s, so.base.w, so.base.eos.u_solved, j.warm_ok);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  bool cold_ok = false;
+  (void)policy_resolve_err(view, solver, back, nan, nan, nan, cold_ok);
+  j.cold_ok = cold_ok;
+  return j;
+}
+
+// One deterministic broken-state battery case.
+struct PolicyBatteryCase {
+  const char *name;
+  Con2PrimIn cin;
+  PolicyOptions pol;
+};
+
+// The fixed broken-state battery: the con2prim-entropy-rapidity.md S11
+// taxonomy, one case per failure mode, built from the view and the audit's
+// own PolicyOptions so it scales with whatever table is being audited.
+// Deterministic by construction (no PRNG).
+std::vector<PolicyBatteryCase> make_policy_battery(const EntropyEOSView &view, const PolicyOptions &pol) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  const double ye_mid = 0.5 * (view.y_lo + view.y_hi);
+  const double rho_mid = std::pow(10.0, 0.5 * (view.x_lo + view.x_hi));
+  const SRange sr = view.srange(rho_mid, ye_mid);
+  const double s_mid = 0.5 * (sr.s_min + sr.s_max);
+  const EOSPoint pt = view.evaluate(rho_mid, s_mid, ye_mid, nan);
+
+  // A genuinely valid, magnetized base state -- the cases that plant a
+  // single defect start from this, so that the defect is the only thing
+  // wrong.
+  const Prim2ConOut base =
+      prim2con(view, rho_mid, s_mid, ye_mid, 2.0, 3.0 * rho_mid * pt.h, 0.4, pt.u_solved);
+  const Con2PrimIn base_in{base.D, base.tau, base.D_Y, base.S_par, base.S_perp, base.B2};
+
+  PolicyOptions pol_ceil = pol;
+  pol_ceil.collapse_to_atmosphere = false;
+
+  // w_cap tightened WITHOUT re-deriving D_max/tau_max: those are derived
+  // FROM w_cap (tau_max ~ cosh(w_cap)^2), so re-deriving them here would
+  // classify the w = 5 state below as a step-1 collapse and the w-cap path
+  // would never be exercised. See core/state_policy.hpp.
+  PolicyOptions pol_cap = pol;
+  pol_cap.w_cap = std::acosh(10.0);
+
+  const double D_atm = 0.5 * pol.rho_atm;
+  const double D_atm_Y = D_atm * ye_mid;
+
+  std::vector<PolicyBatteryCase> out;
+
+  // (1) Vacuum / sub-atmosphere, including garbage tau and momentum.
+  out.push_back({"atm_vacuum", Con2PrimIn{D_atm, 0.0, D_atm_Y, 0.0, 0.0, 0.0}, pol});
+  out.push_back({"atm_tau_absurd", Con2PrimIn{D_atm, 1e30, D_atm_Y, 1e20, 1e20, 0.0}, pol});
+  out.push_back(
+      {"atm_tau_negative", Con2PrimIn{D_atm, -1e10 * D_atm, D_atm_Y, 1e3 * D_atm, 1e3 * D_atm, 0.0}, pol});
+  out.push_back({"atm_magnetized",
+                 Con2PrimIn{D_atm, 1e3 * D_atm, D_atm_Y, 1e2 * D_atm, 1e2 * D_atm, 1e6 * D_atm}, pol});
+  out.push_back({"atm_tiny_D", Con2PrimIn{1e-30 * D_atm, 0.0, 0.0, 0.0, 0.0, 0.0}, pol});
+
+  // (2) Collapse: D and/or tau growing without bound, both policies.
+  const Con2PrimIn col_both{1e6 * pol.D_max, 1e6 * pol.tau_max, 1e6 * pol.D_max * ye_mid, 0.0, 0.0, 0.0};
+  const Con2PrimIn col_mom{1e6 * pol.D_max, 1e6 * pol.tau_max, 1e6 * pol.D_max * ye_mid, 1e30, 1e30, 0.0};
+  const Con2PrimIn col_tau{rho_mid, 1e6 * pol.tau_max, rho_mid * ye_mid, 1e20, 1e20, 0.0};
+  const Con2PrimIn col_D{1e6 * pol.D_max, base.tau, 1e6 * pol.D_max * ye_mid, 1e10, 1e10, 0.0};
+  out.push_back({"collapse_atm_D_and_tau", col_both, pol});
+  out.push_back({"collapse_atm_superluminal", col_mom, pol});
+  out.push_back({"collapse_atm_tau_only", col_tau, pol});
+  out.push_back({"collapse_atm_D_only", col_D, pol});
+  out.push_back({"collapse_ceiling_D_and_tau", col_both, pol_ceil});
+  out.push_back({"collapse_ceiling_superluminal", col_mom, pol_ceil});
+  out.push_back({"collapse_ceiling_tau_only", col_tau, pol_ceil});
+  out.push_back({"collapse_ceiling_D_only", col_D, pol_ceil});
+
+  // (3) Non-finite: NaN and Inf planted in each conservative in turn.
+  static const char *const field_names[12] = {
+      "nonfinite_nan_D",     "nonfinite_nan_tau",   "nonfinite_nan_D_Y",   "nonfinite_nan_S_par",
+      "nonfinite_nan_S_perp", "nonfinite_nan_B2",   "nonfinite_inf_D",     "nonfinite_inf_tau",
+      "nonfinite_inf_D_Y",   "nonfinite_inf_S_par", "nonfinite_inf_S_perp", "nonfinite_inf_B2"};
+  for (int bv = 0; bv < 2; ++bv) {
+    for (int field = 0; field < 6; ++field) {
+      Con2PrimIn cin = base_in;
+      double *slots[6] = {&cin.D, &cin.tau, &cin.D_Y, &cin.S_par, &cin.S_perp, &cin.B2};
+      *slots[field] = (bv == 0) ? nan : inf;
+      out.push_back({field_names[bv * 6 + field], cin, pol});
+    }
+  }
+
+  // (4) Broken-but-finite input: D <= 0, and a negative B^2 (a squared norm
+  // cannot be negative -- core/state_policy.hpp step 0).
+  {
+    Con2PrimIn cin = base_in;
+    cin.D = 0.0;
+    out.push_back({"nonpositive_D_zero", cin, pol});
+    cin.D = -base.D;
+    out.push_back({"nonpositive_D_negative", cin, pol});
+    cin = base_in;
+    cin.B2 = -base.B2;
+    out.push_back({"negative_B2", cin, pol});
+  }
+
+  // (5) tau below the coldest state this (D, |S|) can express.
+  {
+    Con2PrimIn cin = base_in;
+    cin.tau = base.tau / 10.0;
+    out.push_back({"tau_below_cold_floor", cin, pol});
+  }
+
+  // (6) A rapidity above the cap (a legitimate state under a tighter cap).
+  {
+    const Prim2ConOut t5 = prim2con(view, rho_mid, s_mid, ye_mid, 5.0, 0.0, 0.3, pt.u_solved);
+    out.push_back({"w_above_cap",
+                   Con2PrimIn{t5.D, t5.tau, t5.D_Y, t5.S_par, t5.S_perp, t5.B2}, pol_cap});
+  }
+
+  // (7) Ye outside the table range (Ye = D_Y/D is exact, so this is purely a
+  // D_Y defect).
+  {
+    Con2PrimIn cin = base_in;
+    cin.D_Y = 0.0;
+    out.push_back({"ye_below_range", cin, pol});
+    cin.D_Y = base.D * (view.y_hi + 0.2);
+    out.push_back({"ye_above_range", cin, pol});
+  }
+
+  return out;
+}
+
 // --- State sampling (deterministic; see con2prim_audit.hpp's doc comment
 // for the design rationale). One state per index k in [0, opts.n_states):
 // a per-index SampleRng draws, in order, the log-density fraction, Ye
@@ -504,6 +708,122 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
     if (local_cold_fatal[t]) any_fatal = true;
   }
 
+  // --- M3e policy section (con2prim_audit.hpp's "M3e POLICY SECTION") -----
+  if (opts.policy) {
+    report.policy_ran = true;
+
+    // rho_atm: half the smallest D the sampled set contains, so no valid
+    // sampled state can trip the atmosphere trigger (a caller-supplied value
+    // is lowered to that when it is larger -- see the header).
+    double min_D = std::numeric_limits<double>::infinity();
+    for (size_t k = 0; k < n; ++k) min_D = std::min(min_D, static_cast<double>(states[k].cin.D));
+    double rho_atm = 0.5 * min_D;
+    if (!std::isfinite(rho_atm) || rho_atm <= 0.0) rho_atm = std::pow(10.0, view.x_lo);
+    if (std::isfinite(opts.policy_rho_atm) && opts.policy_rho_atm > 0.0) {
+      rho_atm = std::min(rho_atm, opts.policy_rho_atm);
+    }
+
+    // w_cap: above the sampled rapidity range, so neither the cap nor the
+    // D_max/tau_max bounds DERIVED from it can fire on a valid sampled state.
+    double w_cap = std::max(std::acosh(100.0), opts.w_max_sample + 0.5);
+    if (std::isfinite(opts.policy_w_cap) && opts.policy_w_cap > 0.0) {
+      w_cap = std::max(w_cap, opts.policy_w_cap);
+    }
+    w_cap = std::min(w_cap, 0.9 * opts.solver.w_max);
+
+    PolicyOptions pol = default_policy(view, rho_atm);
+    pol.w_cap = w_cap;
+    policy_derive_bounds(view, pol);
+    report.policy_rho_atm_used = pol.rho_atm;
+    report.policy_w_cap_used = pol.w_cap;
+
+    // Pass A (TIMED): con2prim_safe() over the SAME warm state set, with the
+    // same warm-start guesses, so this is directly comparable to
+    // solves_per_sec_warm.
+    std::vector<Con2PrimSafeOut> safe(n);
+    const auto tp0 = std::chrono::steady_clock::now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (size_t k = 0; k < n; ++k) {
+      const SampledState &s = states[k];
+      safe[k] = con2prim_safe(view, s.cin, opts.solver, pol, s.s_guess, s.w_guess, s.u_guess);
+    }
+    const auto tp1 = std::chrono::steady_clock::now();
+    const double policy_seconds = std::chrono::duration<double>(tp1 - tp0).count();
+    report.solves_per_sec_policy = static_cast<double>(n) / std::max(policy_seconds, 1e-12);
+
+    // Pass B (untimed): classify.
+    std::vector<size_t> loc_interv(nt, 0), loc_valid_touched(nt, 0), loc_mismatch(nt, 0),
+        loc_invalid(nt, 0);
+    std::vector<std::vector<size_t>> loc_flags(nt, std::vector<size_t>(8, 0));
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (size_t k = 0; k < n; ++k) {
+      const size_t tid = static_cast<size_t>(this_thread());
+      const SampledState &st = states[k];
+      const Con2PrimSafeOut &so = safe[k];
+
+      // The returned state must ALWAYS be valid -- the never-fails contract.
+      const PrimState out_ps{so.base.rho, so.base.s, so.base.ye, so.base.w};
+      if (!(c2p_out_finite(so.base) && prim2con_out_finite(so.cons) && so.cons.D > 0.0 &&
+            check_prim_state(view, out_ps, pol) == 0u)) {
+        ++loc_invalid[tid];
+      }
+
+      if (so.policy_flags == 0u) {
+        // The no-touch path is contractually a verbatim copy of the input.
+        if (!(so.cons.D == st.cin.D && so.cons.tau == st.cin.tau && so.cons.D_Y == st.cin.D_Y &&
+              so.cons.S_par == st.cin.S_par && so.cons.S_perp == st.cin.S_perp &&
+              so.cons.B2 == st.cin.B2)) {
+          ++loc_mismatch[tid];
+        }
+        continue;
+      }
+
+      ++loc_interv[tid];
+      for (int b = 0; b < 8; ++b) {
+        if (so.policy_flags & (1u << (8 + b))) ++loc_flags[tid][static_cast<size_t>(b)];
+      }
+
+      // False positive? Only if the state was valid by construction AND the
+      // plain solver handled it AND its answer was itself policy-valid --
+      // i.e. the layer had nothing whatsoever to repair. See the header.
+      const Con2PrimOut &plain = warm[k];
+      const bool plain_converged = (plain.result == C2PResult::converged_newton ||
+                                    plain.result == C2PResult::converged_fallback);
+      const PrimState truth_ps{st.rho, st.s, st.ye, st.w};
+      const PrimState solved_ps{plain.rho, plain.s, plain.ye, plain.w};
+      if (plain_converged && c2p_out_finite(plain) && check_prim_state(view, truth_ps, pol) == 0u &&
+          check_prim_state(view, solved_ps, pol) == 0u) {
+        ++loc_valid_touched[tid];
+      }
+    }
+
+    for (size_t t = 0; t < nt; ++t) {
+      report.policy_n_interventions += loc_interv[t];
+      report.policy_n_valid_touched += loc_valid_touched[t];
+      report.policy_n_cons_mismatch += loc_mismatch[t];
+      report.policy_n_invalid_out += loc_invalid[t];
+      for (size_t b = 0; b < 8; ++b) report.policy_flag_counts[b] += loc_flags[t][b];
+    }
+
+    // Pass C: the deterministic broken-state battery.
+    const std::vector<PolicyBatteryCase> battery = make_policy_battery(view, pol);
+    report.policy_battery_n = battery.size();
+    for (const PolicyBatteryCase &c : battery) {
+      const Con2PrimSafeOut so = con2prim_safe(view, c.cin, opts.solver, c.pol);
+      const PolicyJudge j = judge_policy_output(view, c.pol, opts.solver, so);
+      if (!j.valid || !j.warm_ok || !(j.warm_err <= opts.policy_tol_resolve)) {
+        ++report.policy_battery_n_invalid;
+      }
+      if (!j.flagged) ++report.policy_battery_n_no_flag;
+      if (!j.cold_ok) ++report.policy_battery_n_cold_missed;
+    }
+  }
+
   report.status = any_fatal ? Status::fatal : Status::ok;
   return report;
 }
@@ -511,6 +831,16 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
 bool con2prim_needs_attention(const Con2PrimReport &report) {
   if (report.n_failed_no_bracket > 0 || report.n_failed_max_iter > 0 ||
       report.cold_n_failed_no_bracket > 0 || report.cold_n_failed_max_iter > 0) {
+    return true;
+  }
+  // M3e policy section (see con2prim_audit.hpp): a false positive, a
+  // non-verbatim no-touch path, an invalid output, or a battery case that
+  // came out invalid or unflagged. policy_n_interventions itself is NOT
+  // consulted -- on a real table it legitimately absorbs the M3 solver's
+  // documented residual failure tail.
+  if (report.policy_n_valid_touched > 0 || report.policy_n_cons_mismatch > 0 ||
+      report.policy_n_invalid_out > 0 || report.policy_battery_n_invalid > 0 ||
+      report.policy_battery_n_no_flag > 0) {
     return true;
   }
   for (const CheckClassResult &c : report.classes) {
@@ -570,8 +900,46 @@ void Con2PrimReport::print(std::ostream &os) const {
     }
   }
 
+  // --- M3e policy section (self-contained: the lines below say what each
+  // counter means, so the report can be read without the header at hand).
+  os << "\npolicy: " << (policy_ran ? "ran" : "skipped");
+  if (policy_ran) {
+    os << " rho_atm=" << std::scientific << std::setprecision(6) << policy_rho_atm_used
+       << " w_cap=" << policy_w_cap_used;
+  }
+  os << "\n";
+  if (policy_ran) {
+    os << "policy warm-set: n_interventions=" << policy_n_interventions
+       << " (a repair of any kind; on a real table this legitimately absorbs the solver's own "
+          "failure tail)\n";
+    os << "policy warm-set: n_valid_touched=" << policy_n_valid_touched
+       << " (FALSE POSITIVES: the state was valid, the solver converged to a valid answer, and the "
+          "policy still intervened -- must be 0)\n";
+    os << "policy warm-set: n_cons_mismatch=" << policy_n_cons_mismatch
+       << " (policy_flags==0 but the returned conservatives were not the input bit-identically -- "
+          "must be 0)"
+       << " n_invalid_out=" << policy_n_invalid_out
+       << " (returned state not policy-valid/finite -- must be 0)\n";
+    static const char *const flag_names[8] = {"atmosphere", "ceiling",     "s_floored",  "s_ceiled",
+                                              "w_capped",   "rho_clamped", "ye_clamped", "nonfinite"};
+    os << "policy flag counts:";
+    for (size_t i = 0; i < 8; ++i) os << " " << flag_names[i] << "=" << policy_flag_counts[i];
+    os << "\n";
+    os << "policy battery: n=" << policy_battery_n << " n_invalid=" << policy_battery_n_invalid
+       << " (must be 0) n_no_flag=" << policy_battery_n_no_flag << " (must be 0) n_cold_missed="
+       << policy_battery_n_cold_missed
+       << " (diagnostic only: a COLD re-solve of the repaired state missed it; the WARM re-solve is "
+          "the contract)\n";
+    os << "policy battery result: "
+       << ((policy_battery_n > 0 && policy_battery_n_invalid == 0 && policy_battery_n_no_flag == 0)
+               ? "PASS"
+               : (policy_battery_n == 0 ? "EMPTY" : "FAIL"))
+       << "\n";
+  }
+
   os << "\nsolves_per_sec_warm=" << std::scientific << std::setprecision(6) << solves_per_sec_warm
-     << " solves_per_sec_cold=" << solves_per_sec_cold << "\n";
+     << " solves_per_sec_cold=" << solves_per_sec_cold
+     << " solves_per_sec_policy=" << solves_per_sec_policy << "\n";
 
   os.flags(saved_flags);
   os.precision(saved_precision);

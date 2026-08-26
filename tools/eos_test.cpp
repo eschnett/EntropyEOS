@@ -1,7 +1,10 @@
-// tools/eos_test.cpp — the M1/M2c/M3b test harness: "--level table" (M1),
-// "--level adapter" (M2c, CODE.md "Test harness" / eos-adapter-F-to-U.md
-// S10), and "--level con2prim" (M3b, con2prim-entropy-rapidity.md S12
-// deliverable 2). One binary that accreted all three stages as their
+// tools/eos_test.cpp — the M1/M2c/M3b/M3e test harness: "--level table"
+// (M1), "--level adapter" (M2c, CODE.md "Test harness" /
+// eos-adapter-F-to-U.md S10), and "--level con2prim" (M3b,
+// con2prim-entropy-rapidity.md S12 deliverable 2, which since M3e also
+// carries the invalid-state policy section of that document's S11 --
+// automatically, through check_con2prim(); the only new knobs here are
+// --rho-atm and --w-cap). One binary that accreted all these stages as their
 // milestones landed.
 //
 // A thin main() over entropy_eos: loads a table (from a stellarcollapse
@@ -28,6 +31,7 @@
 //            [--write-synthetic PATH] [--csv PREFIX] [--worst N]
 //            [--no-repair] [--m-B GRAMS]
 //            [--states N] [--wmax X] [--sigma-max X] [--rt-tol X]
+//            [--rho-atm X] [--w-cap X]
 //
 // Exit codes ("table"): 2 = fatal structural problem; 1 = "entropy_negative",
 // "entropy_nonmonotone_T", "logenergy_nonmonotone_T", or any
@@ -46,14 +50,18 @@
 // Exit codes ("con2prim"): 2 = build_entropy_eos() failed, or
 // check_con2prim()'s report.status is fatal (a non-finite recovered
 // primitive/EOSPoint turned up somewhere in the audit); 1 =
-// con2prim_needs_attention() (any warm/cold failed_* state, or the
-// "c2p_roundtrip" class has count > 0); 0 = otherwise clean; 64 = usage
-// error.
+// con2prim_needs_attention() (any warm/cold failed_* state, the
+// "c2p_roundtrip" class has count > 0, or the M3e invalid-state policy
+// section found a false positive / a non-verbatim no-touch path / an invalid
+// output / a failing broken-state battery case); 0 = otherwise clean; 64 =
+// usage error.
 
 #include "entropy_eos/entropy_eos.hpp"
+#include "entropy_eos/core/state_policy.hpp"
 #include "entropy_eos/host/adapter_audit.hpp"
 #include "entropy_eos/host/con2prim_audit.hpp"
 
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -145,6 +153,24 @@ void print_usage(std::ostream &os) {
         "                       Con2PrimCheckOptions::tol_roundtrip override\n"
         "                       (conservative-space round-trip threshold entering\n"
         "                       \"c2p_roundtrip\"; default 1e-8)\n"
+        "  --rho-atm X          --level con2prim only: the M3e policy section's\n"
+        "                       atmosphere density, in adapter units (kappa-rescaled\n"
+        "                       g/cc). The PRODUCTION default this tool reports before\n"
+        "                       the audit is default_policy(view, 10^x_lo * 10), i.e.\n"
+        "                       ten times the table's own density floor; the AUDIT\n"
+        "                       lowers whatever it is given to half the smallest D of\n"
+        "                       its own sampled set, because an atmosphere threshold\n"
+        "                       sitting inside the sampled range would make the\n"
+        "                       false-positive measurement vacuous (see\n"
+        "                       Con2PrimCheckOptions::policy_rho_atm). The value\n"
+        "                       actually used is printed in the report.\n"
+        "  --w-cap X            --level con2prim only: the M3e policy section's rapidity\n"
+        "                       cap. Production default: acosh(100) (W <= 100), which\n"
+        "                       must stay below the solver's w_max = 12. The audit\n"
+        "                       raises whatever it is given to max(that, --wmax + 0.5)\n"
+        "                       for the same reason (and because\n"
+        "                       PolicyOptions::D_max/tau_max are derived FROM w_cap);\n"
+        "                       the value used is printed in the report.\n"
         "  -h, --help           print this message\n"
         "\n"
         "exit codes (--level table):\n"
@@ -171,10 +197,15 @@ void print_usage(std::ostream &os) {
         "exit codes (--level con2prim):\n"
         "  0   report.status ok and con2prim_needs_attention() is false\n"
         "  1   con2prim_needs_attention(): any warm-pass failed_no_bracket/\n"
-        "      failed_max_iter state, any cold-pass failed state, or the\n"
-        "      'c2p_roundtrip' class has count > 0 ('c2p_failed' is a redundant\n"
+        "      failed_max_iter state, any cold-pass failed state, the\n"
+        "      'c2p_roundtrip' class has count > 0, or the M3e policy section\n"
+        "      reported a false positive (policy_n_valid_touched), a non-verbatim\n"
+        "      no-touch path, an invalid output, or a broken-state battery case\n"
+        "      that came out invalid or unflagged ('c2p_failed' is a redundant\n"
         "      worst-offender view of the same warm-pass failures, not consulted\n"
-        "      independently)\n"
+        "      independently; the raw policy intervention count is reported but\n"
+        "      not consulted either -- on a real table it legitimately absorbs\n"
+        "      the solver's own documented failure tail)\n"
         "  2   build_entropy_eos() failed (see stderr), or report.status is fatal\n"
         "      (a non-finite recovered primitive/EOSPoint turned up somewhere in\n"
         "      the audit)\n"
@@ -210,6 +241,10 @@ struct ParsedArgs {
   double sigma_max = 0.0;
   bool have_rt_tol = false;
   double rt_tol = 0.0;
+  bool have_rho_atm = false;
+  double rho_atm = 0.0;
+  bool have_w_cap = false;
+  double w_cap = 0.0;
   std::vector<std::string> positionals;
 };
 
@@ -397,6 +432,44 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
         return false;
       }
       out.have_rt_tol = true;
+    } else if (a == "--rho-atm") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_test: option '--rho-atm' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.rho_atm = std::stod(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_test: invalid number for --rho-atm: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (!(out.rho_atm > 0.0)) {
+        std::cerr << "eos_test: --rho-atm must be > 0\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_rho_atm = true;
+    } else if (a == "--w-cap") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_test: option '--w-cap' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.w_cap = std::stod(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_test: invalid number for --w-cap: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (!(out.w_cap > 0.0)) {
+        std::cerr << "eos_test: --w-cap must be > 0\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_w_cap = true;
     } else if (!a.empty() && a[0] == '-') {
       std::cerr << "eos_test: unknown option '" << a << "'\n\n";
       print_usage(std::cerr);
@@ -441,10 +514,11 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
     return false;
   }
 
-  if ((out.have_states || out.have_wmax || out.have_sigma_max || out.have_rt_tol) &&
+  if ((out.have_states || out.have_wmax || out.have_sigma_max || out.have_rt_tol ||
+       out.have_rho_atm || out.have_w_cap) &&
       out.level != "con2prim") {
-    std::cerr << "eos_test: --states/--wmax/--sigma-max/--rt-tol are only valid with --level "
-                 "con2prim\n\n";
+    std::cerr << "eos_test: --states/--wmax/--sigma-max/--rt-tol/--rho-atm/--w-cap are only valid "
+                 "with --level con2prim\n\n";
     print_usage(std::cerr);
     return false;
   }
@@ -685,6 +759,31 @@ int run_con2prim_level(const ParsedArgs &pa) {
   }
   if (pa.have_worst) {
     copts.worst_n = static_cast<size_t>(pa.worst);
+  }
+  if (pa.have_rho_atm) {
+    copts.policy_rho_atm = pa.rho_atm;
+  }
+  if (pa.have_w_cap) {
+    copts.policy_w_cap = pa.w_cap;
+  }
+
+  // M3e: report the PRODUCTION policy defaults -- default_policy() with
+  // rho_atm = 10^x_lo * 10, ten times the table's own density floor, which is
+  // the value a caller of this library would plausibly start from (an
+  // atmosphere one decade above the tabulated minimum). The AUDIT's own
+  // policy differs deliberately, and reports its own rho_atm/w_cap in the
+  // report below -- see con2prim_audit.hpp's Con2PrimCheckOptions::
+  // policy_rho_atm/_w_cap for why (an atmosphere or rapidity threshold inside
+  // the audit's sampled range would make its false-positive measurement
+  // vacuous rather than informative).
+  {
+    const eeos::EntropyEOSView view = adapter.view();
+    const eeos::PolicyOptions prod = eeos::default_policy(view, 10.0 * std::pow(10.0, view.x_lo));
+    std::cout << "policy defaults (production, rho_atm = 10^x_lo * 10): rho_atm=" << prod.rho_atm
+              << " rho_ceiling=" << prod.rho_ceiling << " w_cap=" << prod.w_cap
+              << " D_max=" << prod.D_max << " tau_max=" << prod.tau_max
+              << " collapse_to_atmosphere=" << (prod.collapse_to_atmosphere ? "true" : "false")
+              << "\n";
   }
 
   const eeos::Con2PrimReport report = eeos::check_con2prim(adapter, copts);

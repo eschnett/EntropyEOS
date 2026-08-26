@@ -28,11 +28,13 @@
 
 #include <cstddef>
 #include <iosfwd>
+#include <limits>
 #include <vector>
 
 #include "entropy_eos/core/con2prim.hpp"
 #include "entropy_eos/core/defs.hpp"
 #include "entropy_eos/core/prim2con.hpp"
+#include "entropy_eos/core/state_policy.hpp"
 #include "entropy_eos/host/adapter_audit.hpp"
 #include "entropy_eos/host/adapter_build.hpp"
 
@@ -68,6 +70,38 @@ struct Con2PrimCheckOptions {
   size_t worst_n = 10; // how many worst locations to keep per class
 
   Con2PrimOptions solver; // passed through to every con2prim() call unchanged
+
+  // --- M3e policy section (core/state_policy.hpp) --------------------------
+  // The policy pass re-runs the SAME warm state set through con2prim_safe()
+  // and counts interventions (which must be zero on a state the solver
+  // handled well -- see Con2PrimReport::policy_n_valid_touched), then runs a
+  // small fixed broken-state battery covering the S11 taxonomy.
+  bool policy = true;
+
+  // rho_atm / w_cap for that pass. NaN means "derive it", and the derivation
+  // is deliberately tied to THIS AUDIT'S OWN SAMPLED RANGE rather than to a
+  // production default, because a threshold that sits inside the sampled
+  // range makes the false-positive measurement vacuous rather than
+  // informative:
+  //   rho_atm: half the smallest D the sampled set contains, so no valid
+  //     sampled state can trip the atmosphere trigger. A caller-supplied
+  //     value is LOWERED to that if it is larger (and the value actually
+  //     used is reported as Con2PrimReport::policy_rho_atm_used).
+  //   w_cap: max(default_policy()'s acosh(100), w_max_sample + 0.5), so no
+  //     valid sampled state can trip the rapidity cap -- and, because
+  //     PolicyOptions::D_max/tau_max are DERIVED from w_cap (see
+  //     policy_derive_bounds()), no valid sampled state can trip those
+  //     either: cosh(w)^2 <= cosh(w_cap)^2 is exactly what makes tau_max an
+  //     upper bound. Capped at 0.9 * solver.w_max so the cap stays able to
+  //     fire at all. A caller-supplied value is RAISED to that if smaller.
+  double policy_rho_atm = std::numeric_limits<double>::quiet_NaN();
+  double policy_w_cap = std::numeric_limits<double>::quiet_NaN();
+
+  // Round-trip threshold for the battery's "is the repaired state exactly
+  // solvable?" check (a WARM re-solve of the returned conservatives, seeded
+  // with the returned primitives -- see check_con2prim()'s doc comment for
+  // why warm and not cold).
+  double policy_tol_resolve = 1e-8;
 };
 
 // Result of check_con2prim(). `status` is `fatal` only if some con2prim()
@@ -119,11 +153,57 @@ struct Con2PrimReport {
   //     location, Loc::value is that max)
   std::vector<CheckClassResult> classes;
 
-  double solves_per_sec_warm = 0.0, solves_per_sec_cold = 0.0;
+  // --- M3e policy section (Con2PrimCheckOptions::policy) -------------------
+  // All counters default to 0 / "clean", so a hand-built Con2PrimReport is
+  // still clean under con2prim_needs_attention() (see
+  // tests/test_con2prim_audit.cpp's truth table).
+  bool policy_ran = false;
+  double policy_rho_atm_used = 0.0, policy_w_cap_used = 0.0; // after the derivation above
+
+  // Warm-set pass: con2prim_safe() over the same states as the warm pass.
+  size_t policy_n_interventions = 0; // states with policy_flags != 0 (for ANY reason)
+
+  // Per-flag counts, index = bit - 8, i.e. in flag order
+  // {atmosphere, ceiling, s_floored, s_ceiled, w_capped, rho_clamped,
+  //  ye_clamped, nonfinite} (core/defs.hpp).
+  size_t policy_flag_counts[8] = {};
+
+  // THE false-positive counter, and the one that drives
+  // con2prim_needs_attention(): an intervention on a state whose sampled
+  // (truth) primitives were policy-valid AND whose plain warm con2prim()
+  // converged AND whose recovered primitives were themselves policy-valid.
+  // On such a state the layer had nothing to repair, so a nonzero count
+  // means a threshold is wrong (a too-tight tau_max, an atmosphere trigger
+  // inside the sampled range, a sign slip) -- not that the table is hard.
+  // Interventions on the M3 solver's documented residual failure tail are
+  // deliberately NOT counted here: absorbing those is this layer's job.
+  size_t policy_n_valid_touched = 0;
+
+  // policy_flags == 0 but `cons` was not the input bit-identically. Must be
+  // 0: the no-touch path is contractually a verbatim copy.
+  size_t policy_n_cons_mismatch = 0;
+
+  // Returned state not policy-valid, or non-finite, or D <= 0. Must be 0 --
+  // this is the "never fails" contract itself.
+  size_t policy_n_invalid_out = 0;
+
+  // Broken-state battery (a fixed, deterministic set covering the S11
+  // taxonomy: vacuum/sub-atmosphere, collapse under both
+  // collapse_to_atmosphere settings, tau alone runaway, planted NaN/Inf in
+  // every conservative, tau below the cold floor, a rapidity above the cap,
+  // out-of-range Ye, a negative B^2).
+  size_t policy_battery_n = 0;         // cases run
+  size_t policy_battery_n_invalid = 0; // cases whose output failed a validity check (must be 0)
+  size_t policy_battery_n_no_flag = 0; // cases where the policy did NOT fire at all (must be 0)
+  size_t policy_battery_n_cold_missed = 0; // diagnostic only: cases a COLD re-solve misses
+
+  double solves_per_sec_warm = 0.0, solves_per_sec_cold = 0.0, solves_per_sec_policy = 0.0;
 
   // Human-readable summary: status, state/result counts (warm and cold),
   // both iteration histograms, the round-trip and prim-space quantiles,
-  // each class's count/max/rms and worst offenders, and solve throughput.
+  // each class's count/max/rms and worst offenders, the M3e policy section,
+  // and solve throughput. Self-contained (no cross-referencing needed to
+  // read the policy lines).
   void print(std::ostream &os) const;
 };
 
@@ -157,11 +237,41 @@ struct Con2PrimReport {
 // tests/test_con2prim.cpp's run_one() for the same rationale applied to a
 // hand-unrolled version of this recomputation.
 //
-// Timing: the warm and cold con2prim() passes are timed separately
-// (solves_per_sec_warm/_cold), excluding state sampling/prim2con(truth) and
-// the round-trip bookkeeping that follows -- same "point generation is
-// untimed, only the solve itself is" discipline as check_adapter()'s
-// physicality soak.
+// M3e POLICY SECTION (opts.policy, on by default). After the warm/cold
+// passes, the SAME warm state set is run once more through
+// con2prim_safe() (core/state_policy.hpp) with a PolicyOptions built by
+// default_policy() plus the two audit-specific derivations documented on
+// Con2PrimCheckOptions::policy_rho_atm/_w_cap. Two things are measured:
+//
+//   1. FALSE POSITIVES. Every sampled state is valid by construction, so the
+//      layer must be transparent on it. The counter that matters is
+//      Con2PrimReport::policy_n_valid_touched -- an intervention on a state
+//      whose truth primitives were policy-valid, whose plain warm solve
+//      converged, and whose recovered primitives were policy-valid too.
+//      (The raw intervention count is reported as well, but on a real table
+//      it legitimately picks up the M3 solver's documented residual failure
+//      tail -- absorbing that is the layer's purpose, so it must not be read
+//      as a false positive.) Also checked, on every state: the no-touch path
+//      returns the input conservatives bit-identically, and every returned
+//      state is policy-valid and finite.
+//   2. A BROKEN-STATE BATTERY: a fixed, deterministic set of ~28 states
+//      covering the S11 taxonomy (see Con2PrimReport::policy_battery_n).
+//      Each output must be finite, policy-valid, actually flagged, and
+//      exactly solvable -- the last checked by a WARM re-solve of the
+//      returned conservatives seeded with the returned primitives. Warm and
+//      not cold on purpose: the excision targets (the atmosphere, and the
+//      hot/dense ceiling corner) are precisely where the M3d cold seed and
+//      the S9 bracket scan have their documented real-table failure tail, so
+//      a cold re-solve would measure that tail rather than this layer. The
+//      cold outcome is still recorded, as policy_battery_n_cold_missed.
+//
+// Timing: the warm, cold and policy con2prim() passes are timed separately
+// (solves_per_sec_warm/_cold/_policy), excluding state sampling/
+// prim2con(truth) and the round-trip bookkeeping that follows -- same "point
+// generation is untimed, only the solve itself is" discipline as
+// check_adapter()'s physicality soak. The policy pass runs a full extra
+// con2prim() per state, so it roughly doubles the audit's solve cost; pass
+// opts.policy = false to skip it.
 //
 // Never throws on its own account: a non-finite recovered primitive/EOSPoint
 // or round-trip prim2con() output at any state (warm or cold) is recorded
@@ -172,8 +282,15 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter,
                                const Con2PrimCheckOptions &opts = Con2PrimCheckOptions());
 
 // True iff the report indicates something a caller should look at: any
-// failed_no_bracket/failed_max_iter state, warm or cold pass, or the
-// "c2p_roundtrip" class has count > 0. (status == Status::fatal is a
+// failed_no_bracket/failed_max_iter state, warm or cold pass, the
+// "c2p_roundtrip" class has count > 0, or (M3e) the policy section found a
+// false positive (policy_n_valid_touched), a non-verbatim no-touch path
+// (policy_n_cons_mismatch), an invalid output (policy_n_invalid_out), or a
+// broken-state battery case that came out invalid or unflagged
+// (policy_battery_n_invalid / policy_battery_n_no_flag). The raw
+// policy_n_interventions count is deliberately NOT consulted: on a real
+// table it legitimately absorbs the M3 solver's documented residual failure
+// tail. (status == Status::fatal is a
 // separate, more severe signal callers should check on its own -- see
 // tools/eos_test.cpp. "c2p_failed"'s own class count is not consulted here
 // -- it is redundant with n_failed_no_bracket/n_failed_max_iter by

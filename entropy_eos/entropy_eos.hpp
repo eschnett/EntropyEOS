@@ -15,6 +15,7 @@
 #include "entropy_eos/core/con2prim.hpp"
 #include "entropy_eos/core/defs.hpp"
 #include "entropy_eos/core/prim2con.hpp"
+#include "entropy_eos/core/state_policy.hpp"
 
 #include "entropy_eos/host/adapter_build.hpp"
 #include "entropy_eos/host/bspline_fit.hpp"
