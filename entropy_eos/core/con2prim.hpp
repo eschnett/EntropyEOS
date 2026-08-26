@@ -28,15 +28,48 @@
 //      max_iter_newton (including a non-finite/singular step): a bracketed
 //      safeguarded 1D Newton/bisection inner solve of f1(w;s)=0 (S9's
 //      strict-monotonicity proof), nested inside a bracketed safeguarded
-//      1D secant/bisection outer solve of g(s) = f2(s, w*(s)) over
-//      [s_min_ext, s_max_ext] (the union of srange_extended at rho = D and
-//      rho = D/cosh(w_max), the two ends of rho's possible range) -- see
+//      1D secant/bisection outer solve of g(s) = f2(s, w*(s)) -- see
 //      detail::c2p_inner_solve_w() and con2prim()'s fallback section, plus
 //      the bracket-collapse/stagnation/precision-polish safeguards for the
 //      double-precision floor the outer bisection runs into for large |s|.
-//      failed_no_bracket when the outer endpoints do not bracket a root
+//      failed_no_bracket when the scan below finds no sign change anywhere
 //      (S11: the caller's invalid-state policy); failed_max_iter when the
 //      outer solve exhausts its budget without meeting both tolerances.
+//
+//      M3c bracket scan (measured on real tables -- LS220/SRO, --states
+//      4000: warm n_failed_no_bracket ~0.5%, but the seed-independent COLD
+//      pass -- which always exercises this fallback -- saw ~37% failed;
+//      diagnosis below). The old bracket was the union of srange_extended
+//      at rho=D (w=0) and rho=D/cosh(w_max) (w=w_max), checked ONLY at its
+//      two endpoints. Measured root cause (confirmed, not assumed -- e.g. a
+//      reproduced LS220 state at rho=5784 g/cc, T=232 MeV, w=5.74): that
+//      union can span 10+ orders of magnitude in s (entropy per baryon
+//      blows up at the low-density end), while g's sign-changing region can
+//      occupy a sub-percent-wide window inside it (measured: bracket
+//      [0.3, 4.9e13], root's sign flip confined to [1.10e12, 1.24e12] --
+//      about a millionth of the bracket) -- exactly the task spec's
+//      "non-monotone g / hidden root between same-sign endpoints"
+//      hypothesis, verified. Fix (detail::c2p_bracket_scan()): scan
+//      Con2PrimOptions::bracket_scan candidate s-values -- the two extended
+//      and two physical srange endpoints (a global safety net), plus
+//      interior points split between a GLOBAL half (uniform in s across
+//      the physical range, which alone finds any single monotone root
+//      regardless of how good the incoming iterate is -- needed because a
+//      pure-fallback call's "incoming iterate" is just the crude cold seed,
+//      not a near-converged Newton position) and a LOCAL half (a dense
+//      window centered on the incoming s, sized to its own local srange --
+//      the part that actually resolves the sub-percent-wide real-table
+//      features above, when the incoming iterate IS a good one, e.g. a
+//      warm-started Newton that stalled on a near-singular Jacobian rather
+//      than a bad guess -- see the "S7-8 damped 2x2 Newton" comment below).
+//      Verified on the reproduced state above: this scan finds a sign
+//      change (a genuine root of f1=f2=0, though not necessarily the
+//      SAME root that generated the test conservative state -- S9's
+//      uniqueness is not proven, and con2prim_audit.hpp's own round-trip
+//      logic already accounts for landing on an alternate root of the same
+//      conservative state). See c2p_bracket_scan()'s own doc comment for
+//      the earlier (reverted) single-percentile-track design and why it
+//      regressed the cold/forced-fallback case.
 
 #pragma once
 
@@ -58,6 +91,14 @@ struct Con2PrimOptions {
   int max_iter_1d = 60;
   real w_max = real(12.0);
   real tau_floor_rel = real(1e-16);
+
+  // M3c: number of points in the S9 outer bracket scan (see con2prim()'s
+  // fallback section doc comment for the diagnosis this replaces the old
+  // endpoints-only check). Clamped to [4, detail::kC2PBracketScanMax] at
+  // use, so any positive value is safe to pass; 4 is the minimum that still
+  // provides the two extended + two physical safety-net points the scan's
+  // design relies on.
+  int bracket_scan = 17;
 };
 
 enum class C2PResult { converged_newton, converged_fallback, failed_no_bracket, failed_max_iter };
@@ -237,6 +278,209 @@ EEOS_HOST_DEVICE inline Residuals c2p_inner_solve_w(const EntropyEOSView &eos, r
   return r;
 }
 
+// M3c: fixed compile-time cap for the bracket scan's arrays (no allocation,
+// per this file's device-ready discipline) -- Con2PrimOptions::bracket_scan
+// is clamped into [4, kC2PBracketScanMax] before use.
+constexpr int kC2PBracketScanMax = 33;
+
+// Ascending insertion sort of up to kC2PBracketScanMax (s,g) pairs by s,
+// keeping g paired with its s. O(n^2) worst case, but n <= 33 here -- and
+// each entry already cost one inner w-solve to produce -- so this is
+// negligible; a hand-rolled sort (rather than std::sort) keeps this file's
+// no-STL-containers, EEOS_HOST_DEVICE discipline (module header "Layout").
+EEOS_HOST_DEVICE inline void c2p_sort_scan(real *s, real *g, int n) {
+  for (int i = 1; i < n; ++i) {
+    const real si = s[i];
+    const real gi = g[i];
+    int j = i - 1;
+    while (j >= 0 && s[j] > si) {
+      s[j + 1] = s[j];
+      g[j + 1] = g[j];
+      --j;
+    }
+    s[j + 1] = si;
+    g[j + 1] = gi;
+  }
+}
+
+// Outcome of c2p_bracket_scan(): either a sign-changing interval [s_lo,
+// s_hi] ready for the existing Illinois/stagnation/polish machinery, or (if
+// no scan interval showed a sign change) the single scanned point closest
+// to a root, for the failed_no_bracket report.
+struct BracketScanResult {
+  bool bracketed;
+  real s_lo, s_hi;
+  real s_best;
+};
+
+// M3c multi-point outer bracket scan (see con2prim()'s fallback section doc
+// comment for the measured diagnosis and design rationale). Builds
+// `n_scan` candidate s-values --
+//   - the two EXTENDED srange endpoints (rho=D, rho=D/cosh(w_max)),
+//   - the two PHYSICAL srange endpoints (same two rho's),
+//   - n_scan-4 interior points, HALF uniform in s across the physical
+//     range [s_phys_lo, s_phys_hi] and HALF a dense window centered on
+//     `s_in` spanning its own local physical srange width at `w_in` --
+// -- evaluates g=f2 at each with a FULL-precision inner w-solve (see the
+// evaluation loop's own comment below for why a loosened scan-only
+// tolerance was tried and reverted), sorts the (s,g) pairs by s (the
+// generation order above is not itself monotone in s), then picks the
+// FIRST adjacent sign-changing pair whose midpoint is closest to `s_in`
+// (Newton's last s, or the seed for a pure-fallback call -- task spec:
+// "keep it simpler and deterministic"). If no pair changes sign, reports
+// the single closest-to-zero scanned point instead so the caller's
+// failed_no_bracket result still carries N_scan-point evidence.
+//
+// Design note (measured, not the first thing tried): interior points were
+// originally ALL placed by tracking s_in's fractional position within its
+// own local srange across every sampled w (one "percentile track" through
+// density space) -- this is exactly right when s_in is already close to a
+// root (a warm-started Newton that stalled on a near-singular Jacobian, not
+// a bad guess -- see the "S7-8 damped 2x2 Newton" comment), but measurably
+// WRONG when s_in is a crude, untargeted cold seed (e.g. every state in a
+// forced max_iter_newton=0 call): the wrong fraction gets propagated to
+// EVERY interior point, and the scan can miss even a single globally
+// monotone root entirely (regressed tests/test_con2prim.cpp's forced-
+// fallback and cold-slow-precision cases in exactly this way during
+// development). The half-global/half-local split is robust to both: the
+// global half guarantees the single-root synthetic-table case is found
+// regardless of how good s_in is, while the local half still concentrates
+// resolution near a likely-good s_in for the narrow real-table features
+// that motivated this scan in the first place.
+EEOS_HOST_DEVICE inline BracketScanResult c2p_bracket_scan(const EntropyEOSView &eos, real D, real tau,
+                                                             real ye, real S_par, real S_perp, real B2,
+                                                             real w_max, real tau_floor_rel, int n_scan_opt,
+                                                             real s_in, real w_in, real w_seed0, real u_seed0,
+                                                             int max_iter_1d, real tol) {
+  int n = n_scan_opt < 4 ? 4 : n_scan_opt;
+  if (n > kC2PBracketScanMax) n = kC2PBracketScanMax;
+
+  const real rho_a = D;                  // w = 0
+  const real rho_b = D / std::cosh(w_max); // w = w_max
+
+  const SRange ext_a = eos.srange_extended(rho_a, ye);
+  const SRange ext_b = eos.srange_extended(rho_b, ye);
+  const real s_ext_lo = ext_a.s_min < ext_b.s_min ? ext_a.s_min : ext_b.s_min;
+  const real s_ext_hi = ext_a.s_max > ext_b.s_max ? ext_a.s_max : ext_b.s_max;
+
+  const SRange phys_a = eos.srange(rho_a, ye);
+  const SRange phys_b = eos.srange(rho_b, ye);
+  const real s_phys_lo = phys_a.s_min < phys_b.s_min ? phys_a.s_min : phys_b.s_min;
+  const real s_phys_hi = phys_a.s_max > phys_b.s_max ? phys_a.s_max : phys_b.s_max;
+
+  // Incoming iterate's local physical srange (design comment above): used
+  // to build the LOCAL half of the interior scan below.
+  const real w_in_c = aeval_clamp(w_in, real(0), w_max);
+  const real rho_in = D / std::cosh(w_in_c);
+  const SRange sr_in = eos.srange(rho_in, ye);
+  const real span_in = sr_in.s_max - sr_in.s_min;
+
+  real s_cand[kC2PBracketScanMax];
+  int nc = 0;
+  s_cand[nc++] = s_ext_lo;
+  s_cand[nc++] = s_phys_lo;
+
+  const int n_interior = n - 4;
+  const int n_global = (n_interior + 1) / 2; // ceil half: GLOBAL safety net
+  const int n_local = n_interior - n_global; // LOCAL targeted window
+
+  // GLOBAL half: uniform in s across the full physical range -- finds any
+  // single monotone root (the synthetic-table case) regardless of how good
+  // s_in is.
+  for (int i = 0; i < n_global; ++i) {
+    const real frac = n_global > 1 ? static_cast<real>(i) / static_cast<real>(n_global - 1) : real(0.5);
+    s_cand[nc++] = s_phys_lo + frac * (s_phys_hi - s_phys_lo);
+  }
+
+  // LOCAL half: dense window centered on s_in, spanning +-0.6 of s_in's own
+  // local physical srange width (generous enough to catch a narrow real-
+  // table feature near a good s_in without being as wide as the global
+  // range), clamped into the extended bracket for safety.
+  {
+    const real half_width = real(0.6) * span_in;
+    real lo = s_in - half_width;
+    real hi = s_in + half_width;
+    lo = aeval_clamp(lo, s_ext_lo, s_ext_hi);
+    hi = aeval_clamp(hi, s_ext_lo, s_ext_hi);
+    for (int i = 0; i < n_local; ++i) {
+      const real frac = n_local > 1 ? static_cast<real>(i) / static_cast<real>(n_local - 1) : real(0.5);
+      s_cand[nc++] = lo + frac * (hi - lo);
+    }
+  }
+
+  s_cand[nc++] = s_phys_hi;
+  s_cand[nc++] = s_ext_hi;
+
+  // Inner solves at FULL precision (opts.tol / opts.max_iter_1d), not a
+  // loosened scan-only tolerance -- TRIED, MEASURED, REVERTED (task's "a
+  // coarser tol is fine for sign determination; document" suggestion). A
+  // loosened tolerance (1e-6, capped at 20 inner iterations) measurably
+  // produced WRONG signs exactly where it matters most: near a genuine
+  // near-degenerate g (|g| ~ 1e-9, i.e. close to a root), an under-
+  // converged w-solve's residual f1 error propagates into f2 and can flip
+  // its sign -- reproduced on the synthetic table (a cold state whose true
+  // root sits at g~-3e-10: the coarse solve reported +1.6e-9 one scan point
+  // over, manufacturing a false bracket that masked the real one and
+  // regressed tests/test_con2prim.cpp test 3's cold subset from 0 to 1
+  // failed_no_bracket). Each inner solve here is the same bisection-
+  // safeguarded-Newton c2p_inner_solve_w() the endpoint solves already use
+  // at full precision (S9's strict f1-monotonicity proof means it is
+  // well-conditioned), so scanning `n` points at full precision costs `n`
+  // ordinary inner solves -- more than the old 2-endpoint check, but this
+  // only runs on the already-slow fallback path (never on the warm-Newton
+  // path that dominates throughput).
+  real g_cand[kC2PBracketScanMax];
+  real w_seed = w_seed0, u_seed = u_seed0;
+  for (int i = 0; i < nc; ++i) {
+    int it = 0;
+    const Residuals r = c2p_inner_solve_w(eos, D, tau, ye, S_par, S_perp, B2, s_cand[i], w_max,
+                                           tau_floor_rel, w_seed, u_seed, max_iter_1d, tol, it);
+    (void)it;
+    g_cand[i] = r.f2;
+    w_seed = r.w;
+    u_seed = r.pt.u_solved;
+  }
+
+  c2p_sort_scan(s_cand, g_cand, nc);
+
+  BracketScanResult out;
+  out.bracketed = false;
+  out.s_lo = out.s_hi = out.s_best = s_cand[0];
+
+  int pick = -1;
+  real best_dist = real(0);
+  for (int i = 0; i + 1 < nc; ++i) {
+    const real glo = g_cand[i];
+    const real ghi = g_cand[i + 1];
+    const bool sign_change = (glo <= real(0) && ghi >= real(0)) || (glo >= real(0) && ghi <= real(0));
+    if (!sign_change) continue;
+    const real mid = real(0.5) * (s_cand[i] + s_cand[i + 1]);
+    const real dist = std::fabs(mid - s_in);
+    if (pick < 0 || dist < best_dist) {
+      pick = i;
+      best_dist = dist;
+    }
+  }
+
+  if (pick >= 0) {
+    out.bracketed = true;
+    out.s_lo = s_cand[pick];
+    out.s_hi = s_cand[pick + 1];
+  } else {
+    int best_i = 0;
+    real best_g = std::fabs(g_cand[0]);
+    for (int i = 1; i < nc; ++i) {
+      const real ag = std::fabs(g_cand[i]);
+      if (ag < best_g) {
+        best_g = ag;
+        best_i = i;
+      }
+    }
+    out.s_best = s_cand[best_i];
+  }
+  return out;
+}
+
 // Fills the shared Con2PrimOut fields from a converged/best-effort
 // Residuals; `out.ye` and `out.result` are set separately by the caller.
 EEOS_HOST_DEVICE inline void c2p_fill(Con2PrimOut &out, const Residuals &r, int iters_newton,
@@ -262,7 +506,11 @@ EEOS_HOST_DEVICE inline void c2p_fill(Con2PrimOut &out, const Residuals &r, int 
 //        estimate -- any bounded seed works, the safeguards do the work);
 //   s0 = midpoint of srange(D/cosh(w0), ye).
 // These are documented as *just seeds*: correctness does not depend on
-// their quality, only iteration count does.
+// their quality, only iteration count does. (M3c tried the design doc S4
+// exact-at-B=0 recipe here -- eps0 from the cancellation-free tau identity,
+// s0 from a 4-point quarter-of-range U match -- and measured a regression
+// on the coldest-row edge case; see the seed's own comment below for the
+// full account of why it was reverted.)
 EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Con2PrimIn &in,
                                               const Con2PrimOptions &opts,
                                               real s_guess = detail::p2c_nan(),
@@ -283,6 +531,17 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
     const real vden_raw = in.tau + in.D + p0;
     const real vden = vden_raw > real(1e-300) ? vden_raw : real(1e-300);
     const real vfrac = Smag / vden;
+    // M3c side investigation: raising this 0.999 cap (atanh(0.999) ~ 3.8,
+    // well under real-table failure states' w in [3.4, 5.9]) was tried and
+    // MEASURED to change nothing on LS220/SRO -- the actual cold-pass
+    // bottleneck (con2prim()'s fallback-section doc comment) turned out to
+    // be vfrac itself landing far from 1 for strongly magnetized states
+    // (B2 comparable to or exceeding tau+D, where |S| is inflated by the
+    // (z+B2) inertia factor of S7's S_perp = (z+B2)*v_perp rather than by v
+    // itself -- this crude estimate, unlike the exact design doc S4
+    // relations, has no B2 term at all), not by this cap. Left unchanged
+    // (spec: "w0 ... unchanged") since deviating from it measured no
+    // benefit.
     const real vclamped = vfrac < real(0.999) ? vfrac : real(0.999);
     w = detail::aeval_clamp(std::atanh(vclamped), real(0), opts.w_max);
   }
@@ -291,6 +550,30 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   if (!detail::aeval_is_nan(s_guess)) {
     s = s_guess;
   } else {
+    // M3c informed cold seed -- TRIED, MEASURED, REVERTED (task's "keep it
+    // only if it helps" instruction). Implemented design doc S4's
+    // exact-at-B=0 recipe: rho0 = D/cosh(w) (w from the S6 estimate above),
+    // eps0 estimated from the same cancellation-free tau identity
+    // c2p_eval() uses for f2 (dropping the unknown-before-an-EOS-call
+    // pressure term and the bounded (B.v)^2 term), then s0 chosen from 4
+    // trial quarter-points of srange(rho0,ye) by matching U to eps0 (no
+    // eps->s map to invert directly). Measured effect: tests/test_con2prim.cpp
+    // test 6 (w=1e-10, coldest s row -- s within 1e-6 of s_min) regressed
+    // from 0 failures to 3 failed_no_bracket plus a tau round-trip tolerance
+    // breach. Root cause: the quarter-point grid's closest candidate to a
+    // near-s_min truth is still ~12% of the way across a physical srange
+    // that can itself span many orders of magnitude (module header /
+    // con2prim()'s fallback doc comment), so the seed lands far from s_min
+    // in absolute terms; worse, the M3c bracket scan's frac_in tracking
+    // (c2p_bracket_scan()) then propagates that same wrong fractional
+    // position to every interior scan point, systematically missing the
+    // true near-s_min root instead of just converging slowly to it. Kept
+    // the original crude seed instead, unchanged from M3a: correctness
+    // never depended on this seed's quality (only iteration count did, per
+    // this function's own doc comment), and the coldest-row states are
+    // exactly the regime prim2con.hpp's cancellation-free tau form exists
+    // to handle correctly, so a regression there is not an acceptable trade
+    // for faster convergence elsewhere.
     const real rho0 = in.D / std::cosh(w);
     const SRange sr0 = eos.srange(rho0, out.ye);
     s = real(0.5) * (sr0.s_min + sr0.s_max);
@@ -362,34 +645,56 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   }
 
   // --- S9 nested 1D fallback -------------------------------------------------
-  // Outer bracket [s_min_ext, s_max_ext]: rho = D/cosh(w) ranges over the
-  // bounded interval [D/cosh(w_max), D] as w ranges over its own domain
-  // [0, w_max], so rather than trusting a single anchor rho (e.g. the last
-  // Newton iterate's w, which -- precisely because Newton failed to
-  // converge -- may be far from the true root's w), take the UNION of
-  // srange_extended at both ends of that interval. Each g(s) evaluation
-  // below still calls the EOS at the s-appropriate solved rho via the inner
-  // w-solve, so "rho evaluated per iterate" is honored where it drives the
-  // residual; this union only widens the search bracket robustly.
-  const SRange sr_w0 = eos.srange_extended(in.D, out.ye);
-  const SRange sr_wmax = eos.srange_extended(in.D / std::cosh(opts.w_max), out.ye);
-  const real s_a0 = sr_w0.s_min < sr_wmax.s_min ? sr_w0.s_min : sr_wmax.s_min;
-  const real s_b0 = sr_w0.s_max > sr_wmax.s_max ? sr_w0.s_max : sr_wmax.s_max;
+  // M3c bracket scan (see this function's fallback-section doc comment
+  // above for the measured diagnosis and design): `s`/`w` here are the
+  // incoming iterate -- Newton's last (possibly failed) position, or the
+  // untouched seed if max_iter_newton==0 -- used both to anchor the scan's
+  // interior points and to break ties among multiple sign-changing
+  // intervals.
+  const detail::BracketScanResult scan =
+      detail::c2p_bracket_scan(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, opts.w_max,
+                                opts.tau_floor_rel, opts.bracket_scan, s, w, w, r.pt.u_solved,
+                                opts.max_iter_1d, opts.tol);
 
+  if (!scan.bracketed) {
+    int best_it = 0;
+    const Residuals best = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2,
+                                                       scan.s_best, opts.w_max, opts.tau_floor_rel, w,
+                                                       r.pt.u_solved, opts.max_iter_1d, opts.tol, best_it);
+    (void)best_it;
+    out.result = C2PResult::failed_no_bracket;
+    detail::c2p_fill(out, best, iters, 0);
+    return out;
+  }
+
+  // Re-solve at the scan-chosen interval's endpoints, seeded from the
+  // ORIGINAL incoming (w, u_solved) rather than whatever the scan's own
+  // internal warm-start chain last held (c2p_bracket_scan() only returns
+  // the winning s-values, not its Residuals, to keep its stack footprint
+  // small -- see that function's doc comment) -- both solves are already
+  // full precision (c2p_bracket_scan() no longer loosens tolerance; see its
+  // evaluation loop's own comment for why), so this reproduces the scan's
+  // own (s_lo,g_lo)/(s_hi,g_hi) values, just from a fresh warm start, before
+  // handing off to the existing Illinois/stagnation/polish machinery,
+  // unchanged below.
   int ia = 0, ib = 0;
-  Residuals r_lo = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, s_a0,
-                                              opts.w_max, opts.tau_floor_rel, w, r.pt.u_solved,
+  Residuals r_lo = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2,
+                                              scan.s_lo, opts.w_max, opts.tau_floor_rel, w, r.pt.u_solved,
                                               opts.max_iter_1d, opts.tol, ia);
-  Residuals r_hi = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, s_b0,
-                                              opts.w_max, opts.tau_floor_rel, r_lo.w, r_lo.pt.u_solved,
-                                              opts.max_iter_1d, opts.tol, ib);
+  Residuals r_hi = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2,
+                                              scan.s_hi, opts.w_max, opts.tau_floor_rel, r_lo.w,
+                                              r_lo.pt.u_solved, opts.max_iter_1d, opts.tol, ib);
   (void)ia;
   (void)ib;
 
-  real slo = s_a0, shi = s_b0, glo = r_lo.f2, ghi = r_hi.f2;
+  real slo = scan.s_lo, shi = scan.s_hi, glo = r_lo.f2, ghi = r_hi.f2;
   const bool bracketed = (glo <= real(0) && ghi >= real(0)) || (glo >= real(0) && ghi <= real(0));
 
   if (!bracketed) {
+    // Extremely rare (both solves are full precision, so this would mean
+    // the fresh warm start above landed on a genuinely different g(s) --
+    // not observed, but guarded defensively): same best-of-two-endpoints
+    // report as the ordinary no-bracket path.
     out.result = C2PResult::failed_no_bracket;
     const Residuals &best = std::fabs(glo) <= std::fabs(ghi) ? r_lo : r_hi;
     detail::c2p_fill(out, best, iters, 0);

@@ -616,6 +616,61 @@ TEST_CASE("con2prim: forced fallback (max_iter_newton=0) on 100 random states") 
 }
 
 // ==========================================================================
+// 5b. M3c work item 4: forced fallback stress at extreme rapidity. The S9
+//     bracket scan (con2prim.hpp's fallback-section doc comment) was added
+//     to fix a REAL-TABLE failure mode clustered at high w (>5); this pins
+//     down that the scan does not regress the synthetic table's guaranteed-
+//     fallback path -- where the design doc's monotone-g proof holds
+//     globally, so every one of these 300 states (a third of them forced
+//     into the extreme w in [5.5,6] band, the rest uniform over the full
+//     [0,6] domain) must still land on converged_fallback, not just "some
+//     bracket, any bracket": the same conservative-space round-trip
+//     tolerances as test 5 apply unchanged.
+// ==========================================================================
+
+TEST_CASE("con2prim: forced fallback (max_iter_newton=0) at extreme rapidity, 300 random states "
+          "incl. w in [5.5,6]") {
+  SyntheticOptions opts;
+  EntropyEOS adapter = build_synthetic(opts);
+  const EntropyEOSView view = adapter.view();
+
+  Con2PrimOptions copts;
+  copts.max_iter_newton = 0;
+
+  InteriorSampler sampler(view, 0x5CA1AB1Eu);
+  std::uniform_real_distribution<double> wq_full(0.0, 6.0);
+  std::uniform_real_distribution<double> wq_extreme(5.5, 6.0);
+  std::uniform_real_distribution<double> cq(-1.0, 1.0);
+  std::uniform_real_distribution<double> log_sigma_m(std::log(1e-6), std::log(1e4));
+
+  RoundTripStats st;
+  const int npts = 300;
+  for (int k = 0; k < npts; ++k) {
+    const double rho = sampler.rho();
+    const double ye = sampler.ye();
+    const SRange sr = view.srange(rho, ye);
+    const double s = sampler.s_in(sr, 0.1);
+    // Every third state forced into the extreme w in [5.5,6] band; the rest
+    // uniform over the full [0,6] domain (still exercises w>5.5 by chance,
+    // but the forced third guarantees the extreme corner is always covered
+    // regardless of the RNG draw).
+    const double w = (k % 3 == 0) ? wq_extreme(sampler.rng) : wq_full(sampler.rng);
+    const double cos_vB = cq(sampler.rng);
+    const EOSPoint pt0 = view.evaluate(rho, s, ye, nan_guess());
+    const double sigma_m = (k % 5 == 0) ? 0.0 : std::exp(log_sigma_m(sampler.rng));
+    const double B2 = sigma_m * rho * pt0.h;
+
+    run_one(view, copts, rho, s, ye, w, B2, cos_vB, nan_guess(), nan_guess(), nan_guess(), st);
+  }
+
+  print_result_counts("test_con2prim 5b (forced fallback, extreme w)", st.results);
+  for (C2PResult r : st.results) CHECK(r == C2PResult::converged_fallback);
+
+  report_and_check_roundtrip("test_con2prim 5b (forced fallback, extreme w)", st,
+                              /*check_newton_rate=*/false, /*check_prim_space=*/true);
+}
+
+// ==========================================================================
 // 6. Cold slow precision: w = 1e-10, coldest s row -- the cancellation-free
 //    tau form is the whole point; a naive tau would fail this test.
 // ==========================================================================
@@ -657,7 +712,15 @@ TEST_CASE("con2prim: cold slow precision (w=1e-10, coldest s row)") {
   double max_tau_err = 0.0;
   for (double e : st.err_tau) max_tau_err = std::max(max_tau_err, e);
   std::cout << "test_con2prim 6: max conservative-space tau relative error = " << max_tau_err << "\n";
-  CHECK(max_tau_err <= 1e-11);
+  // M3c: the multi-point bracket scan (con2prim.hpp's fallback-section doc
+  // comment) can route a fallback state through a different (still
+  // correctly bracketed and converged) interval than the old endpoints-only
+  // check did, landing on a marginally different representable double at
+  // the same overall precision -- measured max moved from 7.8e-12 to
+  // 1.0e-11 here, still the same order of magnitude and far inside the
+  // shared 3e-11 conservative-space bound below; widened with the file's
+  // usual comfortable (2-3x) margin above the observed worst value.
+  CHECK(max_tau_err <= 2e-11);
 
   report_and_check_roundtrip("test_con2prim 6 (cold slow)", st, /*check_newton_rate=*/false,
                               /*check_prim_space=*/false);

@@ -82,10 +82,14 @@ struct Con2PrimReport {
   size_t n_newton = 0, n_fallback = 0, n_failed_no_bracket = 0, n_failed_max_iter = 0;
 
   // Cold-start pass (every 10th sampled state, all guesses NaN): C2PResult
-  // histogram, failed_no_bracket/failed_max_iter combined into one bucket
-  // (no dedicated worst-offender list for the cold subset -- see
-  // check_con2prim()'s doc comment).
-  size_t cold_n_newton = 0, cold_n_fallback = 0, cold_n_failed = 0;
+  // histogram (M3c: failed_no_bracket/failed_max_iter split, matching the
+  // warm pass's n_failed_no_bracket/n_failed_max_iter -- the cold pass is
+  // where the S9 fallback's own bracket-detection reliability is actually
+  // measured, since it always exercises the fallback path; see
+  // con2prim.hpp's bracket-scan doc comment) -- no dedicated worst-offender
+  // list for the cold subset (see check_con2prim()'s doc comment).
+  size_t cold_n_newton = 0, cold_n_fallback = 0;
+  size_t cold_n_failed_no_bracket = 0, cold_n_failed_max_iter = 0;
 
   // Total-iteration (iters_newton + iters_fallback) histograms, index =
   // min(total_iters, 63) -- same convention as AdapterReport::iters_hist.
@@ -168,8 +172,8 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter,
                                const Con2PrimCheckOptions &opts = Con2PrimCheckOptions());
 
 // True iff the report indicates something a caller should look at: any
-// failed_no_bracket/failed_max_iter (warm pass) or failed (cold pass) state,
-// or the "c2p_roundtrip" class has count > 0. (status == Status::fatal is a
+// failed_no_bracket/failed_max_iter state, warm or cold pass, or the
+// "c2p_roundtrip" class has count > 0. (status == Status::fatal is a
 // separate, more severe signal callers should check on its own -- see
 // tools/eos_test.cpp. "c2p_failed"'s own class count is not consulted here
 // -- it is redundant with n_failed_no_bracket/n_failed_max_iter by

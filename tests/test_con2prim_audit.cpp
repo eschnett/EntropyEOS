@@ -81,7 +81,8 @@ TEST_CASE("check_con2prim: clean synthetic (default grid, n=4000) round trips cl
   // Newton and the SS9 fallback should always converge.
   CHECK(report.n_failed_no_bracket == 0);
   CHECK(report.n_failed_max_iter == 0);
-  CHECK(report.cold_n_failed == 0);
+  CHECK(report.cold_n_failed_no_bracket == 0);
+  CHECK(report.cold_n_failed_max_iter == 0);
   CHECK(find_class(report, "c2p_failed").count == 0);
 
   // Synthetic is smooth everywhere: the conservative-space round trip
@@ -164,7 +165,8 @@ TEST_CASE("check_con2prim: two runs with identical options are bitwise identical
   CHECK(r1.n_failed_max_iter == r2.n_failed_max_iter);
   CHECK(r1.cold_n_newton == r2.cold_n_newton);
   CHECK(r1.cold_n_fallback == r2.cold_n_fallback);
-  CHECK(r1.cold_n_failed == r2.cold_n_failed);
+  CHECK(r1.cold_n_failed_no_bracket == r2.cold_n_failed_no_bracket);
+  CHECK(r1.cold_n_failed_max_iter == r2.cold_n_failed_max_iter);
 
   for (size_t i = 0; i < 64; ++i) {
     CHECK(r1.iters_hist_warm[i] == r2.iters_hist_warm[i]);
@@ -225,9 +227,15 @@ TEST_CASE("con2prim_needs_attention: failed_*/roundtrip drive it, c2p_failed's o
     CHECK(eeos::con2prim_needs_attention(r));
   }
 
-  SUBCASE("cold_n_failed alone forces true") {
+  SUBCASE("cold_n_failed_no_bracket alone forces true") {
     Con2PrimReport r = clean;
-    r.cold_n_failed = 1;
+    r.cold_n_failed_no_bracket = 1;
+    CHECK(eeos::con2prim_needs_attention(r));
+  }
+
+  SUBCASE("cold_n_failed_max_iter alone forces true") {
+    Con2PrimReport r = clean;
+    r.cold_n_failed_max_iter = 1;
     CHECK(eeos::con2prim_needs_attention(r));
   }
 
@@ -312,7 +320,9 @@ TEST_CASE("check_con2prim: LS220 real table (guarded), default m_B, n=2000 -- ru
   MESSAGE("test_con2prim_audit 4 (LS220): n_newton=" << report.n_newton
           << " n_fallback=" << report.n_fallback << " n_failed_no_bracket=" << report.n_failed_no_bracket
           << " n_failed_max_iter=" << report.n_failed_max_iter << " cold_n_newton=" << report.cold_n_newton
-          << " cold_n_fallback=" << report.cold_n_fallback << " cold_n_failed=" << report.cold_n_failed
+          << " cold_n_fallback=" << report.cold_n_fallback
+          << " cold_n_failed_no_bracket=" << report.cold_n_failed_no_bracket
+          << " cold_n_failed_max_iter=" << report.cold_n_failed_max_iter
           << " c2p_failed.count=" << failed.count << " c2p_roundtrip.count=" << roundtrip.count
           << " rt_D.max=" << report.rt_D.max << " rt_tau.p99=" << report.rt_tau.p99
           << " rt_tau.max=" << report.rt_tau.max << " rt_S.max=" << report.rt_S.max

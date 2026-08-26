@@ -469,7 +469,8 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
   // --- Cold-pass classification (results + histogram + fatal check only --
   // no round-trip/prim-space stats or worst-offender list, see the header's
   // doc comment).
-  std::vector<size_t> local_cold_newton(nt, 0), local_cold_fallback(nt, 0), local_cold_failed(nt, 0);
+  std::vector<size_t> local_cold_newton(nt, 0), local_cold_fallback(nt, 0);
+  std::vector<size_t> local_cold_no_bracket(nt, 0), local_cold_max_iter(nt, 0);
   std::vector<std::vector<size_t>> local_hist_cold(nt, std::vector<size_t>(64, 0));
   std::vector<char> local_cold_fatal(nt, 0);
 
@@ -486,8 +487,8 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
     switch (rec.result) {
       case C2PResult::converged_newton: ++local_cold_newton[tid]; break;
       case C2PResult::converged_fallback: ++local_cold_fallback[tid]; break;
-      case C2PResult::failed_no_bracket:
-      case C2PResult::failed_max_iter: ++local_cold_failed[tid]; break;
+      case C2PResult::failed_no_bracket: ++local_cold_no_bracket[tid]; break;
+      case C2PResult::failed_max_iter: ++local_cold_max_iter[tid]; break;
     }
     const int total_iters = rec.iters_newton + rec.iters_fallback;
     const size_t hb = static_cast<size_t>(std::min(std::max(total_iters, 0), 63));
@@ -497,7 +498,8 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
   for (size_t t = 0; t < nt; ++t) {
     report.cold_n_newton += local_cold_newton[t];
     report.cold_n_fallback += local_cold_fallback[t];
-    report.cold_n_failed += local_cold_failed[t];
+    report.cold_n_failed_no_bracket += local_cold_no_bracket[t];
+    report.cold_n_failed_max_iter += local_cold_max_iter[t];
     for (size_t i = 0; i < 64; ++i) report.iters_hist_cold[i] += local_hist_cold[t][i];
     if (local_cold_fatal[t]) any_fatal = true;
   }
@@ -507,7 +509,8 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
 }
 
 bool con2prim_needs_attention(const Con2PrimReport &report) {
-  if (report.n_failed_no_bracket > 0 || report.n_failed_max_iter > 0 || report.cold_n_failed > 0) {
+  if (report.n_failed_no_bracket > 0 || report.n_failed_max_iter > 0 ||
+      report.cold_n_failed_no_bracket > 0 || report.cold_n_failed_max_iter > 0) {
     return true;
   }
   for (const CheckClassResult &c : report.classes) {
@@ -528,7 +531,9 @@ void Con2PrimReport::print(std::ostream &os) const {
      << " n_failed_no_bracket=" << n_failed_no_bracket << " n_failed_max_iter=" << n_failed_max_iter
      << " n_failed_total=" << (n_failed_no_bracket + n_failed_max_iter) << "\n";
   os << "cold: n_newton=" << cold_n_newton << " n_fallback=" << cold_n_fallback
-     << " n_failed=" << cold_n_failed << "\n";
+     << " n_failed_no_bracket=" << cold_n_failed_no_bracket
+     << " n_failed_max_iter=" << cold_n_failed_max_iter
+     << " n_failed_total=" << (cold_n_failed_no_bracket + cold_n_failed_max_iter) << "\n";
 
   os << "iters_hist_warm:\n";
   for (size_t i = 0; i < 64; ++i) {
