@@ -19,6 +19,7 @@
 #include "entropy_eos/host/repair.hpp"
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
+#include "test_scale.hpp"
 
 using eeos::RawTable;
 using eeos::RepairEntry;
@@ -109,12 +110,14 @@ std::vector<double> reference_pava(const std::vector<double> &input) {
 
 } // namespace
 
-TEST_CASE("repair_column: PAVA stage agrees exactly with an independent O(n^2) reference") {
+TEST_CASE("repair_column: PAVA stage agrees exactly with an independent O(n^2) reference "
+          "(200 arrays, 40 under sanitizers)") {
   std::mt19937 rng(20260824);
   std::uniform_int_distribution<size_t> pick_len(1, 12);
   std::uniform_real_distribution<double> pick_val(-50.0, 50.0);
 
-  for (int trial = 0; trial < 200; ++trial) {
+  const int n_trials = static_cast<int>(eeos_n(200, 40));
+  for (int trial = 0; trial < n_trials; ++trial) {
     const size_t n = pick_len(rng);
     std::vector<double> input(n);
     for (size_t i = 0; i < n; ++i) {
@@ -137,13 +140,14 @@ TEST_CASE("repair_column: PAVA stage agrees exactly with an independent O(n^2) r
 
 // --- (3) strict min-slope monotonicity --------------------------------------
 
-TEST_CASE("repair_column: result satisfies the strict minimum slope") {
+TEST_CASE("repair_column: result satisfies the strict minimum slope (200 trials, 40 under sanitizers)") {
   std::mt19937 rng(7);
   std::uniform_int_distribution<size_t> pick_len(2, 25);
   std::uniform_real_distribution<double> pick_val(-10.0, 10.0);
   const double min_slope = 0.01;
 
-  for (int trial = 0; trial < 200; ++trial) {
+  const int n_trials = static_cast<int>(eeos_n(200, 40));
+  for (int trial = 0; trial < n_trials; ++trial) {
     const size_t n = pick_len(rng);
     std::vector<double> col(n);
     for (size_t i = 0; i < n; ++i) {

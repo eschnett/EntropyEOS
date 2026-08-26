@@ -23,6 +23,7 @@
 #include "entropy_eos/host/adapter_build.hpp"
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
+#include "test_scale.hpp"
 
 using eeos::C2PResult;
 using eeos::Con2PrimIn;
@@ -140,7 +141,7 @@ TEST_CASE("prim2con: cancellation-free tau matches E-D (naive) at moderate w, "
   std::uniform_real_distribution<double> cq(-1.0, 1.0);
 
   SUBCASE("moderate w: naive E-D matches the model tau to 1e-13 relative of (tau+D)") {
-    const int npts = 500;
+    const int npts = static_cast<int>(eeos_n(500, 100));
     double max_rel = 0.0;
     for (int k = 0; k < npts; ++k) {
       const double rho = sampler.rho();
@@ -169,7 +170,7 @@ TEST_CASE("prim2con: cancellation-free tau matches E-D (naive) at moderate w, "
   }
 
   SUBCASE("tiny w (1e-8), cold s: tau positive, finite, matches independent term-sum") {
-    const int npts = 200;
+    const int npts = static_cast<int>(eeos_n(200, 40));
     for (int k = 0; k < npts; ++k) {
       const double rho = sampler.rho();
       const double ye = sampler.ye();
@@ -201,7 +202,7 @@ TEST_CASE("prim2con: cancellation-free tau matches E-D (naive) at moderate w, "
 // ==========================================================================
 
 TEST_CASE("con2prim residuals: analytic Jacobian matches Richardson-extrapolated FD "
-          "(fine grid, 200 random interior states)") {
+          "(fine grid, 200 (40 under sanitizers) random interior states)") {
   SyntheticOptions opts;
   opts.nrho = 120;
   opts.ntemp = 120;
@@ -216,7 +217,7 @@ TEST_CASE("con2prim residuals: analytic Jacobian matches Richardson-extrapolated
 
   auto richardson = [](double d_h, double d_2h) { return (4.0 * d_h - d_2h) / 3.0; };
 
-  const int npts = 200;
+  const int npts = static_cast<int>(eeos_n(200, 40));
   std::vector<double> ana_f1s(npts), ana_f1w(npts), ana_f2s(npts), ana_f2w(npts);
   std::vector<double> fd_f1s(npts), fd_f1w(npts), fd_f2s(npts), fd_f2w(npts);
 
@@ -445,7 +446,8 @@ void report_and_check_roundtrip(const std::string &label, const RoundTripStats &
 // 3. Round trips: the core acceptance test (design doc deliverable 2).
 // ==========================================================================
 
-TEST_CASE("con2prim: round trips over 2000 random states (warm start) plus a 300-state cold subset") {
+TEST_CASE("con2prim: round trips over 2000 (300 under sanitizers) random states (warm start) plus a "
+          "300 (60 under sanitizers)-state cold subset") {
   SyntheticOptions opts; // default grid
   EntropyEOS adapter = build_synthetic(opts);
   const EntropyEOSView view = adapter.view();
@@ -460,8 +462,8 @@ TEST_CASE("con2prim: round trips over 2000 random states (warm start) plus a 300
   std::uniform_real_distribution<double> frac(0.0, 1.0);
   std::uniform_real_distribution<double> log_sigma_m(std::log(1e-6), std::log(1e4));
 
-  const int npts = 2000;
-  const int ncold = 300;
+  const int npts = static_cast<int>(eeos_n(2000, 300));
+  const int ncold = static_cast<int>(eeos_n(300, 60));
 
   RoundTripStats warm, cold;
 
@@ -493,10 +495,10 @@ TEST_CASE("con2prim: round trips over 2000 random states (warm start) plus a 300
   std::cout << "test_con2prim 3: " << (npts + ncold) << " solves in " << seconds << "s ("
             << states_per_sec << " states/sec)\n";
 
-  report_and_check_roundtrip("test_con2prim 3 (warm, n=2000)", warm, /*check_newton_rate=*/true,
-                              /*check_prim_space=*/true);
-  report_and_check_roundtrip("test_con2prim 3 (cold subset, n=300)", cold, /*check_newton_rate=*/false,
-                              /*check_prim_space=*/true);
+  report_and_check_roundtrip("test_con2prim 3 (warm, n=" + std::to_string(npts) + ")", warm,
+                              /*check_newton_rate=*/true, /*check_prim_space=*/true);
+  report_and_check_roundtrip("test_con2prim 3 (cold subset, n=" + std::to_string(ncold) + ")", cold,
+                              /*check_newton_rate=*/false, /*check_prim_space=*/true);
 }
 
 // ==========================================================================
@@ -579,7 +581,7 @@ TEST_CASE("con2prim: limiting cases (S=0, B=0 hydro at w=6, sigma_m=1e4 at w=3)"
 //    the fallback, with the same conservative-space accuracy.
 // ==========================================================================
 
-TEST_CASE("con2prim: forced fallback (max_iter_newton=0) on 100 random states") {
+TEST_CASE("con2prim: forced fallback (max_iter_newton=0) on 100 (20 under sanitizers) random states") {
   SyntheticOptions opts;
   EntropyEOS adapter = build_synthetic(opts);
   const EntropyEOSView view = adapter.view();
@@ -593,7 +595,7 @@ TEST_CASE("con2prim: forced fallback (max_iter_newton=0) on 100 random states") 
   std::uniform_real_distribution<double> log_sigma_m(std::log(1e-6), std::log(1e4));
 
   RoundTripStats st;
-  const int npts = 100;
+  const int npts = static_cast<int>(eeos_n(100, 20));
   for (int k = 0; k < npts; ++k) {
     const double rho = sampler.rho();
     const double ye = sampler.ye();
@@ -636,15 +638,15 @@ TEST_CASE("con2prim: forced fallback (max_iter_newton=0) on 100 random states") 
 //     to fix a REAL-TABLE failure mode clustered at high w (>5); this pins
 //     down that the scan does not regress the synthetic table's guaranteed-
 //     fallback path -- where the design doc's monotone-g proof holds
-//     globally, so every one of these 300 states (a third of them forced
-//     into the extreme w in [5.5,6] band, the rest uniform over the full
-//     [0,6] domain) must still land on converged_fallback, not just "some
-//     bracket, any bracket": the same conservative-space round-trip
-//     tolerances as test 5 apply unchanged.
+//     globally, so every one of these 300 (100 under sanitizers) states (a
+//     third of them forced into the extreme w in [5.5,6] band, the rest
+//     uniform over the full [0,6] domain) must still land on
+//     converged_fallback, not just "some bracket, any bracket": the same
+//     conservative-space round-trip tolerances as test 5 apply unchanged.
 // ==========================================================================
 
-TEST_CASE("con2prim: forced fallback (max_iter_newton=0) at extreme rapidity, 300 random states "
-          "incl. w in [5.5,6]") {
+TEST_CASE("con2prim: forced fallback (max_iter_newton=0) at extreme rapidity, 300 (100 under "
+          "sanitizers) random states incl. w in [5.5,6]") {
   SyntheticOptions opts;
   EntropyEOS adapter = build_synthetic(opts);
   const EntropyEOSView view = adapter.view();
@@ -659,7 +661,7 @@ TEST_CASE("con2prim: forced fallback (max_iter_newton=0) at extreme rapidity, 30
   std::uniform_real_distribution<double> log_sigma_m(std::log(1e-6), std::log(1e4));
 
   RoundTripStats st;
-  const int npts = 300;
+  const int npts = static_cast<int>(eeos_n(300, 100));
   for (int k = 0; k < npts; ++k) {
     const double rho = sampler.rho();
     const double ye = sampler.ye();
@@ -707,7 +709,7 @@ TEST_CASE("con2prim: cold slow precision (w=1e-10, coldest s row)") {
   std::uniform_real_distribution<double> cq(-1.0, 1.0);
 
   RoundTripStats st;
-  const int npts = 100;
+  const int npts = static_cast<int>(eeos_n(100, 20));
   std::vector<double> tau_over_D;
   for (int k = 0; k < npts; ++k) {
     const double rho = sampler.rho();
@@ -755,12 +757,14 @@ TEST_CASE("con2prim: cold slow precision (w=1e-10, coldest s row)") {
 //    regime where the pre-M3d seed's B^2-blindness made w0 and hence rho0
 //    wrong by orders of magnitude, and where the S9 bracket scan's local
 //    window was therefore anchored in the wrong basin (~1/3 of cold calls
-//    failed on the real tables). 300 states, every one cold, over the full
-//    w in [0,6] and arbitrary angle(S,B): zero failed_*, and the same
-//    conservative-space round-trip tolerances as tests 3-6.
+//    failed on the real tables). 300 (100 under sanitizers) states, every
+//    one cold, over the full w in [0,6] and arbitrary angle(S,B): zero
+//    failed_*, and the same conservative-space round-trip tolerances as
+//    tests 3-6.
 // ==========================================================================
 
-TEST_CASE("con2prim: cold-start magnetized stress, 300 states, sigma_m in [1,1e4], all guesses NaN") {
+TEST_CASE("con2prim: cold-start magnetized stress, 300 (100 under sanitizers) states, sigma_m in "
+          "[1,1e4], all guesses NaN") {
   SyntheticOptions opts;
   EntropyEOS adapter = build_synthetic(opts);
   const EntropyEOSView view = adapter.view();
@@ -772,7 +776,7 @@ TEST_CASE("con2prim: cold-start magnetized stress, 300 states, sigma_m in [1,1e4
   std::uniform_real_distribution<double> log_sigma_m(std::log(1.0), std::log(1e4));
 
   RoundTripStats st;
-  const int npts = 300;
+  const int npts = static_cast<int>(eeos_n(300, 100));
   for (int k = 0; k < npts; ++k) {
     const double rho = sampler.rho();
     const double ye = sampler.ye();
@@ -797,9 +801,9 @@ TEST_CASE("con2prim: cold-start magnetized stress, 300 states, sigma_m in [1,1e4
 
 // ==========================================================================
 // 8. M3d seed quality, measured directly rather than only through its
-//    effect on the solver. detail::c2p_cold_seed() is called on 100 random
-//    magnetized states and its (s, w) compared against the truth the
-//    conservative state was built from.
+//    effect on the solver. detail::c2p_cold_seed() is called on 100 (50
+//    under sanitizers) random magnetized states and its (s, w) compared
+//    against the truth the conservative state was built from.
 //
 //    The bar (20% relative on both) is deliberately loose: the BINDING
 //    requirement on the seed is zero failures (tests 3-7), and the seed's
@@ -827,7 +831,7 @@ TEST_CASE("con2prim: M3d cold seed lands within 20% of the true (s, w) on magnet
   std::uniform_real_distribution<double> cq(-1.0, 1.0);
   std::uniform_real_distribution<double> log_sigma_m(std::log(1e-3), std::log(1e4));
 
-  const int npts = 100;
+  const int npts = static_cast<int>(eeos_n(100, 50));
   std::vector<double> ds, dw;
   int n_within = 0;
 

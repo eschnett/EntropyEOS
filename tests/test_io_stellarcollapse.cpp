@@ -29,6 +29,7 @@
 #include "entropy_eos/host/repair.hpp"
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
+#include "test_scale.hpp"
 
 using eeos::RawTable;
 using eeos::RepairEntry;
@@ -623,6 +624,7 @@ TEST_CASE("write_stellarcollapse (with source): LS220 write-back round trip") {
 }
 
 TEST_CASE("read_stellarcollapse: SRO real table") {
+  if (eeos_skip_big_table("test_io_stellarcollapse: SRO real table")) return;
   if (!table_exists(kSROPath)) {
     WARN_MESSAGE(false, "SRO table not found at '" << kSROPath << "' -- skipped ('skipped')");
     return;
@@ -637,6 +639,7 @@ TEST_CASE("read_stellarcollapse: SRO real table") {
 }
 
 TEST_CASE("write_stellarcollapse (with source): SRO opaque blob survives byte-identical") {
+  if (eeos_skip_big_table("test_io_stellarcollapse: SRO opaque blob passthrough")) return;
   if (!table_exists(kSROPath)) {
     WARN_MESSAGE(false, "SRO table not found at '" << kSROPath << "' -- skipped ('skipped')");
     return;

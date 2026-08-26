@@ -21,6 +21,7 @@
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
 #include "entropy_eos/host/units.hpp"
+#include "test_scale.hpp"
 
 using eeos::AdapterCheckOptions;
 using eeos::AdapterReport;
@@ -59,7 +60,11 @@ TEST_CASE("check_adapter: clean synthetic (default grid) reports zero violations
   CHECK(adapter.kappa() > 1.0 - 1e-2);
   CHECK(adapter.kappa() <= 1.0);
 
-  const AdapterReport report = eeos::check_adapter(adapter, table);
+  // Physicality soak (class C): 200000 states (10000 under sanitizers) --
+  // see test_scale.hpp.
+  AdapterCheckOptions aopts;
+  aopts.soak_n = eeos_n(200000, 10000);
+  const AdapterReport report = eeos::check_adapter(adapter, table, aopts);
 
   CHECK(report.status == eeos::Status::ok);
   CHECK(report.fatal_messages.empty());
@@ -116,14 +121,32 @@ TEST_CASE("check_adapter: clean synthetic (default grid) reports zero violations
 
 TEST_CASE("check_adapter: fine synthetic grid (120x120x12, node_stride=2) fidelity convergence") {
   SyntheticOptions opts_default; // 40x30x10
+
+  RawTable table_default = eeos::make_synthetic_table(opts_default);
+  EntropyEOS adapter_default = eeos::build_entropy_eos(table_default);
+  AdapterCheckOptions aopts_default;
+  aopts_default.soak_n = eeos_n(200000, 10000); // class C soak; see test_scale.hpp
+  const AdapterReport report_default = eeos::check_adapter(adapter_default, table_default, aopts_default);
+
+  const double dT_default = find_class(report_default, "delta_T").max;
+  const double dp_default = find_class(report_default, "delta_p").max;
+  MESSAGE("test_adapter_audit 2: default-grid delta_T=" << dT_default << " delta_p=" << dp_default);
+
+  // The fine-grid (120x120x12) build/audit and the fine-vs-default
+  // convergence-ratio checks below are skipped under sanitizers (printed
+  // note): they are the same class-A/B fidelity code path at a second,
+  // much more expensive resolution, not additional coverage -- see
+  // test_scale.hpp. The default-grid fidelity checks above always run.
+  if (eeos_sanitized) {
+    MESSAGE("test_adapter_audit 2: fine-grid (120x120x12) build/audit and convergence-ratio "
+            "checks skipped under sanitizers");
+    return;
+  }
+
   SyntheticOptions opts_fine = opts_default;
   opts_fine.nrho = 120;
   opts_fine.ntemp = 120;
   opts_fine.nye = 12;
-
-  RawTable table_default = eeos::make_synthetic_table(opts_default);
-  EntropyEOS adapter_default = eeos::build_entropy_eos(table_default);
-  const AdapterReport report_default = eeos::check_adapter(adapter_default, table_default);
 
   RawTable table_fine = eeos::make_synthetic_table(opts_fine);
   EntropyEOS adapter_fine = eeos::build_entropy_eos(table_fine);
@@ -131,12 +154,9 @@ TEST_CASE("check_adapter: fine synthetic grid (120x120x12, node_stride=2) fideli
   aopts_fine.node_stride = 2;
   const AdapterReport report_fine = eeos::check_adapter(adapter_fine, table_fine, aopts_fine);
 
-  const double dT_default = find_class(report_default, "delta_T").max;
-  const double dp_default = find_class(report_default, "delta_p").max;
   const double dT_fine = find_class(report_fine, "delta_T").max;
   const double dp_fine = find_class(report_fine, "delta_p").max;
 
-  MESSAGE("test_adapter_audit 2: default-grid delta_T=" << dT_default << " delta_p=" << dp_default);
   MESSAGE("test_adapter_audit 2: fine-grid    delta_T=" << dT_fine << " delta_p=" << dp_fine);
 
   CHECK(dT_fine <= 1e-4);
@@ -166,7 +186,11 @@ TEST_CASE("check_adapter: dirty synthetic, repaired in memory, builds and audits
   CHECK(std::isfinite(adapter.kappa()));
   CHECK(std::isfinite(adapter.m_B_star_g()));
 
-  const AdapterReport report = eeos::check_adapter(adapter, table);
+  // Physicality soak (class C): 200000 states (10000 under sanitizers) --
+  // see test_scale.hpp.
+  AdapterCheckOptions aopts;
+  aopts.soak_n = eeos_n(200000, 10000);
+  const AdapterReport report = eeos::check_adapter(adapter, table, aopts);
 
   CHECK(std::isfinite(report.kappa));
   CHECK(std::isfinite(report.m_B_star_g));
@@ -335,7 +359,7 @@ TEST_CASE("check_adapter: extension_seam_jump small and soak_extended clean on s
   EntropyEOS adapter = eeos::build_entropy_eos(table);
 
   AdapterCheckOptions aopts;
-  aopts.soak_n = 20000;
+  aopts.soak_n = eeos_n(20000, 1000); // soak_extended; see test_scale.hpp
   aopts.soak_extended = true;
   const AdapterReport report = eeos::check_adapter(adapter, table, aopts);
 
@@ -409,7 +433,7 @@ void run_real_table_soak_extended(const std::string &path, const char *label) {
   // tests/integration.sh).
   AdapterCheckOptions aopts;
   aopts.node_stride = 25;
-  aopts.soak_n = 20000;
+  aopts.soak_n = eeos_n(20000, 1000); // soak_extended; see test_scale.hpp
   aopts.soak_extended = true;
   const AdapterReport report = eeos::check_adapter(adapter, table, aopts);
 
@@ -428,5 +452,6 @@ TEST_CASE("check_adapter: LS220 real table, soak_extended + extension_seam_jump 
 }
 
 TEST_CASE("check_adapter: SRO real table, soak_extended + extension_seam_jump (guarded)") {
+  if (eeos_skip_big_table("test_adapter_audit 7 (SRO): real table")) return;
   run_real_table_soak_extended(kSROPath, "SRO");
 }

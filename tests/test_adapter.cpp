@@ -27,6 +27,7 @@
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
 #include "entropy_eos/host/units.hpp"
+#include "test_scale.hpp"
 
 using eeos::AdapterAudit;
 using eeos::BuildOptions;
@@ -215,8 +216,11 @@ TEST_CASE("EntropyEOSView::evaluate: node round trip at every 5th table node") {
 }
 
 // ==========================================================================
-// 3. Closed-form comparison at 500 random interior points, default vs. fine
-//    grid, with grid convergence
+// 3. Closed-form comparison at 500 (100 under sanitizers) random interior
+//    points, default vs. fine grid, with grid convergence. Under sanitizers
+//    the fine-grid build/samples and the fine-grid/convergence-ratio
+//    assertions are skipped entirely (printed note) -- the default-grid
+//    comparison, at its full tolerances, always runs.
 // ==========================================================================
 
 namespace {
@@ -290,24 +294,14 @@ void print_sample_stats(const std::string &label, const SampleStats &st) {
 TEST_CASE("EntropyEOSView::evaluate: closed-form comparison and grid convergence "
           "(default 40x30x10 vs. fine 120x120x12)") {
   SyntheticOptions opts_default; // 40x30x10
-  SyntheticOptions opts_fine = opts_default;
-  opts_fine.nrho = 120;
-  opts_fine.ntemp = 120;
-  opts_fine.nye = 12;
-
   EntropyEOS adapter_default = build_synthetic(opts_default);
-  EntropyEOS adapter_fine = build_synthetic(opts_fine);
   const EntropyEOSView view_default = adapter_default.view();
-  const EntropyEOSView view_fine = adapter_fine.view();
 
-  const int npts = 500;
+  const int npts = static_cast<int>(eeos_n(500, 100));
   const SampleStats st_default = run_closed_form_samples(
       view_default, opts_default, adapter_default.conv_t(), adapter_default.kappa(), npts, 20260825u);
-  const SampleStats st_fine = run_closed_form_samples(view_fine, opts_fine, adapter_fine.conv_t(),
-                                                        adapter_fine.kappa(), npts, 20260826u);
 
   print_sample_stats("test_adapter 3: default-grid (40x30x10) max relative errors", st_default);
-  print_sample_stats("test_adapter 3: fine-grid (120x120x12) max relative errors", st_fine);
   print_iters_histogram("test_adapter 3: cold iteration histogram (default grid)", st_default.iters_cold);
 
   // Default-grid tolerances.
@@ -319,6 +313,36 @@ TEST_CASE("EntropyEOSView::evaluate: closed-form comparison and grid convergence
   CHECK(st_default.max_rel_U_rhos <= 3e-2);
   CHECK(st_default.max_rel_mu <= 3e-2);
   CHECK(st_default.max_rel_cs2 <= 3e-2);
+  CHECK(st_default.max_rel_TF <= 1e-9); // see the T_F note below
+
+  // No sample anywhere hit the iteration cap.
+  CHECK_FALSE(st_default.any_maxiter);
+  for (int it : st_default.iters_cold) CHECK(it <= adapter_default.max_iter());
+
+  // Fine-grid build/samples and the fine-vs-default convergence-ratio
+  // assertions below: full code-path coverage of this sanitizer-value-vs-
+  // iteration-count tradeoff is already established by the default-grid
+  // checks above, so under sanitizers this expensive second adapter build
+  // (120x120x12) is skipped rather than merely shrunk (see test_scale.hpp's
+  // doc comment) -- never weakening the default-grid tolerances above, which
+  // always run at full strength.
+  if (eeos_sanitized) {
+    MESSAGE("test_adapter 3: fine-grid (120x120x12) build and convergence-ratio checks "
+            "skipped under sanitizers");
+    return;
+  }
+
+  SyntheticOptions opts_fine = opts_default;
+  opts_fine.nrho = 120;
+  opts_fine.ntemp = 120;
+  opts_fine.nye = 12;
+  EntropyEOS adapter_fine = build_synthetic(opts_fine);
+  const EntropyEOSView view_fine = adapter_fine.view();
+
+  const SampleStats st_fine = run_closed_form_samples(view_fine, opts_fine, adapter_fine.conv_t(),
+                                                        adapter_fine.kappa(), npts, 20260826u);
+
+  print_sample_stats("test_adapter 3: fine-grid (120x120x12) max relative errors", st_fine);
 
   // Fine-grid tolerances.
   CHECK(st_fine.max_rel_U <= 1e-5);
@@ -357,13 +381,10 @@ TEST_CASE("EntropyEOSView::evaluate: closed-form comparison and grid convergence
   // does shrink with resolution, as checked above. What's asserted here
   // instead is the stronger fact that both grids already clear the *fine*-
   // grid ceiling by several orders of magnitude.
-  CHECK(st_default.max_rel_TF <= 1e-9);
   CHECK(st_fine.max_rel_TF <= 1e-9);
 
   // No sample anywhere hit the iteration cap.
-  CHECK_FALSE(st_default.any_maxiter);
   CHECK_FALSE(st_fine.any_maxiter);
-  for (int it : st_default.iters_cold) CHECK(it <= adapter_default.max_iter());
 }
 
 // ==========================================================================
@@ -372,7 +393,7 @@ TEST_CASE("EntropyEOSView::evaluate: closed-form comparison and grid convergence
 // ==========================================================================
 
 TEST_CASE("EntropyEOSView::evaluate: derivatives match Richardson-extrapolated FD of U "
-          "(fine grid, 100 points)") {
+          "(fine grid, 100 (20 under sanitizers) points)") {
   SyntheticOptions opts;
   opts.nrho = 120;
   opts.ntemp = 120;
@@ -395,7 +416,7 @@ TEST_CASE("EntropyEOSView::evaluate: derivatives match Richardson-extrapolated F
 
   InteriorSampler sampler(opts, 70070707u);
 
-  const int npts = 100;
+  const int npts = static_cast<int>(eeos_n(100, 20));
   std::vector<double> ana_Urho(npts), ana_Us(npts), ana_Urhorho(npts), ana_Urhos(npts);
   std::vector<double> fd_Urho(npts), fd_Us(npts), fd_Urhorho(npts);
   std::vector<double> fd_Urhos_a(npts), fd_Urhos_b(npts); // U_rho along s, U_s along rho
@@ -683,7 +704,7 @@ void run_real_table_adapter_test(const std::string &path, const char *label, uns
   std::uniform_real_distribution<double> yq(view.y_lo, view.y_hi);
   std::uniform_real_distribution<double> frac(0.0, 1.0);
 
-  const int npts = 20000;
+  const int npts = static_cast<int>(eeos_n(20000, 1000));
   std::vector<int> iters_cold;
   iters_cold.reserve(static_cast<size_t>(npts));
   int maxiter_count = 0;
@@ -731,6 +752,7 @@ TEST_CASE("build_entropy_eos + evaluate: LS220 real table (guarded)") {
 }
 
 TEST_CASE("build_entropy_eos + evaluate: SRO real table (guarded)") {
+  if (eeos_skip_big_table("test_adapter 8 (SRO): real table")) return;
   run_real_table_adapter_test(kSROPath, "SRO", 0x5502001u);
 }
 
@@ -829,15 +851,22 @@ void check_seam_continuity(const EntropyEOSView &view, const char *label) {
 
 TEST_CASE("EntropyEOSView::evaluate: seam continuity across u_lo/u_hi/x_lo (M2d-2 C2 tails)") {
   SyntheticOptions opts_default; // 40x30x10
+  EntropyEOS adapter_default = build_synthetic(opts_default);
+  check_seam_continuity(adapter_default.view(), "default");
+
+  // The fine-grid (120x120x12) repeat of the same checks is skipped under
+  // sanitizers (printed note): it is the same code path at a second
+  // resolution, not additional coverage -- see test_scale.hpp.
+  if (eeos_sanitized) {
+    MESSAGE("test_adapter 9: fine-grid (120x120x12) seam continuity checks skipped under sanitizers");
+    return;
+  }
+
   SyntheticOptions opts_fine = opts_default;
   opts_fine.nrho = 120;
   opts_fine.ntemp = 120;
   opts_fine.nye = 12;
-
-  EntropyEOS adapter_default = build_synthetic(opts_default);
   EntropyEOS adapter_fine = build_synthetic(opts_fine);
-
-  check_seam_continuity(adapter_default.view(), "default");
   check_seam_continuity(adapter_fine.view(), "fine");
 }
 
@@ -917,7 +946,7 @@ TEST_CASE("EntropyEOSView::evaluate: U >= 0 over the extended box (synthetic tab
   std::uniform_real_distribution<double> uq(view.u_ext_lo, view.u_ext_hi);
   std::uniform_real_distribution<double> yq(view.y_lo, view.y_hi);
 
-  const int npts = 20000;
+  const int npts = static_cast<int>(eeos_n(20000, 1000));
   int n_checked = 0;
   for (int k = 0; k < npts; ++k) {
     const double x = xq(rng);
@@ -949,7 +978,7 @@ TEST_CASE("EntropyEOSView::sigma_extended: strictly monotone increasing in u acr
   std::uniform_real_distribution<double> yq(view.y_lo, view.y_hi);
 
   const int nlines = 20;
-  const int nsteps = 400;
+  const int nsteps = static_cast<int>(eeos_n(400, 80));
   for (int line = 0; line < nlines; ++line) {
     const double x = xq(rng);
     const double ye = yq(rng);

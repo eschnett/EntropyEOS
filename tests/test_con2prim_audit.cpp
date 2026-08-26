@@ -21,6 +21,7 @@
 #include "entropy_eos/host/repair.hpp"
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
+#include "test_scale.hpp"
 
 using eeos::CheckClassResult;
 using eeos::Con2PrimCheckOptions;
@@ -61,8 +62,8 @@ void check_quantiles_ordered(const QuantileStats &q) {
 } // namespace
 
 // ==========================================================================
-// 1. Clean synthetic (default grid, n_states=4000): the core acceptance
-//    test (design doc deliverable 2).
+// 1. Clean synthetic (default grid, n_states=4000, 500 under sanitizers):
+//    the core acceptance test (design doc deliverable 2).
 // ==========================================================================
 
 TEST_CASE("check_con2prim: clean synthetic (default grid, n=4000) round trips cleanly") {
@@ -70,11 +71,11 @@ TEST_CASE("check_con2prim: clean synthetic (default grid, n=4000) round trips cl
   EntropyEOS adapter = build_synthetic(opts);
 
   Con2PrimCheckOptions copts;
-  copts.n_states = 4000;
+  copts.n_states = eeos_n(4000, 500);
   const Con2PrimReport report = eeos::check_con2prim(adapter, copts);
 
   CHECK(report.status == eeos::Status::ok);
-  CHECK(report.n_states == 4000);
+  CHECK(report.n_states == copts.n_states);
 
   // Zero failed_* across both passes: the synthetic gas is smooth
   // everywhere in the sampled interior (5% margin), so both the coupled
@@ -152,7 +153,7 @@ TEST_CASE("check_con2prim: two runs with identical options are bitwise identical
   EntropyEOS adapter = build_synthetic(opts);
 
   Con2PrimCheckOptions copts;
-  copts.n_states = 1500;
+  copts.n_states = eeos_n(1500, 300); // determinism check: scale size, not logic
 
   const Con2PrimReport r1 = eeos::check_con2prim(adapter, copts);
   const Con2PrimReport r2 = eeos::check_con2prim(adapter, copts);
@@ -302,7 +303,7 @@ TEST_CASE("check_con2prim: LS220 real table (guarded), default m_B, n=2000 -- ru
   EntropyEOS adapter = eeos::build_entropy_eos(table); // default m_B (amu)
 
   Con2PrimCheckOptions copts;
-  copts.n_states = 2000;
+  copts.n_states = eeos_n(2000, 300);
   const Con2PrimReport report = eeos::check_con2prim(adapter, copts);
 
   CHECK(report.status != eeos::Status::fatal);

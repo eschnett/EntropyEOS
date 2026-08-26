@@ -14,6 +14,7 @@
 
 #include "entropy_eos/core/bspline_eval.hpp"
 #include "entropy_eos/host/bspline_fit.hpp"
+#include "test_scale.hpp"
 
 using eeos::BandedLU;
 using eeos::Bspline3;
@@ -134,12 +135,14 @@ std::vector<double> fit_along_axis(const std::vector<double> &data, int d0, int 
 // 1. BandedLU vs. dense Gaussian elimination
 // ==========================================================================
 
-TEST_CASE("BandedLU: matches dense Gaussian elimination on random banded systems") {
+TEST_CASE("BandedLU: matches dense Gaussian elimination on random banded systems "
+          "(50 trials, 10 under sanitizers)") {
   std::mt19937 rng(20260825u);
   std::uniform_int_distribution<int> n_dist(6, 40);
   std::uniform_real_distribution<double> val_dist(-1.0, 1.0);
 
-  for (int trial = 0; trial < 50; ++trial) {
+  const int n_trials = static_cast<int>(eeos_n(50, 10));
+  for (int trial = 0; trial < n_trials; ++trial) {
     const int n = n_dist(rng);
     const int kl = BandedLU::kl;
 
@@ -197,7 +200,8 @@ TEST_CASE("fit_bspline_1d: not-a-knot reproduces a global cubic exactly") {
 
     const double xend = x0 + (n - 1) * h;
     std::uniform_real_distribution<double> xq(x0, xend);
-    for (int k = 0; k < 100; ++k) {
+    const int n_samp = static_cast<int>(eeos_n(100, 20));
+    for (int k = 0; k < n_samp; ++k) {
       const double x = xq(rng);
       const BsplineEval1 e = eeos::bspline_eval1(view, x);
       CHECK(rel_err(e.f, f(x)) <= 1e-10);
@@ -234,9 +238,15 @@ TEST_CASE("fit_bspline_1d: S(x_i) == f_i at every node") {
 // 4. 1D convergence on sin(x)
 // ==========================================================================
 
-TEST_CASE("fit_bspline_1d: grid convergence on sin(x) over [0,3]") {
+TEST_CASE("fit_bspline_1d: grid convergence on sin(x) over [0,3] "
+          "(n = 20,40,80,160; only 20,40 -- first order pair -- under sanitizers)") {
   const double x0 = 0.0, xend = 3.0;
-  const std::vector<int> ns = {20, 40, 80, 160};
+  // Under sanitizers only the first (cheapest) resolution pair runs, so only
+  // the first observed convergence order gets asserted below -- at the same
+  // thresholds as a full run, since the order between any adjacent pair is
+  // independently meaningful (see test_scale.hpp: shrink the grid, not the
+  // tolerance).
+  const std::vector<int> ns = eeos_sanitized ? std::vector<int>{20, 40} : std::vector<int>{20, 40, 80, 160};
   std::vector<double> err_f, err_fp, err_fpp;
 
   for (const int n : ns) {
@@ -347,7 +357,8 @@ TEST_CASE("fit_bspline_3d/bspline_eval3: separable product of low-degree factors
 
   std::mt19937 rng(4004u);
   std::uniform_real_distribution<double> xq(x0, xend), uq(u0, uend), yq(y0, yend);
-  for (int k = 0; k < 200; ++k) {
+  const int n_samp = static_cast<int>(eeos_n(200, 40));
+  for (int k = 0; k < n_samp; ++k) {
     const double x = xq(rng), u = uq(rng), y = yq(rng);
     const BsplineEval3 e = eeos::bspline_eval3(view, x, u, y);
 

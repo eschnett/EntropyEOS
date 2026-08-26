@@ -9,6 +9,7 @@
 
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/units.hpp"
+#include "test_scale.hpp"
 
 using eeos::dirty_synthetic_options;
 using eeos::RawTable;
@@ -37,7 +38,8 @@ TEST_CASE("synthetic table: stored fields equal the analytic functions exactly")
   const std::vector<double> &entropy = table.field("entropy");
   const std::vector<double> &logpress = table.field("logpress");
 
-  for (int sample = 0; sample < 200; ++sample) {
+  const int n_samples = static_cast<int>(eeos_n(200, 40));
+  for (int sample = 0; sample < n_samples; ++sample) {
     const size_t irho = pick_rho(rng);
     const size_t jT = pick_temp(rng);
     const size_t kYe = pick_ye(rng);
