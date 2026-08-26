@@ -277,12 +277,18 @@ and OpenMP builds).
   with conservative-space round trips at p99 ≈ 1e-12 and ~2×10⁵ solves/s; the
   guaranteed-fallback bracket uses a global+local multi-point scan at full precision
   (endpoints-only sign checks provably miss roots — g(s) is non-monotone near extension
-  seams and the extended s-bracket can span 10+ decades). Known open items:
-  (i) cold-start seeds for strongly magnetized states are B²-blind
-  (S_⊥ = (z+B²)v_⊥ inflates |S| independently of v), leaving ~1/3 cold-start
-  failures on real tables — warm production paths unaffected; (ii) a ~0.1% failure
+  seams and the extended s-bracket can span 10+ decades). Cold starts (M3d): a
+  pressure-lagged exact seed — the energy relation solved exactly for z (bracketed
+  cubic in q = z+B², exact physical bounds, hydro limit recovered rather than
+  special-cased), rapidity exact from the momentum projections, ε from the
+  τ-identity, s from the guaranteed-monotone U-bisection; only p is lagged
+  (sensitivity dw = tanh w·dp/(ρh) < 1/4·dp/p-ish, bounded). Measured: cold failures
+  143→0 (LS220) / 131→4 (SRO) per 4000 states; at 40k statistics cold is within 2×
+  of warm, sharing only the acausal-corner tail; warm path bit-identical; cold
+  throughput ×9; no tuned constants (seed_passes = 3; s-bisection cap 16, 8 suffices
+  for a GPU fixed-trip count). Known open items: (i) the shared ~0.2–0.8% failure
   tail confined to the hot-edge/high-w acausal-cs² corner (beyond table validity —
-  §11 invalid-state policy territory); (iii) the RePrimAnd benchmark (external
+  §11 invalid-state policy territory); (ii) the RePrimAnd benchmark (external
   library build — decide separately).
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
   fixed-iteration evaluate/con2prim variants.
