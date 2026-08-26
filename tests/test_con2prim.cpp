@@ -609,7 +609,22 @@ TEST_CASE("con2prim: forced fallback (max_iter_newton=0) on 100 random states") 
   }
 
   print_result_counts("test_con2prim 5 (forced fallback)", st.results);
-  for (C2PResult r : st.results) CHECK(r == C2PResult::converged_fallback);
+  // M3d: with max_iter_newton == 0 the solver takes NO Newton step, so every
+  // state must be resolved by the SS9 fallback -- except that the M3d cold
+  // seed (con2prim.hpp's c2p_cold_seed()) is now accurate enough that on
+  // some states its very first residual evaluation already satisfies both
+  // tolerances, which con2prim() reports as converged_newton with
+  // iters_newton == 0 (no iteration was needed, so there was nothing for the
+  // fallback to do). Measured here: 7 of 100. That is the seed working, not
+  // the fallback being skipped, so the assertion is "resolved without ever
+  // iterating Newton" rather than the literal enum: iters_newton == 0 is
+  // checked for every state below, and the conservative-space round trips
+  // are held to the same tolerances either way.
+  for (size_t i = 0; i < st.results.size(); ++i) {
+    CHECK(st.iters_newton[i] == 0);
+    CHECK((st.results[i] == C2PResult::converged_fallback ||
+           st.results[i] == C2PResult::converged_newton));
+  }
 
   report_and_check_roundtrip("test_con2prim 5 (forced fallback)", st, /*check_newton_rate=*/false,
                               /*check_prim_space=*/true);
@@ -664,7 +679,14 @@ TEST_CASE("con2prim: forced fallback (max_iter_newton=0) at extreme rapidity, 30
   }
 
   print_result_counts("test_con2prim 5b (forced fallback, extreme w)", st.results);
-  for (C2PResult r : st.results) CHECK(r == C2PResult::converged_fallback);
+  // Same M3d caveat as test 5 (see its comment): the cold seed can land
+  // inside opts.tol on its own, reported as converged_newton with
+  // iters_newton == 0. Measured here: 6 of 300.
+  for (size_t i = 0; i < st.results.size(); ++i) {
+    CHECK(st.iters_newton[i] == 0);
+    CHECK((st.results[i] == C2PResult::converged_fallback ||
+           st.results[i] == C2PResult::converged_newton));
+  }
 
   report_and_check_roundtrip("test_con2prim 5b (forced fallback, extreme w)", st,
                               /*check_newton_rate=*/false, /*check_prim_space=*/true);
@@ -724,4 +746,136 @@ TEST_CASE("con2prim: cold slow precision (w=1e-10, coldest s row)") {
 
   report_and_check_roundtrip("test_con2prim 6 (cold slow)", st, /*check_newton_rate=*/false,
                               /*check_prim_space=*/false);
+}
+
+// ==========================================================================
+// 7. M3d cold-start magnetized stress. The failure class M3d exists to fix
+//    (con2prim.hpp module header item 6) lives at high magnetization with
+//    ALL guesses absent: sigma_m = B^2/(rho*h) in [1, 1e4] is exactly the
+//    regime where the pre-M3d seed's B^2-blindness made w0 and hence rho0
+//    wrong by orders of magnitude, and where the S9 bracket scan's local
+//    window was therefore anchored in the wrong basin (~1/3 of cold calls
+//    failed on the real tables). 300 states, every one cold, over the full
+//    w in [0,6] and arbitrary angle(S,B): zero failed_*, and the same
+//    conservative-space round-trip tolerances as tests 3-6.
+// ==========================================================================
+
+TEST_CASE("con2prim: cold-start magnetized stress, 300 states, sigma_m in [1,1e4], all guesses NaN") {
+  SyntheticOptions opts;
+  EntropyEOS adapter = build_synthetic(opts);
+  const EntropyEOSView view = adapter.view();
+  const Con2PrimOptions copts;
+
+  InteriorSampler sampler(view, 0xB2C01D5Eu);
+  std::uniform_real_distribution<double> wq(0.0, 6.0);
+  std::uniform_real_distribution<double> cq(-1.0, 1.0);
+  std::uniform_real_distribution<double> log_sigma_m(std::log(1.0), std::log(1e4));
+
+  RoundTripStats st;
+  const int npts = 300;
+  for (int k = 0; k < npts; ++k) {
+    const double rho = sampler.rho();
+    const double ye = sampler.ye();
+    const SRange sr = view.srange(rho, ye);
+    const double s = sampler.s_in(sr, 0.05);
+    const double w = wq(sampler.rng);
+    const double cos_vB = cq(sampler.rng);
+    const EOSPoint pt0 = view.evaluate(rho, s, ye, nan_guess());
+    const double B2 = std::exp(log_sigma_m(sampler.rng)) * rho * pt0.h;
+
+    run_one(view, copts, rho, s, ye, w, B2, cos_vB, nan_guess(), nan_guess(), nan_guess(), st);
+  }
+
+  print_result_counts("test_con2prim 7 (cold magnetized stress)", st.results);
+  for (C2PResult r : st.results) {
+    CHECK(r != C2PResult::failed_no_bracket);
+    CHECK(r != C2PResult::failed_max_iter);
+  }
+  report_and_check_roundtrip("test_con2prim 7 (cold magnetized stress)", st,
+                              /*check_newton_rate=*/false, /*check_prim_space=*/true);
+}
+
+// ==========================================================================
+// 8. M3d seed quality, measured directly rather than only through its
+//    effect on the solver. detail::c2p_cold_seed() is called on 100 random
+//    magnetized states and its (s, w) compared against the truth the
+//    conservative state was built from.
+//
+//    The bar (20% relative on both) is deliberately loose: the BINDING
+//    requirement on the seed is zero failures (tests 3-7), and the seed's
+//    accuracy is what buys that, not an end in itself. It is set from the
+//    measured real-table distribution -- on the LS220/SRO cold subsets at
+//    the default 3 passes, 399 of 400 seeds land inside 20% in both s and w
+//    (p50 |ds|/|s| = 2.3e-4, p50 |dw|/w = 6.4e-3; see Con2PrimOptions'
+//    seed_passes comment for the full pass sweep) -- so 20% is roughly two
+//    orders of magnitude of headroom above the typical real-table error
+//    while still failing loudly if the seed ever regresses to the
+//    pre-M3d B^2-blind quality, which was wrong by factors of 10-1000 on
+//    exactly these states. On this synthetic gas the seed is far better than
+//    that (the printed distribution below is ~1e-12 in s), so the check has
+//    room to tighten if the synthetic path is ever the only one available.
+// ==========================================================================
+
+TEST_CASE("con2prim: M3d cold seed lands within 20% of the true (s, w) on magnetized states") {
+  SyntheticOptions opts;
+  EntropyEOS adapter = build_synthetic(opts);
+  const EntropyEOSView view = adapter.view();
+  const Con2PrimOptions copts;
+
+  InteriorSampler sampler(view, 0x5EED9001u);
+  std::uniform_real_distribution<double> wq(0.0, 6.0);
+  std::uniform_real_distribution<double> cq(-1.0, 1.0);
+  std::uniform_real_distribution<double> log_sigma_m(std::log(1e-3), std::log(1e4));
+
+  const int npts = 100;
+  std::vector<double> ds, dw;
+  int n_within = 0;
+
+  for (int k = 0; k < npts; ++k) {
+    const double rho = sampler.rho();
+    const double ye = sampler.ye();
+    const SRange sr = view.srange(rho, ye);
+    const double s = sampler.s_in(sr, 0.05);
+    const double w = wq(sampler.rng);
+    const double cos_vB = cq(sampler.rng);
+    const EOSPoint pt0 = view.evaluate(rho, s, ye, nan_guess());
+    // Every fifth state unmagnetized, so the B->0 limit of the seed's
+    // energy solve (where it degenerates to the design doc's exact hydro
+    // z = E + p) is covered alongside the magnetized bulk.
+    const double B2 = (k % 5 == 0) ? 0.0 : std::exp(log_sigma_m(sampler.rng)) * rho * pt0.h;
+
+    const Prim2ConOut truth = eeos::prim2con(view, rho, s, ye, w, B2, cos_vB, pt0.u_solved);
+    const double ye_rec = truth.D_Y / truth.D;
+    const eeos::detail::ColdSeed seed =
+        eeos::detail::c2p_cold_seed(view, truth.D, truth.tau, ye_rec, truth.S_par, truth.S_perp, truth.B2,
+                                     copts.w_max, copts.seed_passes, copts.seed_s_iters);
+
+    CHECK(std::isfinite(seed.s));
+    CHECK(std::isfinite(seed.w));
+    CHECK(seed.w >= 0.0);
+    CHECK(seed.w <= copts.w_max);
+
+    // Same metrics as run_one()'s prim-space deltas, including the 1e-2
+    // floor on w (see run_one()'s comment: the seed pins w to an ABSOLUTE
+    // accuracy, so a raw relative error blows up for a sample with w ~ 0
+    // even when the recovery is excellent).
+    const double e_s = rel_err(seed.s, s, 1e-2);
+    const double e_w = rel_err(seed.w, w, 1e-2);
+    ds.push_back(e_s);
+    dw.push_back(e_w);
+    if (e_s <= 0.20 && e_w <= 0.20) ++n_within;
+  }
+
+  auto report = [](const std::string &name, const std::vector<double> &v) {
+    double mx = 0.0;
+    for (double x : v) mx = std::max(mx, x);
+    std::cout << "    seed " << name << ": median=" << percentile(v, 0.5) << " p90=" << percentile(v, 0.9)
+              << " p99=" << percentile(v, 0.99) << " max=" << mx << "\n";
+  };
+  std::cout << "test_con2prim 8: seed quality over " << npts << " magnetized states (" << n_within
+            << "/" << npts << " within 20% on both):\n";
+  report("|ds|/max(|s|,1e-2)", ds);
+  report("|dw|/max(w,1e-2)", dw);
+
+  CHECK(n_within == npts);
 }

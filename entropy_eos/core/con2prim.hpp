@@ -70,6 +70,43 @@
 //      conservative state). See c2p_bracket_scan()'s own doc comment for
 //      the earlier (reverted) single-percentile-track design and why it
 //      regressed the cold/forced-fallback case.
+//
+//   6. M3d B^2-AWARE COLD SEED (detail::c2p_cold_seed(), used by con2prim()
+//      whenever a guess is absent). The M3c crude seed (tanh w0 =
+//      |S|/(tau+D+p0)) is B^2-BLIND: S_perp = (z+B^2)*v_perp (S5) inflates
+//      |S| independently of the actual velocity, so for a strongly
+//      magnetized state w0 comes out far too large, rho0 = D/cosh(w0) far
+//      too small, and s0 = mid-srange(rho0) lands in the wrong basin --
+//      after which even the M3c scan's LOCAL half is anchored in the wrong
+//      place. Measured cost of that blindness (--level con2prim, --states
+//      4000): ~1/3 of COLD calls failed on both real tables (LS220 143/400,
+//      SRO 131/400), concentrated in the magnetized states, while WARM calls
+//      (98.8% Newton) were unaffected. The M3d seed replaces it with a
+//      fixed-cost block iteration in which every step is an EXACT S4/S5/S7
+//      relation and the only lagged quantity is the pressure -- see
+//      c2p_cold_seed()'s own doc comment for the four ingredients (the
+//      solved magnetic energy relation, the exact momentum projection, the
+//      tau-identity energy estimate, and the provably-cannot-fail monotone
+//      s-recovery), the measurements that set its two tunables, and the two
+//      alternative closures that were implemented and measured worse.
+//      Measured result (--states 4000, i.e. 400 cold states): cold
+//      failed_total 143 -> 0 (LS220) and 131 -> 0 (SRO), against WARM
+//      failed_totals of 7 and 13 that are BIT-IDENTICAL to pre-M3d (same
+//      counts, same round-trip and prim-space quantiles to every digit --
+//      a fully warm call never touches the seed), and cold throughput up
+//      ~9x (8.3e3 -> 8.0e4 solves/s LS220, 7.8e3 -> 6.2e4 SRO): the seed's
+//      ~20 EOS evaluations are far cheaper than the 17-point bracket scan
+//      (17 full inner w-solves) it now usually avoids entirely. The cold
+//      iteration histogram moves with it -- LS220 median total iterations
+//      7 -> 4, and the >30-iteration tail (85 states, 27 of them at the
+//      63-iteration histogram cap) disappears.
+//
+//      At 10x statistics (--states 40000: 40000 warm, 4000 cold) the
+//      residual failure RATES are cold 0.45% vs warm 0.22% (LS220) and
+//      cold 0.80% vs warm 0.41% (SRO) -- within 2x on both tables, and the
+//      remaining states are the hot-edge/acausal-corner tail that BOTH
+//      passes share (open item (ii)), not a seed deficiency. Pre-M3d the
+//      same ratio was ~200x.
 
 #pragma once
 
@@ -99,6 +136,38 @@ struct Con2PrimOptions {
   // provides the two extended + two physical safety-net points the scan's
   // design relies on.
   int bracket_scan = 17;
+
+  // M3d cold-start seed (detail::c2p_cold_seed()): number of outer
+  // (p -> z -> w -> eps -> s -> p) passes, and the iteration cap of the
+  // inner monotone s-recovery solve. Clamped to [1,8] / [2,40] at use, so
+  // any value is safe to pass.
+  //
+  // Both defaults are measured on the LS220/SRO cold subsets of
+  // `eos_test --level con2prim --states 4000` (400 cold states each),
+  // reported as (cold failed_total, seeds within 20% of truth in BOTH s
+  // and w):
+  //   passes:  1 -> (1, 322/400) LS220, (4, 321/400) SRO
+  //            2 -> (3, 398/400),       (6, 398/400)
+  //            3 -> (0, 399/400),       (0, 399/400)   <-- default
+  //            4 -> (1, 400/400),       (1, 400/400)
+  //            6 -> (0, 400/400),       (0, 400/400)
+  // The seed's own error falls ~10x per pass in s and ~3x in w, but
+  // reliability saturates at 3: from there the residual 0-1 failures are
+  // the documented hot-edge/acausal-corner tail that the WARM pass shows
+  // too (7 LS220 / 13 SRO on the same sample), not a seed deficiency, so
+  // passes 4-6 buy prettier seeds and no fewer failures. Pass 1 alone
+  // already removes the whole magnetized failure class (143/131 -> 1/4),
+  // which is the measurement that identifies the B^2-blind z as the root
+  // cause rather than anything downstream of it.
+  //
+  // seed_s_iters is a CAP on a safeguarded Newton that exits early, not a
+  // fixed trip count: 6, 8, 12, 16 and 24 all produce BIT-IDENTICAL results
+  // on both real tables (the s-solve converges in <= 6 steps once
+  // warm-started along the pass chain), while 4 is measurably worse
+  // (LS220 3 failed, 397/400). 16 is kept as free headroom on the CPU; a
+  // GPU port running a fixed trip count can safely use 8.
+  int seed_passes = 3;
+  int seed_s_iters = 16;
 };
 
 enum class C2PResult { converged_newton, converged_fallback, failed_no_bracket, failed_max_iter };
@@ -481,6 +550,282 @@ EEOS_HOST_DEVICE inline BracketScanResult c2p_bracket_scan(const EntropyEOSView 
   return out;
 }
 
+// ===========================================================================
+// M3d cold-start seed
+// ===========================================================================
+
+// Iteration cap for the seed's inner EOS-FREE scalar solve
+// (c2p_seed_z_solve()). Generous because that solve touches no EOS at all --
+// a handful of multiplies per step on a bracketed monotone residual -- so
+// its cost is invisible next to the s-recovery's evaluate() calls, and
+// running it to convergence is exactly what the seed's accuracy rests on.
+constexpr int kC2PSeedScalarIters = 40;
+
+// What c2p_cold_seed() hands back: the (s, w) the Newton starts from, the
+// EOS warm start u that came with them, plus the seed's own rho/z (exposed
+// for the seed-quality unit test in tests/test_con2prim.cpp and for scratch
+// probes -- POD, no cost).
+struct ColdSeed {
+  real s, w, u;
+  real rho, z;
+};
+
+// Recovers s from U(rho, s, ye) = eps by a bisection-safeguarded Newton on
+// the srange_extended() bracket. This CANNOT fail, which is the reason the
+// seed is built around it: U_s = That > 0 everywhere the adapter is defined,
+// including both designed extension tails (adapter_eval.hpp's monotonicity
+// guard on the u-direction primary track of sigma and L is exactly what
+// makes That > 0 there too), so U is strictly monotone in s on
+// [s_min_ext, s_max_ext] and the bracket is a genuine invariant --
+// eps outside [U(s_min_ext), U(s_max_ext)] simply drives the iteration onto
+// the corresponding endpoint instead of diverging. Same shape as
+// adapter_eval.hpp's own T-solve: Newton where the derivative is usable and
+// the step stays inside the bracket, plain bisection otherwise.
+//
+// n_iter is a CAP, not a fixed trip count: the |g| test below exits early on
+// the CPU (typically 4-7 evaluates once warm-started along the seed's own
+// pass chain). A GPU port that wants a branch-free fixed cost can simply
+// drop the two breaks and always run n_iter times -- nothing else in the
+// loop is data-dependent.
+EEOS_HOST_DEVICE inline real c2p_seed_s_solve(const EntropyEOSView &eos, real rho, real ye, real eps,
+                                               real u_prev, int n_iter, EOSPoint &pt_out) {
+  const SRange ext = eos.srange_extended(rho, ye);
+  real lo = ext.s_min, hi = ext.s_max;
+  if (!(lo < hi)) { // degenerate bracket (never seen on a real table; guarded)
+    pt_out = eos.evaluate(rho, lo, ye, u_prev);
+    return lo;
+  }
+
+  const real eps_scale = eps > real(1e-300) ? eps : real(1e-300);
+  real s = real(0.5) * (lo + hi);
+  EOSPoint pt = eos.evaluate(rho, s, ye, u_prev);
+
+  for (int i = 0; i < n_iter; ++i) {
+    const real g = pt.U - eps;
+    // U increasing in s: g<0 means the root is further right (raise lo).
+    if (g < real(0)) {
+      lo = s;
+    } else {
+      hi = s;
+    }
+    if (std::fabs(g) <= real(1e-12) * eps_scale) break;
+
+    real s_next;
+    bool newton_ok = false;
+    if (pt.U_s > real(0)) {
+      s_next = s - g / pt.U_s;
+      newton_ok = c2p_is_finite(s_next) && s_next > lo && s_next < hi;
+    }
+    if (!newton_ok) s_next = real(0.5) * (lo + hi);
+    if (s_next == s || !(lo < hi)) break; // bracket collapsed to adjacent doubles
+
+    s = s_next;
+    pt = eos.evaluate(rho, s, ye, pt.u_solved);
+  }
+
+  pt_out = pt;
+  return s;
+}
+
+// The seed's inner ENERGY solve. Given the pressure p, the S5 energy
+// relation and the S5 perpendicular momentum projection close on each other
+// with NO reference to the rapidity at all:
+//
+//   z = E + p - B^2/2 * (1 + v_perp^2),      v_perp = S_perp/(z + B^2)
+//
+// (the two other magnetic terms of S5's E cancel into that single
+// (1 + v_perp^2), see prim2con.hpp's algebra note). In the variable
+// q = z + B^2 this is the cubic
+//
+//   H(q) = q - A + (B^2 * S_perp^2)/(2 q^2) = 0,   A = E + p + B^2/2,
+//
+// solved here by bisection-safeguarded Newton. H has a single minimum at
+// q_branch = cbrt(B^2 S_perp^2) and is strictly increasing above it; the
+// physical root always lies on that increasing branch, since
+// q_branch/q = (B^2 v_perp^2/q)^(1/3) < 1. So the bracket is
+//   q_lo = max(D + B^2, q_branch)   (z >= D exactly: z = D*h*cosh w, h >= 1)
+//   q_hi = max(q_lo, A)             (H(A) = B^2 S_perp^2/(2A^2) >= 0)
+// -- both endpoints exact physical bounds, no tuned constants. For B^2 = 0
+// this degenerates to the linear H(q) = q - (E + p), i.e. the design doc's
+// exact hydro z = E + p, recovered rather than special-cased.
+//
+// EOS-free (pure arithmetic), so the iteration cap is generous.
+EEOS_HOST_DEVICE inline real c2p_seed_z_solve(real D, real E, real p, real S_perp, real B2, int n_iter) {
+  const real A = E + p + real(0.5) * B2;
+  const real half_num = real(0.5) * B2 * S_perp * S_perp; // H's numerator over q^2
+
+  // q_branch = cbrt(B^2 * S_perp^2), formed factor-wise so an intermediate
+  // product cannot overflow for the ~1e19-scale magnitudes real tables reach.
+  const real q_branch = std::cbrt(B2) * std::cbrt(S_perp) * std::cbrt(S_perp);
+  real lo = D + B2;
+  if (q_branch > lo) lo = q_branch;
+  real hi = A > lo ? A : lo;
+
+  // Start AT q_hi = A rather than at the bracket midpoint. Two reasons, both
+  // load-bearing: (a) for B^2 = 0 the residual is exactly H(q) = q - A, so
+  // this first point IS the root and the |H| test below exits with the exact
+  // hydro z = E + p -- starting from the midpoint instead would reject every
+  // Newton step (it lands precisely on the open bracket's endpoint) and leave
+  // the answer to 40 bisections of an O(tau)-wide interval, i.e. ~1e-12
+  // relative, which is not enough for a residual the solver then measures
+  // against a 1e-12 tolerance; (b) for B^2 > 0, A over-estimates the root
+  // (H(A) >= 0), which is the side Newton descends from monotonically.
+  real q = hi;
+  if (hi > lo) {
+    // H(lo) > 0 would mean no root on the increasing branch (an inconsistent
+    // lagged p); the bisection below then simply converges to `lo`, the
+    // physical floor, which is the right answer to report.
+    for (int i = 0; i < n_iter; ++i) {
+      const real H = q - A + half_num / (q * q);
+      if (H < real(0)) {
+        lo = q;
+      } else {
+        hi = q;
+      }
+      if (std::fabs(H) <= real(1e-14) * A) break;
+      const real dH = real(1) - real(2) * half_num / (q * q * q);
+      real q_next;
+      bool newton_ok = false;
+      if (dH > real(0)) {
+        q_next = q - H / dH;
+        newton_ok = c2p_is_finite(q_next) && q_next > lo && q_next < hi;
+      }
+      if (!newton_ok) q_next = real(0.5) * (lo + hi);
+      if (q_next == q || !(lo < hi)) break;
+      q = q_next;
+    }
+  }
+
+  const real z = q - B2;
+  return z > D ? z : D; // z = D*h*cosh(w) >= D exactly
+}
+
+// M3d B^2-aware cold-start seed (module header item 6 for the diagnosis this
+// replaces). A fixed-cost block iteration built so that EVERY step is an
+// exact design-doc relation and the ONLY lagged quantity is the pressure p.
+// Per pass, given p (0 on the first pass):
+//
+//   1. ENERGY -> z, exactly, via c2p_seed_z_solve() above. This is the step
+//      that cures the B^2-blindness, and it has to be solved rather than
+//      estimated: the magnetic contribution to E is B^2/2*(1+v_perp^2),
+//      known only to a factor of two a priori, and for a magnetically
+//      dominated state that factor of two is many times z itself. (Measured:
+//      substituting the midpoint z ~ E - 0.75*B^2 for this solve puts z 13%
+//      off on a sigma = 2.7e3 LS220 state, which lands w at 1.6 instead of
+//      4.9 -- see item 2's sensitivity note. The whole seed is only as good
+//      as this solve.)
+//
+//   2. MOMENTUM -> w, exactly, from S5's two projections:
+//        tanh^2(w) = (S_par/z)^2 + (S_perp/(z+B^2))^2.
+//      Given the exact z this is exact, and its sensitivity to the ONE
+//      lagged input is bounded and small: dw = tanh(w) * dp/(rho*h) at
+//      leading order, and p/(rho*h) < 1/4 even for a radiation-dominated
+//      state, so even the p = 0 first pass lands within ~0.25 in w
+//      ABSOLUTE, with later passes second order. (This bound is why the
+//      seed iterates on p and not on the enthalpy: closing the loop through
+//      h instead gives sinh(w) = |S|/(D*h) for B^2 = 0, i.e.
+//      dw = d(log h), and an h-lagged iteration started from the exact bound
+//      h >= 1 was MEASURED to be useless -- on radiation-dominated LS220
+//      states h ~ 10^4 puts the first w at w_max, where the kinetic term
+//      2*D*sinh^2(w/2) alone exceeds tau, so eps floors at 0, s floors at
+//      s_min_ext, h comes back as 1 and the iteration sits in that spurious
+//      fixed point: 198/400 cold failures, worse than no seed at all.)
+//
+//   3. ENERGY -> eps (S7, exact given p). Solving the cancellation-free tau
+//      identity for the one term that carries eps,
+//        rho*eps*W^2 = tau - 2*D*sinh^2(w/2) - p*sinh^2(w)
+//                      - B^2/2*(1+V^2) + B^2/2*v_par^2,
+//      and dividing by rho*W^2 = D*cosh(w). A negative right-hand side means
+//      the lagged p overshot, i.e. the state is colder than this iterate can
+//      express; eps is floored at 0, which step 4 turns into "the coldest s
+//      this density can represent" -- the correct direction to be wrong in,
+//      and a floor the adapter's U >= 0 over the whole extended box makes
+//      meaningful rather than arbitrary.
+//
+//   4. ENTROPY -> s (exact inversion of the table), by the monotone bracketed
+//      solve of c2p_seed_s_solve(). Load-bearing: it is the only step that
+//      CANNOT fail, and it is what replaces the old "midpoint of srange"
+//      guess that put s in the wrong basin.
+//
+//   5. p <- EOSPoint::p for the next pass.
+//
+// The returned (s, w) is self-consistent by construction -- s was solved at
+// rho = D/cosh(w) of the SAME pass -- which matters because con2prim()'s
+// Newton and the S9 bracket scan both consume the pair, not either half
+// alone. No allocation, no recursion; per pass, two EOS-free scalar solves
+// plus one srange_extended() and a handful of evaluate() calls.
+EEOS_HOST_DEVICE inline ColdSeed c2p_cold_seed(const EntropyEOSView &eos, real D, real tau, real ye,
+                                                real S_par, real S_perp, real B2, real w_max, int n_pass,
+                                                int n_s_iter) {
+  const real E = tau + D;
+  const real S_perp_pos = S_perp > real(0) ? S_perp : real(0);
+  const real V_max = std::tanh(w_max); // the only "cap", and it is opts.w_max itself
+
+  const int npass = n_pass < 1 ? 1 : (n_pass > 8 ? 8 : n_pass);
+  const int nsit = n_s_iter < 2 ? 2 : (n_s_iter > 40 ? 40 : n_s_iter);
+
+  real p = real(0);        // the one lagged quantity: 0 on the first pass
+  real u_prev = p2c_nan(); // EOS T-solve warm start, threaded across passes
+
+  ColdSeed out;
+  out.s = real(0);
+  out.w = real(0);
+  out.u = p2c_nan();
+  out.rho = D;
+  out.z = D;
+
+  for (int pass = 0; pass < npass; ++pass) {
+    // --- 1. energy -> z ----------------------------------------------------
+    const real z = c2p_seed_z_solve(D, E, p, S_perp_pos, B2, kC2PSeedScalarIters);
+    const real q = z + B2;
+
+    // --- 2. momentum -> w --------------------------------------------------
+    real v_par = S_par / z;
+    const real v_perp = S_perp_pos / q;
+    real V = std::sqrt(v_par * v_par + v_perp * v_perp);
+    if (!c2p_is_finite(V)) V = real(0);
+    // V >= V_max means the lagged p is not yet consistent with a state of
+    // rapidity <= w_max; report w_max and let the next pass's p fix it.
+    const real w = V < V_max ? aeval_clamp(std::atanh(V), real(0), w_max) : w_max;
+
+    const real coshw = std::cosh(w);
+    const real sinhw = std::sinh(w);
+    const real half_sinh = std::sinh(real(0.5) * w);
+    const real rho = D / coshw;
+
+    // Re-express the velocity at the rapidity actually adopted. A no-op on
+    // the ordinary path (V < V_max makes Vc = tanh(atanh(V)) = V), but it
+    // keeps step 3's magnetic terms consistent with w on the capped branch,
+    // where V itself may exceed 1. Only v_par needs rescaling: step 3 uses
+    // the split solely through Vc (= |v|) and v_par, the (B.v)^2 term.
+    const real Vc = std::tanh(w);
+    if (V > real(0)) v_par *= Vc / V;
+
+    // --- 3. energy -> eps --------------------------------------------------
+    const real rhoW2 = D * coshw; // rho*W^2, with rho = D/cosh(w)
+    real eps = (tau - real(2) * D * half_sinh * half_sinh - p * sinhw * sinhw -
+                real(0.5) * B2 * (real(1) + Vc * Vc) + real(0.5) * B2 * v_par * v_par) /
+               rhoW2;
+    if (!(eps > real(0))) eps = real(0); // also catches a non-finite quotient
+
+    // --- 4. entropy -> s ---------------------------------------------------
+    EOSPoint pt;
+    const real s = c2p_seed_s_solve(eos, rho, ye, eps, u_prev, nsit, pt);
+    u_prev = pt.u_solved;
+
+    out.s = s;
+    out.w = w;
+    out.u = pt.u_solved;
+    out.rho = rho;
+    out.z = z;
+
+    // --- 5. p for the next pass --------------------------------------------
+    p = (c2p_is_finite(pt.p) && pt.p > real(0)) ? pt.p : real(0);
+  }
+
+  return out;
+}
+
 // Fills the shared Con2PrimOut fields from a converged/best-effort
 // Residuals; `out.ye` and `out.result` are set separately by the caller.
 EEOS_HOST_DEVICE inline void c2p_fill(Con2PrimOut &out, const Residuals &r, int iters_newton,
@@ -500,17 +845,29 @@ EEOS_HOST_DEVICE inline void c2p_fill(Con2PrimOut &out, const Residuals &r, int 
 } // namespace detail
 
 // Recovers primitives from a scalar conservative state (design doc SS6-9).
-// s_guess/w_guess/u_guess default to NaN ("no guess"); when finite they warm
-// -start the corresponding piece, otherwise a cold-start seed is used (S6):
-//   w0 = atanh(min(|S|/(tau+D+p0), 0.999)), p0 = 0.3*tau (a crude bounded
-//        estimate -- any bounded seed works, the safeguards do the work);
-//   s0 = midpoint of srange(D/cosh(w0), ye).
-// These are documented as *just seeds*: correctness does not depend on
-// their quality, only iteration count does. (M3c tried the design doc S4
-// exact-at-B=0 recipe here -- eps0 from the cancellation-free tau identity,
-// s0 from a 4-point quarter-of-range U match -- and measured a regression
-// on the coldest-row edge case; see the seed's own comment below for the
-// full account of why it was reverted.)
+// s_guess/w_guess/u_guess default to NaN ("no guess"); when finite they
+// warm-start the corresponding piece, otherwise the M3d B^2-aware cold seed
+// of detail::c2p_cold_seed() supplies it (see that function's doc comment
+// for the construction, and the module header's item 6 for the measured
+// diagnosis it was built from).
+//
+// Historical note, kept because it is the reason the M3d seed is built the
+// way it is: through M3a-M3c this was a crude B^2-blind estimate
+// (tanh w0 = |S|/(tau+D+0.3*tau), s0 = midpoint of srange(D/cosh w0)),
+// documented as "just a seed" on the theory that only iteration count
+// depended on its quality. That theory was measurably false for strongly
+// magnetized states (module header item 6). M3c then tried a partial fix --
+// eps0 from the tau identity plus s0 chosen from 4 quarter-points of
+// srange(rho0) by matching U to eps0 -- and REVERTED it: a 4-point grid's
+// best candidate is still ~12% of the way across a physical srange that can
+// span many orders of magnitude, so on the coldest-row edge case
+// (tests/test_con2prim.cpp test 6) it landed far from the near-s_min truth
+// in absolute terms, and the bracket scan's local window then inherited that
+// wrong position. Both failures are addressed here by construction rather
+// than by tuning: the s recovery is an exact monotone solve on the whole
+// extended bracket (not a coarse grid search), so it is as accurate at
+// s_min as anywhere else, and the seed's rho is B^2-aware, so the window it
+// anchors is centred on the right basin.
 EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Con2PrimIn &in,
                                               const Con2PrimOptions &opts,
                                               real s_guess = detail::p2c_nan(),
@@ -521,62 +878,26 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   Con2PrimOut out{};
   out.ye = in.D_Y / in.D;
 
-  // --- S6 cold-start seeds -------------------------------------------------
-  real w;
-  if (!detail::aeval_is_nan(w_guess)) {
-    w = detail::aeval_clamp(w_guess, real(0), opts.w_max);
-  } else {
-    const real Smag = std::sqrt(in.S_par * in.S_par + in.S_perp * in.S_perp);
-    const real p0 = real(0.3) * in.tau;
-    const real vden_raw = in.tau + in.D + p0;
-    const real vden = vden_raw > real(1e-300) ? vden_raw : real(1e-300);
-    const real vfrac = Smag / vden;
-    // M3c side investigation: raising this 0.999 cap (atanh(0.999) ~ 3.8,
-    // well under real-table failure states' w in [3.4, 5.9]) was tried and
-    // MEASURED to change nothing on LS220/SRO -- the actual cold-pass
-    // bottleneck (con2prim()'s fallback-section doc comment) turned out to
-    // be vfrac itself landing far from 1 for strongly magnetized states
-    // (B2 comparable to or exceeding tau+D, where |S| is inflated by the
-    // (z+B2) inertia factor of S7's S_perp = (z+B2)*v_perp rather than by v
-    // itself -- this crude estimate, unlike the exact design doc S4
-    // relations, has no B2 term at all), not by this cap. Left unchanged
-    // (spec: "w0 ... unchanged") since deviating from it measured no
-    // benefit.
-    const real vclamped = vfrac < real(0.999) ? vfrac : real(0.999);
-    w = detail::aeval_clamp(std::atanh(vclamped), real(0), opts.w_max);
-  }
+  // --- M3d cold-start seed -------------------------------------------------
+  // Computed only when at least one of (s, w) is missing; a fully warm call
+  // never pays for it and is bit-identical to the pre-M3d solver.
+  const bool cold_s = detail::aeval_is_nan(s_guess);
+  const bool cold_w = detail::aeval_is_nan(w_guess);
 
-  real s;
-  if (!detail::aeval_is_nan(s_guess)) {
-    s = s_guess;
-  } else {
-    // M3c informed cold seed -- TRIED, MEASURED, REVERTED (task's "keep it
-    // only if it helps" instruction). Implemented design doc S4's
-    // exact-at-B=0 recipe: rho0 = D/cosh(w) (w from the S6 estimate above),
-    // eps0 estimated from the same cancellation-free tau identity
-    // c2p_eval() uses for f2 (dropping the unknown-before-an-EOS-call
-    // pressure term and the bounded (B.v)^2 term), then s0 chosen from 4
-    // trial quarter-points of srange(rho0,ye) by matching U to eps0 (no
-    // eps->s map to invert directly). Measured effect: tests/test_con2prim.cpp
-    // test 6 (w=1e-10, coldest s row -- s within 1e-6 of s_min) regressed
-    // from 0 failures to 3 failed_no_bracket plus a tau round-trip tolerance
-    // breach. Root cause: the quarter-point grid's closest candidate to a
-    // near-s_min truth is still ~12% of the way across a physical srange
-    // that can itself span many orders of magnitude (module header /
-    // con2prim()'s fallback doc comment), so the seed lands far from s_min
-    // in absolute terms; worse, the M3c bracket scan's frac_in tracking
-    // (c2p_bracket_scan()) then propagates that same wrong fractional
-    // position to every interior scan point, systematically missing the
-    // true near-s_min root instead of just converging slowly to it. Kept
-    // the original crude seed instead, unchanged from M3a: correctness
-    // never depended on this seed's quality (only iteration count did, per
-    // this function's own doc comment), and the coldest-row states are
-    // exactly the regime prim2con.hpp's cancellation-free tau form exists
-    // to handle correctly, so a regression there is not an acceptable trade
-    // for faster convergence elsewhere.
-    const real rho0 = in.D / std::cosh(w);
-    const SRange sr0 = eos.srange(rho0, out.ye);
-    s = real(0.5) * (sr0.s_min + sr0.s_max);
+  real s = s_guess;
+  real w = cold_w ? real(0) : detail::aeval_clamp(w_guess, real(0), opts.w_max);
+  real u_start = u_guess;
+
+  if (cold_s || cold_w) {
+    const detail::ColdSeed seed =
+        detail::c2p_cold_seed(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, opts.w_max,
+                               opts.seed_passes, opts.seed_s_iters);
+    if (cold_s) s = seed.s;
+    if (cold_w) w = detail::aeval_clamp(seed.w, real(0), opts.w_max);
+    // The seed's converged EOS T-solve position is also the best available
+    // warm start for the Newton's first evaluate(), so pass it on unless the
+    // caller supplied one of its own.
+    if (detail::aeval_is_nan(u_start)) u_start = seed.u;
   }
 
   // --- S7-8 damped 2x2 Newton ----------------------------------------------
@@ -601,7 +922,7 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   // unconditionally; the SS9 fallback (guaranteed globally convergent) is
   // the safety net for the states that still do not converge within
   // max_iter_newton, exactly as the design doc intends.
-  Residuals r = detail::c2p_eval(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, s, w, u_guess,
+  Residuals r = detail::c2p_eval(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, s, w, u_start,
                                   opts.tau_floor_rel);
   int iters = 0;
   bool converged = std::fabs(r.f1) <= opts.tol && std::fabs(r.f2) <= opts.tol;
@@ -651,6 +972,19 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   // untouched seed if max_iter_newton==0 -- used both to anchor the scan's
   // interior points and to break ties among multiple sign-changing
   // intervals.
+  //
+  // M3d asked whether a COLD call should instead anchor the scan's LOCAL
+  // half on the seed itself, on the theory that a cold Newton which ran out
+  // of iterations has not "stalled near a root" (the case the local window
+  // was designed for) but simply wandered. MEASURED and NOT adopted: over
+  // 4000 cold states per table the two anchors are indistinguishable --
+  // LS220 18 vs 20 failed, SRO 32 vs 31 -- so the extra state is not worth
+  // carrying. The reason they tie is itself a property of the M3d seed:
+  // with a seed accurate to ~1e-4 in s, a cold Newton either converges (it
+  // does for 99% of cold states, see the module header) or ends up near
+  // where it started, so "Newton's last iterate" and "the seed" are the
+  // same neighbourhood -- and for max_iter_newton == 0 they are literally
+  // the same value.
   const detail::BracketScanResult scan =
       detail::c2p_bracket_scan(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, opts.w_max,
                                 opts.tau_floor_rel, opts.bracket_scan, s, w, w, r.pt.u_solved,
