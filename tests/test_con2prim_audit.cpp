@@ -292,12 +292,13 @@ bool table_exists(const std::string &path) {
 } // namespace
 
 TEST_CASE("check_con2prim: LS220 real table (guarded), default m_B, n=2000 -- runs to completion") {
-  if (!table_exists(kLS220Path)) {
-    WARN_MESSAGE(false, "LS220 table not found at '" << kLS220Path << "' -- skipped ('skipped')");
+  const std::string path = eeos_san_table(kLS220Path);
+  if (!table_exists(path)) {
+    WARN_MESSAGE(false, "LS220 table not found at '" << path << "' -- skipped ('skipped')");
     return;
   }
 
-  RawTable table = eeos::read_stellarcollapse(kLS220Path);
+  RawTable table = eeos::read_stellarcollapse(path);
   const eeos::RepairResult repair_result = eeos::repair_table(table);
   (void)repair_result;
   EntropyEOS adapter = eeos::build_entropy_eos(table); // default m_B (amu)

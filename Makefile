@@ -49,7 +49,7 @@ TEST_BINS = $(TEST_SRCS:.cpp=)
 TOOL_SRCS = $(wildcard tools/*.cpp)
 TOOL_BINS = $(TOOL_SRCS:.cpp=)
 
-.PHONY: all lib test tools integration install clean
+.PHONY: all lib test tools integration install clean san-fixture
 
 all: lib
 
@@ -78,6 +78,18 @@ tools: $(TOOL_BINS)
 
 integration: tools
 	./tests/integration.sh
+
+# Regenerates the small (~20 MB) cropped LS220 fixture used by the LS220
+# real-table tests under SAN=1 (see tests/test_scale.hpp's eeos_san_table()):
+# a real-data box that still contains LS220's genuine Inf points in
+# cs2/gamma (irho 69-83, jT 9-17, kYe 18) and keeps the full temperature
+# axis, so the in-test repair paths still exercise genuine pathologies. Not
+# run automatically by `test`/`integration` -- run by hand (or whenever the
+# fixture needs regenerating) since it needs the full LS220 table under
+# tables/ (see tables/README.md), which CI never has.
+san-fixture: tools
+	./tools/eos_crop tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5 \
+		tables/LS220_san_crop.h5 --irho 60 120 --jt 0 135 --kye 10 25
 
 install: lib
 	mkdir -p $(PREFIX)/lib $(PREFIX)/include/entropy_eos

@@ -668,7 +668,8 @@ bool table_exists(const std::string &path) {
   return static_cast<bool>(f);
 }
 
-void run_real_table_adapter_test(const std::string &path, const char *label, unsigned seed) {
+void run_real_table_adapter_test(const std::string &full_path, const char *label, unsigned seed) {
+  const std::string path = eeos_san_table(full_path);
   if (!table_exists(path)) {
     WARN_MESSAGE(false, label << " table not found at '" << path << "' -- skipped ('skipped')");
     return;

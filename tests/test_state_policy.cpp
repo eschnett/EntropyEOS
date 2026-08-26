@@ -939,12 +939,13 @@ TEST_CASE("state_policy: LS220 real table (guarded) -- no false positives, then 
   // identical in shape to every other suite's.
   (void)eeos_skip_big_table("state_policy SRO variant (LS220 below covers the real-table path)");
 
-  if (!table_exists(kLS220Path)) {
-    WARN_MESSAGE(false, "LS220 table not found at '" << kLS220Path << "' -- skipped ('skipped')");
+  const std::string path = eeos_san_table(kLS220Path);
+  if (!table_exists(path)) {
+    WARN_MESSAGE(false, "LS220 table not found at '" << path << "' -- skipped ('skipped')");
     return;
   }
 
-  RawTable table = eeos::read_stellarcollapse(kLS220Path);
+  RawTable table = eeos::read_stellarcollapse(path);
   const eeos::RepairResult repair_result = eeos::repair_table(table);
   (void)repair_result;
   EntropyEOS adapter = eeos::build_entropy_eos(table); // default m_B (amu)

@@ -24,7 +24,9 @@
 #pragma once
 
 #include <cstddef>
+#include <fstream>
 #include <iostream>
+#include <string>
 
 // Compile-time sanitizer detection. __SANITIZE_ADDRESS__ is defined by GCC
 // (and by clang when -fsanitize=address is on, alongside __has_feature);
@@ -60,4 +62,33 @@ inline bool eeos_skip_big_table(const char *name) {
     return true;
   }
   return false;
+}
+
+// The path of the small (~20 MB) cropped LS220 fixture `make san-fixture`
+// produces (tools/eos_crop.cpp; see the Makefile) -- a real-data box that
+// still contains LS220's genuine Inf/NaN points in cs2/gamma and keeps the
+// full temperature axis, so the tests that route through eeos_san_table()
+// below keep exercising their reader/build/solve code paths, and the
+// in-test repair paths, on genuine pathological real data even under SAN.
+inline const char *eeos_san_ls220_crop_path() { return "tables/LS220_san_crop.h5"; }
+
+// Routes a real-table path through the small SAN fixture when appropriate.
+// Under a sanitized build, if `full_path` is the full-size LS220 table and
+// the cropped fixture (tables/LS220_san_crop.h5) exists on disk, returns the
+// fixture's path instead (printing a one-line note so a test log makes
+// clear which table actually ran); otherwise returns `full_path` unchanged
+// -- including on a plain build, where this function is a no-op by
+// construction (eeos_sanitized is false), so a plain build is bit-for-bit
+// unaffected by this header, per this file's header comment.
+inline std::string eeos_san_table(const std::string &full_path) {
+  static const std::string kLS220FullPath = "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5";
+  if (eeos_sanitized && full_path == kLS220FullPath) {
+    const std::string crop_path = eeos_san_ls220_crop_path();
+    std::ifstream f(crop_path, std::ios::binary);
+    if (f) {
+      std::cout << "SAN: using cropped LS220 fixture; run 'make san-fixture' to regenerate\n";
+      return crop_path;
+    }
+  }
+  return full_path;
 }

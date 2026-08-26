@@ -34,6 +34,23 @@ bunzip2 tables/LS220_3335_rho391_temp163_ye66.h5.bz2
 Grid: 391 × 163 × 66 (ρ × T × Ye). Source page:
 https://stellarcollapse.org/SROEOS.html
 
+## Sanitizer fixture (optional, generated)
+
+Sanitizer test runs (`make test SAN=1`) automatically substitute a small cropped
+LS220 fixture when present, cutting the SAN wall time from ~9 min to ~2.7 min while
+keeping real-data coverage (the crop contains LS220's three genuine non-finite
+cs2/gamma points and the full temperature axis). Generate it once after downloading
+LS220:
+
+```bash
+make san-fixture
+```
+
+which runs `tools/eos_crop` (index ranges irho 60–120 × jT 0–135 × kYe 10–25,
+~19 MB). Without the fixture, sanitizer runs fall back to the full table
+transparently. Plain (non-sanitizer) builds and `make integration` always use the
+full tables.
+
 ## Citations
 
 - E. O'Connor & C. D. Ott, Class. Quantum Grav. 27, 114103 (2010) — table format.
