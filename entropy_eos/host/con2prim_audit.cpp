@@ -312,6 +312,11 @@ std::vector<PolicyBatteryCase> make_policy_battery(const EntropyEOSView &view, c
       prim2con(view, rho_mid, s_mid, ye_mid, 2.0, 3.0 * rho_mid * pt.h, 0.4, pt.u_solved);
   const Con2PrimIn base_in{base.D, base.tau, base.D_Y, base.S_par, base.S_perp, base.B2};
 
+  // Both collapse modes are exercised EXPLICITLY (never through the default,
+  // so a default flip cannot silently turn one battery family into a
+  // mislabeled copy of the other).
+  PolicyOptions pol_atm = pol;
+  pol_atm.collapse_to_atmosphere = true;
   PolicyOptions pol_ceil = pol;
   pol_ceil.collapse_to_atmosphere = false;
 
@@ -341,10 +346,10 @@ std::vector<PolicyBatteryCase> make_policy_battery(const EntropyEOSView &view, c
   const Con2PrimIn col_mom{1e6 * pol.D_max, 1e6 * pol.tau_max, 1e6 * pol.D_max * ye_mid, 1e30, 1e30, 0.0};
   const Con2PrimIn col_tau{rho_mid, 1e6 * pol.tau_max, rho_mid * ye_mid, 1e20, 1e20, 0.0};
   const Con2PrimIn col_D{1e6 * pol.D_max, base.tau, 1e6 * pol.D_max * ye_mid, 1e10, 1e10, 0.0};
-  out.push_back({"collapse_atm_D_and_tau", col_both, pol});
-  out.push_back({"collapse_atm_superluminal", col_mom, pol});
-  out.push_back({"collapse_atm_tau_only", col_tau, pol});
-  out.push_back({"collapse_atm_D_only", col_D, pol});
+  out.push_back({"collapse_atm_D_and_tau", col_both, pol_atm});
+  out.push_back({"collapse_atm_superluminal", col_mom, pol_atm});
+  out.push_back({"collapse_atm_tau_only", col_tau, pol_atm});
+  out.push_back({"collapse_atm_D_only", col_D, pol_atm});
   out.push_back({"collapse_ceiling_D_and_tau", col_both, pol_ceil});
   out.push_back({"collapse_ceiling_superluminal", col_mom, pol_ceil});
   out.push_back({"collapse_ceiling_tau_only", col_tau, pol_ceil});

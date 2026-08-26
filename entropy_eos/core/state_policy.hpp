@@ -136,11 +136,12 @@ struct PolicyOptions {
                               // D = rho*W <= rho_ceiling * cosh(w_cap)
   real tau_max = real(0);     // default_policy(): see policy_derive_bounds()
 
-  // Owner's default: excise a collapse state to atmosphere. false instead
-  // projects it onto the ceiling primitives (rho = rho_ceiling, s = the
-  // physical s_max there, w from the momentum against the ceiling inertia),
-  // which keeps a heavy, hot, moving cell instead of a vacuum one.
-  bool collapse_to_atmosphere = true;
+  // Owner's default: project a collapse state onto the ceiling primitives
+  // (rho = rho_ceiling, s = the physical s_max there, w from the momentum
+  // against the ceiling inertia), keeping a heavy, hot, moving cell. true
+  // instead excises it to atmosphere ("hydro excision" in the strict sense:
+  // the point is replaced by vacuum-like data).
+  bool collapse_to_atmosphere = false;
 };
 
 // The scalar primitive core the policy acts on. Direction vectors are the
@@ -291,7 +292,7 @@ EEOS_HOST_DEVICE inline PolicyOptions default_policy(const EntropyEOSView &eos, 
   pol.atm_trigger = real(1.01);
   pol.rho_ceiling = std::pow(real(10), eos.x_hi);
   pol.w_cap = std::acosh(real(100)); // W <= 100; well below Con2PrimOptions::w_max = 12
-  pol.collapse_to_atmosphere = true;
+  pol.collapse_to_atmosphere = false;
   policy_derive_bounds(eos, pol);
   return pol;
 }
@@ -455,8 +456,8 @@ EEOS_HOST_DEVICE inline void pol_package(const EntropyEOSView &eos, const PrimSt
 // The collapse / hydro-excision branch, shared by con2prim_safe() steps 1
 // and 4. Returns the policy flags it set.
 //
-// collapse_to_atmosphere (the owner's default): excise to atmosphere, and
-// report BOTH flag_pol_ceiling (a ceiling was what triggered it) and
+// collapse_to_atmosphere = true: excise to atmosphere, and report BOTH
+// flag_pol_ceiling (a ceiling was what triggered it) and
 // flag_pol_atmosphere (what was done about it).
 //
 // Otherwise: project onto the ceiling primitives -- rho = rho_ceiling, s =
