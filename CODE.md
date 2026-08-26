@@ -272,8 +272,18 @@ and OpenMP builds).
   monotone tails, flags judged on the solved state, and U ≥ 0 over the whole extended
   box; synthetic seam jumps ~5e-7, real-table seam maxima confined to the documented
   residual pockets (accept-and-guard, open decision 4).
-- **M3:** `prim2con`, `con2prim` (coupled 2×2 Newton + nested 1D fallback);
-  `eos_test --level con2prim`; benchmarks vs. RePrimAnd.
+- **M3:** ✅ core complete (a: prim2con + 2×2 Newton + nested fallback; b: `eos_test
+  --level con2prim`; c: fallback hardening). Measured state: warm starts 98.8% Newton
+  with conservative-space round trips at p99 ≈ 1e-12 and ~2×10⁵ solves/s; the
+  guaranteed-fallback bracket uses a global+local multi-point scan at full precision
+  (endpoints-only sign checks provably miss roots — g(s) is non-monotone near extension
+  seams and the extended s-bracket can span 10+ decades). Known open items:
+  (i) cold-start seeds for strongly magnetized states are B²-blind
+  (S_⊥ = (z+B²)v_⊥ inflates |S| independently of v), leaving ~1/3 cold-start
+  failures on real tables — warm production paths unaffected; (ii) a ~0.1% failure
+  tail confined to the hot-edge/high-w acausal-cs² corner (beyond table validity —
+  §11 invalid-state policy territory); (iii) the RePrimAnd benchmark (external
+  library build — decide separately).
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
   fixed-iteration evaluate/con2prim variants.
 
