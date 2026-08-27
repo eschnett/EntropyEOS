@@ -41,6 +41,23 @@
 // diffusion may have perturbed) -- see repair_table()'s doc comment for the
 // exact algorithm.
 //
+// M3f "causal-cap" repair (eos-causality-repair.md): the two stages above
+// both enforce *monotonicity* of the fitted splines; neither can see the
+// other hard requirement of eos-adapter-F-to-U.md S8, causality
+// (0 < c_s^2 < 1) of the potential U the adapter builds out of those same
+// splines. On the real tables c_s^2 >= 1 over a systematic high-rho corner
+// (LS220-2009: 4.2% of nodes, a contiguous suffix in rho at every (T, Ye);
+// SRO: 4.3%) -- genuine table physics, confirmed by those tables' own
+// stored cs2 columns, but fatal to the con2prim Newton's conditioning
+// (its diagonal entry is z_w = z(1-c_s^2)tanh w). The causal-cap stage
+// (RepairOptions::causal_cap, on by default) runs last, audits c_s^2 of the
+// fitted "entropy"/"logenergy" splines on a refined grid via the analytic
+// chain rule, and where the audit finds edge-anchored violation runs
+// projects "logenergy" onto the causal Lipschitz envelope along adiabats --
+// see repair_table()'s doc comment (causal-cap stage) for the algorithm and
+// eos-causality-repair.md S3 for the mathematics. Only "logenergy" is ever
+// edited; "entropy" never gains a RepairEntry from this stage.
+//
 // Host-only: STL containers, may throw. Structural problems -- a listed
 // field missing from the table, or a non-finite value in a listed field --
 // mean a broken file, not physics noise, and are reported by throwing
@@ -138,6 +155,56 @@ struct RepairOptions {
   // diffuse_alpha and diffuse_window (above) are reused by the 3D stage's
   // Jacobi diffusion step and box-marking, exactly as documented for the
   // per-column stage but applied in 3D (repair_table()'s doc comment).
+
+  // --- M3f causal-cap stage (eos-causality-repair.md S5) ------------------
+
+  // Run the causal-cap stage after both monotonicity stages above. On by
+  // default (decided 2026-08-27, eos-causality-repair.md S5): eos_repair's
+  // contract is "make the table satisfy the hard requirements of
+  // eos-adapter-F-to-U.md S8", and 0 < c_s^2 < 1 is on that list; like the
+  // monotonicity repair it is a logged physics edit, and it acts only where
+  // the table is already unphysical by its own stored cs2 column.
+  //
+  // Silently skipped (a no-op, RepairResult::CausalCapSummary::ran = false)
+  // unless BOTH "entropy" and "logenergy" are in `fields` (c_s^2 is a joint
+  // property of the two splines), the table carries an "energy_shift"
+  // attribute, and every axis has >= 4 points and is non-degenerate.
+  bool causal_cap = true;
+
+  // Audit threshold: a refined sample whose c_s^2 is >= this is a violation.
+  // 1.0 is the physical causality bound.
+  double cs2_max = 1.0;
+
+  // Target slope c_bar of the Lipschitz envelope the projection imposes on
+  // ln h along adiabats (eos-causality-repair.md S3). Strictly below
+  // cs2_max on purpose: the hysteresis absorbs the ringing a refit puts
+  // back near the anchor seam, and 1 - c_s^2 is exactly the con2prim
+  // Newton's diagonal conditioning headroom. 0 < cs2_cap < cs2_max is a
+  // precondition, not a preference -- repair_table() throws
+  // std::invalid_argument otherwise (see its doc comment), since without the
+  // gap the loop has no mechanism to converge.
+  double cs2_cap = 0.99;
+
+  // Round budget for the stage's audit/project/re-repair loop. Round 1 does
+  // the bulk; later rounds chase refit ringing near the anchor seams.
+  int causal_rounds_max = 8;
+
+  // How many rho *cells* a node's adiabat trace may descend looking for a
+  // causal anchor before the node is given up on (reported via
+  // CausalCapSummary::trace_giveups, never edited). Measured anchor depths:
+  // <= 11 cells (LS220-2009), <= 18 (SRO).
+  int trace_depth_max = 64;
+
+  // Consecutive causal refined steps required before the trace anchors
+  // (hysteresis: anchoring on the very first causal step would put the
+  // anchor exactly where the refit is most likely to ring back above the
+  // cap).
+  int anchor_pad = 2;
+
+  // The stage's refined audit grid reuses refine3d_xy / refine3d_u above:
+  // the main loop audits at (refine3d_xy, refine3d_u, refine3d_xy) and the
+  // final verification always at (4,4,4), mirroring the 3D stage. The
+  // adiabat trace steps by one refined rho step, hrho/refine3d_xy.
 };
 
 // One value changed by repair_table(), identified by field and grid index.
@@ -228,7 +295,103 @@ struct RepairResult {
   };
   std::vector<FieldSummary> summaries;
 
-  // Human-readable summary (status, then one line per field).
+  // --- M3f causal-cap stage (eos-causality-repair.md) ----------------------
+  //
+  // One summary for the whole stage, not one per field: c_s^2 is a joint
+  // property of the "entropy" and "logenergy" splines, and the stage runs
+  // once over both (editing only "logenergy").
+  struct CausalCapSummary {
+    // False (and everything below at its default) whenever the stage did
+    // not run: options.causal_cap off, a missing field/attribute, or a grid
+    // too small to fit (see RepairOptions::causal_cap).
+    bool ran = false;
+
+    // True iff the stage's lexicographic backstop (repair_table()'s doc
+    // comment, causal-cap step 6) rejected the projected state and reverted
+    // "logenergy" to exactly its pre-stage bytes -- either because the
+    // (4,4,4) L_u monotonicity count got worse (never trade the T-solve's
+    // hard requirement for causality) or because the (4,4,4) c_s^2 count
+    // did. When true, nodes_capped and rounds_used are 0 and
+    // violations_after is the pre-stage count.
+    bool reverted = false;
+
+    // Rounds of the main audit/project/re-repair loop whose effect is part
+    // of the kept state (a round whose projection made the count worse is
+    // discarded and not counted, exactly like FieldSummary::rounds3d_used).
+    int rounds_used = 0;
+
+    // DISTINCT "logenergy" nodes whose value differs from the pre-stage
+    // state in the kept state (counted once each, no matter how many rounds
+    // touched them; 0 when reverted). "entropy" is never edited by this
+    // stage, so it contributes nothing here or to RepairResult::entries.
+    size_t nodes_capped = 0;
+
+    // Nodes whose adiabat trace descended options.trace_depth_max cells (or
+    // ran off the low-rho edge of the table) without finding a causal
+    // anchor: reported, never edited (eos-causality-repair.md S4 step 3).
+    size_t trace_giveups = 0;
+
+    // c_s^2 violation *sample* counts at (4,4,4) of the pre-stage state and
+    // of the state repair_table() actually returned. violations_after ==
+    // violations_before exactly when the stage reverted (or changed
+    // nothing).
+    size_t violations_before = 0;
+    size_t violations_after = 0;
+
+    // Diagnostics of the returned state's own (4,4,4) audit, all
+    // report-only (eos-causality-repair.md S2, S4 step 2, S6):
+    //   interior_untouched   violating samples in runs that do NOT reach the
+    //                        rho_max edge -- the sigma_T-pocket spikes and
+    //                        SRO's Ye = 0.645 sliver. Out of scope by
+    //                        design: capping eps cannot fix a defect that
+    //                        lives in sigma's flatness.
+    //   cs2_nonpositive      samples with c_s^2 <= 0 (fit noise in near-flat
+    //                        regions, and the same sigma pockets). A
+    //                        different defect class; z_w stays positive
+    //                        there, so con2prim conditioning is unharmed.
+    //   cs2_indeterminate    samples where the chain rule has no answer at
+    //                        all (sigma_u <= 0, h <= 0, or a non-finite
+    //                        intermediate); neither counted as a violation
+    //                        nor edited.
+    //   cs2_near_cap         samples with c_s^2 >= options.cs2_cap, i.e. how
+    //                        much of the hysteresis band is in use.
+    //   cs2_max_seen         the largest finite c_s^2 the audit saw.
+    size_t interior_untouched = 0;
+    size_t cs2_nonpositive = 0;
+    size_t cs2_indeterminate = 0;
+    size_t cs2_near_cap = 0;
+    double cs2_max_seen = 0.0;
+
+    // (4,4,4) fu-monotonicity violation counts the backstop compares, for
+    // "entropy" (which this stage never edits, so the value is the same
+    // before and after and is reported once) and for "logenergy" before and
+    // after the stage.
+    size_t mono_entropy = 0;
+    size_t mono_logenergy_before = 0;
+    size_t mono_logenergy_after = 0;
+
+    // The same two (4,4,4) counts for the state the stage actually produced,
+    // whether or not the backstop kept it. Identical to violations_after /
+    // mono_logenergy_after unless `reverted` is set, in which case these are
+    // the numbers that caused the rejection -- the only place the reason is
+    // visible, since the "after" fields describe the state that was returned
+    // (i.e. the pre-stage one).
+    size_t projected_violations = 0;
+    size_t projected_mono_logenergy = 0;
+
+    // Every main-loop round's c_s^2 violation sample count, in chronological
+    // order (at refine (refine3d_xy, refine3d_u, refine3d_xy)), one entry
+    // per round including the one that finds zero and ends the loop, then
+    // the final verification's (4,4,4) count as the last entry. Empty iff
+    // the stage did not run. repair_table() itself prints nothing (CODE.md
+    // "Environment"); tools/eos_repair prints these as per-round progress
+    // lines, exactly as it does for the 3D stage.
+    std::vector<size_t> rounds_violation_history;
+  };
+  CausalCapSummary causal_cap;
+
+  // Human-readable summary (status, then one line per field, then the
+  // causal-cap stage's block if it ran).
   void print(std::ostream &os) const;
 };
 
@@ -327,9 +490,91 @@ struct RepairResult {
 //   audit in step 4, which is bookkeeping, not a "round") is appended, in
 //   order, to FieldSummary::rounds3d_violation_history.
 //
+// Causal-cap stage (M3f, eos-causality-repair.md), run ONCE after every
+// field has been through both stages above, if options.causal_cap (default
+// on) and the preconditions on RepairOptions::causal_cap hold (both fields
+// listed, "energy_shift" present, every axis >= 4 points). It edits only
+// "logenergy"; "entropy" is left bit-identical, so node adiabat labels
+// s = sigma(node) are stable across rounds and the T-solve's sigma_u > 0
+// guarantee is untouched.
+//   5. Audit. Fit both fields with fit_bspline_3d() at the table's own
+//      log10 axes (x = log10 rho, u = log10 T, y = Ye; uniform spacing
+//      assumed, as everywhere in M2) and sample
+//        c_s^2 = (eps_x + eps_xx) / h,   h = 1 + eps + eps_x
+//      on the same refined grid step 2b uses, at (refine3d_xy, refine3d_u,
+//      refine3d_xy) in the main loop and at (4,4,4) for verification. Here
+//      x = ln rho and the derivatives are taken *along the adiabat* through
+//      the sample, via the implicit-function chain rule on the sigma spline
+//      (eos-adapter-F-to-U.md S3.1, in raw table variables): with
+//      U'= -sigma_x/sigma_u and U''= -(sigma_xx + 2 sigma_xu U' + sigma_uu
+//      U'^2)/sigma_u, eps and its two x-derivatives follow from the
+//      "logenergy" spline analytically. Only c^2 and energy_shift enter --
+//      c_s^2 is invariant under the adapter's kappa rescaling and under the
+//      table's m_B convention, so auditing the raw-variable fit is exactly
+//      auditing the production adapter's interior. A sample violates iff
+//      c_s^2 >= options.cs2_max; samples with c_s^2 <= 0, samples the chain
+//      rule cannot resolve, and samples merely above options.cs2_cap are
+//      counted for reporting only.
+//   6. Scope. Group the violating samples of each refined (u, y) row into
+//      maximal runs along x. Only runs that reach the x_hi (rho_max) edge
+//      are treated; interior runs are counted into
+//      CausalCapSummary::interior_untouched and never edited (their defect
+//      lives in sigma_T's flatness, not in eps's stiffness, and chasing
+//      them is what burns round budgets -- the M2d-1 lesson). A treated run
+//      starting at refined index a marks, for the 2x2 data-node corners
+//      (jT, kYe) of its owning (u, y) cell, every node with irho >=
+//      ceil(a / refine3d_xy).
+//   7. Project, per marked node (i, j, k), independently (-> OpenMP; each
+//      trace reads only the pre-round splines, so the result does not
+//      depend on scheduling):
+//        a. Trace the node's adiabat s = entropy(i,j,k) downward in x in
+//           refined steps hrho/refine3d_xy, solving sigma(x', u, y) = s for
+//           u at each step (safeguarded Newton on the sigma spline, warm
+//           started from the previous step). Where the adiabat leaves the
+//           box through u_min, the trace follows the u_min edge (the fully
+//           degenerate regime, where T-dependence is negligible --
+//           eos-causality-repair.md S6).
+//        b. Anchor where c_s^2 <= options.cs2_cap has held for
+//           options.anchor_pad consecutive steps. If that has not happened
+//           within options.trace_depth_max cells, or the trace reaches the
+//           low-rho edge of the table first, give up on the node
+//           (CausalCapSummary::trace_giveups) and leave it bit-identical.
+//        c. March back up to the node imposing the one-sided Lipschitz
+//           envelope h_env(x+d) = min(h_orig(x+d), h_env(x)*exp(cs2_cap*d))
+//           and integrating the energy-consistency ODE
+//           d(eps)/dx = h - 1 - eps with h = h_env, from eps_orig(anchor),
+//           by exact integrating-factor steps (exact whenever h is
+//           exponential on a step, which is how each step is modelled).
+//           Implementation detail: the ODE is integrated for the *deficit*
+//           D = eps_orig - eps_env, which obeys the same linear ODE with
+//           source h_orig - h_env and D(anchor) = 0, so D stays exactly 0
+//           on stretches where the envelope does not bind and the node's
+//           own exact stored eps carries the value (algebraically identical
+//           to integrating eps itself, but with no quadrature drift on the
+//           already-causal part -- which is what makes the stage idempotent
+//           and keeps causal nodes bit-identical).
+//        d. Write log10(eps_env*c^2 + energy_shift) into "logenergy" iff
+//           the envelope actually bound somewhere on the traced stretch AND
+//           eps_env < eps_orig AND the result is finite and above the
+//           storage shift. Otherwise the node keeps its bits exactly.
+//   8. Restore monotonicity: re-run the per-column pipeline (steps 0-1) on
+//      every (irho, kYe) column the projection touched, exactly as step 2d
+//      does for the 3D stage.
+//   9. Loop: re-audit and repeat, up to options.causal_rounds_max rounds,
+//      tracking the best (lowest c_s^2 violation count) state seen and
+//      giving up early -- reverting to that best state -- after 4
+//      consecutive rounds fail to beat it, exactly as step 2 does.
+//  10. Verification + lexicographic backstop: one final (4,4,4) audit of
+//      c_s^2, plus (4,4,4) fu-monotonicity counts of both fields. The kept
+//      state must satisfy, in order, (a) monotonicity counts no worse than
+//      the pre-stage state's -- never trade the T-solve's hard requirement
+//      for causality -- and (b) a c_s^2 count no worse than the pre-stage
+//      state's. If either fails, "logenergy" reverts to exactly its
+//      pre-stage bytes and CausalCapSummary::reverted is set.
+//
 // Final write-back, per field: a RepairEntry for every index whose value
-// after *all* stages above (per-column, then 3D if it ran) differs from the
-// original input value (exact bitwise != -- always computed against the
+// after *all* stages above (per-column, then 3D if it ran, then causal-cap
+// if it ran) differs from the original input value (exact bitwise != -- always computed against the
 // pre-repair original, not incrementally against an intermediate stage's
 // output, so the log stays meaningful across every round of every stage),
 // in the fixed order documented on RepairResult::entries. Indices that never
@@ -371,11 +616,26 @@ struct RepairResult {
 // residual pathologies as something to measure and report, not something
 // this stage promises to eliminate in one pass.
 //
+// The causal-cap stage is idempotent under the same conditions plus its own
+// write condition: whenever a first run left CausalCapSummary::
+// violations_after == 0, the next run's very first (cheaper) main-loop
+// audit is guaranteed clean too (refine3d_xy divides the verification's
+// fixed refine of 4 for the documented default refine3d_xy = 2, so every
+// main-loop sample is also a verification sample), so the loop exits before
+// projecting anything. Even where the audit does find something, a node
+// whose traced stretch is already causal is left bit-identical: the deficit
+// formulation of step 7c makes the projection an exact no-op there rather
+// than a roundoff-level rewrite.
+//
 // Throws std::runtime_error if a listed field is missing from `table` or
 // contains a non-finite value (checked for every listed field before any
 // field is modified, so a throw leaves `table` untouched), and
 // std::invalid_argument if a listed field name has no known minimum slope
-// (only "entropy" and "logenergy" do).
+// (only "entropy" and "logenergy" do) or if options.causal_cap is on without
+// 0 < options.cs2_cap < options.cs2_max (the cap must be a physical sound
+// speed strictly below the audit threshold, or the hysteresis that converges
+// the refit ringing does not exist). Both are checked before any field is
+// modified.
 RepairResult repair_table(RawTable &table, const RepairOptions &options = RepairOptions());
 
 // The per-column algorithm, exposed for unit testing: L2 isotonic
@@ -388,5 +648,47 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options = Repair
 // output is already non-decreasing -- so repair_column(col, 0.0) isolates
 // the pure PAVA result for testing.
 void repair_column(std::vector<double> &col, double min_slope);
+
+// Result of causal_envelope() below.
+struct CausalEnvelope {
+  // The projected dimensionless eps at the node. Bitwise equal to the
+  // caller's eps_node whenever `bound` is false.
+  double eps_node = 0.0;
+  // Whether the Lipschitz envelope actually bound anywhere on the stretch
+  // (i.e. whether the original h exceeded the cap's growth on some step).
+  // The causal-cap stage writes a node only when this is true.
+  bool bound = false;
+  // False if a step was ill-posed (a non-positive or non-finite h);
+  // eps_node is then meaningless and the stage gives up on the node.
+  bool ok = false;
+};
+
+// The causal-cap stage's edit primitive on one already-traced stretch of an
+// adiabat, exposed for unit testing (eos-causality-repair.md S3).
+//
+// `h` holds the ORIGINAL specific enthalpy h = 1 + eps + deps/dx|_s sampled
+// along the adiabat at uniform steps `delta` > 0 in x = ln rho, ordered
+// DOWNWARD from the node: h[0] is the node itself, h.back() the causal
+// anchor. `eps_node` is the node's own (exact, stored) dimensionless eps.
+//
+// The one-sided Lipschitz envelope h_env(x+delta) = min(h_orig(x+delta),
+// h_env(x) e^{cs2_cap*delta}) is imposed marching up from the anchor, and
+// the energy-consistency ODE deps/dx = h - 1 - eps is integrated alongside
+// it -- in the deficit form D = eps_orig - eps_env, D(anchor) = 0, dD/dx =
+// (h_orig - h_env) - D -- with exact integrating-factor steps that treat h
+// as exponential on each step. On a stretch where the envelope binds
+// throughout with a purely exponential h_orig, the result is *exactly* the
+// closed form of eos-causality-repair.md S3,
+//
+//   eps(x) = (eps_a + 1) e^{-dx} - 1 + h_a (e^{cs2_cap*dx} - e^{-dx})
+//                                          / (1 + cs2_cap),
+//
+// to roundoff (the per-step recursion telescopes algebraically). On a
+// stretch where it never binds the result is eps_node unchanged, bitwise.
+//
+// A stretch of length 0 or 1 (nothing above the anchor) returns eps_node
+// with bound == false. Throws nothing.
+CausalEnvelope causal_envelope(const std::vector<double> &h, double eps_node, double cs2_cap,
+                                double delta);
 
 } // namespace eeos

@@ -8,9 +8,11 @@
 // that.
 //
 //   eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]
-//              [--no-spline-safe] [--no-spline-safe-3d] [--log FILE]
+//              [--no-spline-safe] [--no-spline-safe-3d]
+//              [--no-causal-cap] [--cs2-cap X] [--log FILE]
 //   eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]
 //              [--no-spline-safe] [--no-spline-safe-3d]
+//              [--no-causal-cap] [--cs2-cap X]
 //
 // Exit codes: 0 = already clean, 1 = repaired (or would repair, under
 // --check-only), 2 = fatal structural problem or other runtime error,
@@ -38,9 +40,11 @@ const char *const kToolVersion = "entropy_eos eos_repair 0.1";
 void print_usage(std::ostream &os) {
   os << "usage:\n"
         "  eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]\n"
-        "             [--no-spline-safe] [--no-spline-safe-3d] [--log FILE]\n"
+        "             [--no-spline-safe] [--no-spline-safe-3d]\n"
+        "             [--no-causal-cap] [--cs2-cap X] [--log FILE]\n"
         "  eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]\n"
         "             [--no-spline-safe] [--no-spline-safe-3d]\n"
+        "             [--no-causal-cap] [--cs2-cap X]\n"
         "\n"
         "Repairs a stellarcollapse-format EOS table so that \"entropy\" and\n"
         "\"logenergy\" are strictly monotone increasing in temperature at every\n"
@@ -58,10 +62,20 @@ void print_usage(std::ostream &os) {
         "\"open decision 4\") that fits the *whole* field as one tensor-product\n"
         "spline and fixes cross-column violations (two neighboring columns\n"
         "individually monotone but blending non-monotone between them) that no\n"
-        "per-column repair can see, let alone fix. Structural problems (bad\n"
-        "axes, non-finite values, missing required fields or attributes) are\n"
-        "fatal and are never repaired -- they indicate a broken file, not\n"
-        "physics noise.\n"
+        "per-column repair can see, let alone fix. Finally -- unless\n"
+        "--no-causal-cap -- the causal-cap stage (M3f,\n"
+        "eos-causality-repair.md), which enforces the other hard requirement\n"
+        "of eos-adapter-F-to-U.md S8: causality, 0 < c_s^2 < 1, of the\n"
+        "potential U the adapter builds from those same two splines. It audits\n"
+        "c_s^2 on a refined grid through the analytic chain rule and, wherever\n"
+        "it finds a violation run reaching the rho_max edge, projects\n"
+        "\"logenergy\" (only) onto the causal Lipschitz envelope along adiabats\n"
+        "-- a logged physics edit to a region that is already unphysical by the\n"
+        "table's own stored cs2 column, exactly like the monotonicity repair.\n"
+        "Interior violation spikes (the sigma_T pockets) and c_s^2 <= 0 samples\n"
+        "are reported, never edited. Structural problems (bad axes, non-finite\n"
+        "values, missing required fields or attributes) are fatal and are never\n"
+        "repaired -- they indicate a broken file, not physics noise.\n"
         "\n"
         "positional arguments:\n"
         "  IN.h5               input table (stellarcollapse.org / O'Connor-Ott\n"
@@ -81,6 +95,16 @@ void print_usage(std::ostream &os) {
         "  --no-spline-safe-3d skip the tensor-product 3D spline-safe stage\n"
         "                      (RepairOptions::spline_safe_3d = false). On by\n"
         "                      default.\n"
+        "  --no-causal-cap     skip the causal-cap stage\n"
+        "                      (RepairOptions::causal_cap = false); the table's\n"
+        "                      acausal high-density corner then passes through\n"
+        "                      unchanged. On by default.\n"
+        "  --cs2-cap X         target slope of the causality projection, in\n"
+        "                      units of c^2 (RepairOptions::cs2_cap; default\n"
+        "                      0.99 -- deliberately below the audit threshold\n"
+        "                      cs2_max = 1.0, so the gap absorbs refit ringing\n"
+        "                      and leaves the con2prim Newton some 1 - c_s^2\n"
+        "                      conditioning headroom)\n"
         "  --log FILE          write a human-readable repair log to FILE (not\n"
         "                      valid together with --check-only)\n"
         "  -h, --help          print this message\n"
@@ -100,6 +124,9 @@ struct ParsedArgs {
   double min_slope_loge = 0.0;
   bool no_spline_safe = false;
   bool no_spline_safe_3d = false;
+  bool no_causal_cap = false;
+  bool have_cs2_cap = false;
+  double cs2_cap = 0.0;
   bool have_log = false;
   std::string log_path;
   std::vector<std::string> positionals;
@@ -149,6 +176,28 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
       out.no_spline_safe = true;
     } else if (a == "--no-spline-safe-3d") {
       out.no_spline_safe_3d = true;
+    } else if (a == "--no-causal-cap") {
+      out.no_causal_cap = true;
+    } else if (a == "--cs2-cap") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_repair: option '--cs2-cap' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.cs2_cap = std::stod(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_repair: invalid number for --cs2-cap: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (!(out.cs2_cap > 0.0) || !(out.cs2_cap < 1.0)) {
+        std::cerr << "eos_repair: --cs2-cap must lie strictly between 0 and 1, got '" << args[i]
+                  << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_cs2_cap = true;
     } else if (a == "--log") {
       if (i + 1 >= args.size()) {
         std::cerr << "eos_repair: option '--log' requires a value\n\n";
@@ -218,6 +267,12 @@ void write_log(const std::string &log_path, const std::string &in_path, const st
   log << "min_slope_logenergy: " << options.min_slope_logenergy << "\n";
   log << "spline_safe:         " << (options.spline_safe ? "on" : "off") << "\n";
   log << "spline_safe_3d:      " << (options.spline_safe_3d ? "on" : "off") << "\n";
+  log << "causal_cap:          " << (options.causal_cap ? "on" : "off") << "\n";
+  log << "cs2_max:             " << options.cs2_max << "\n";
+  log << "cs2_cap:             " << options.cs2_cap << "\n";
+  log << "causal_rounds_max:   " << options.causal_rounds_max << "\n";
+  log << "trace_depth_max:     " << options.trace_depth_max << "\n";
+  log << "anchor_pad:          " << options.anchor_pad << "\n";
   log << "timestamp:           " << std::put_time(&now_tm, "%Y-%m-%dT%H:%M:%SZ") << "\n";
   log << "\n";
 
@@ -251,6 +306,22 @@ void print_rounds3d_progress(std::ostream &os, const eeos::RepairResult &result)
     }
     os << "\n";
   }
+}
+
+// The same per-round progress line for the M3f causal-cap stage (repair.hpp:
+// the library stays quiet, the tool prints): every main-loop round's c_s^2
+// violation *sample* count in order, then the final (4,4,4) verification's
+// own count as the last entry.
+void print_causal_cap_progress(std::ostream &os, const eeos::RepairResult &result) {
+  const eeos::RepairResult::CausalCapSummary &c = result.causal_cap;
+  if (c.rounds_violation_history.empty()) {
+    return;
+  }
+  os << "causal-cap:";
+  for (size_t r = 0; r + 1 < c.rounds_violation_history.size(); ++r) {
+    os << " round" << (r + 1) << "_violations=" << c.rounds_violation_history[r];
+  }
+  os << " verify444_violations=" << c.rounds_violation_history.back() << "\n";
 }
 
 } // namespace
@@ -296,9 +367,16 @@ int main(int argc, char **argv) {
     if (pa.no_spline_safe_3d) {
       repair_opts.spline_safe_3d = false;
     }
+    if (pa.no_causal_cap) {
+      repair_opts.causal_cap = false;
+    }
+    if (pa.have_cs2_cap) {
+      repair_opts.cs2_cap = pa.cs2_cap;
+    }
 
     eeos::RepairResult result = eeos::repair_table(table, repair_opts);
     print_rounds3d_progress(std::cout, result);
+    print_causal_cap_progress(std::cout, result);
 
     if (pa.check_only) {
       std::cout << "eos_repair --check-only: "

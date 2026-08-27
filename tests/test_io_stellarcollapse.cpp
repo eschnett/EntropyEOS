@@ -470,6 +470,59 @@ TEST_CASE("append_repair_group: writes group contents and attributes correctly")
   CHECK(read_string_attr(group.get(), "input_path") == "some_input.h5");
   CHECK(read_uint64_attr(group.get(), "input_fnv1a") == fake_fnv1a);
   CHECK(read_uint64_attr(group.get(), "n_modified") == 2);
+
+  // M3f causal-cap parameters and headline outcome (see append_repair_group()'s
+  // doc comment): every option that can change what the repair did is recorded,
+  // so a repaired table carries the settings its acausal corner was projected
+  // under.
+  CHECK(read_uint64_attr(group.get(), "causal_cap") == (options.causal_cap ? 1u : 0u));
+  CHECK(read_double_attr(group.get(), "cs2_max") == options.cs2_max);
+  CHECK(read_double_attr(group.get(), "cs2_cap") == options.cs2_cap);
+  CHECK(read_uint64_attr(group.get(), "causal_rounds_max") ==
+        static_cast<std::uint64_t>(options.causal_rounds_max));
+  CHECK(read_uint64_attr(group.get(), "trace_depth_max") ==
+        static_cast<std::uint64_t>(options.trace_depth_max));
+  CHECK(read_uint64_attr(group.get(), "anchor_pad") ==
+        static_cast<std::uint64_t>(options.anchor_pad));
+  CHECK(read_uint64_attr(group.get(), "causal_nodes_capped") == 0);
+  CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_before") == 0);
+  CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_after") == 0);
+  CHECK(read_uint64_attr(group.get(), "causal_reverted") == 0);
+}
+
+TEST_CASE("append_repair_group: records a non-default causal-cap outcome") {
+  SyntheticOptions opts;
+  opts.nrho = 3;
+  opts.ntemp = 3;
+  opts.nye = 2;
+  RawTable t = eeos::make_synthetic_table(opts);
+  const std::string path = scratch_path("repair_group_causal.h5");
+  eeos::write_stellarcollapse(path, t);
+
+  RepairResult result;
+  result.causal_cap.ran = true;
+  result.causal_cap.reverted = true;
+  result.causal_cap.nodes_capped = 12345;
+  result.causal_cap.violations_before = 999;
+  result.causal_cap.violations_after = 999;
+
+  RepairOptions options;
+  options.cs2_cap = 0.95;
+  options.anchor_pad = 3;
+
+  eeos::append_repair_group(path, result, options, "in.h5", 7ULL, "eos_repair-test");
+
+  H5Guard file(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
+  REQUIRE(file.valid());
+  H5Guard group(H5Gopen(file.get(), "repair", H5P_DEFAULT), H5Gclose);
+  REQUIRE(group.valid());
+
+  CHECK(read_double_attr(group.get(), "cs2_cap") == 0.95);
+  CHECK(read_uint64_attr(group.get(), "anchor_pad") == 3);
+  CHECK(read_uint64_attr(group.get(), "causal_nodes_capped") == 12345);
+  CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_before") == 999);
+  CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_after") == 999);
+  CHECK(read_uint64_attr(group.get(), "causal_reverted") == 1);
 }
 
 TEST_CASE("append_repair_group: empty result writes n_modified=0 and no entry datasets") {

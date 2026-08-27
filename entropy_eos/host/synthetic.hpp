@@ -65,6 +65,35 @@ struct OffsetDefect {
   double offset = 0.0;
 };
 
+// Adds a smooth power-law stiffening term to the *physical* specific energy:
+//
+//   eps_cgs(rho,T,Ye) += amplitude * (rho / rho_c_gcc)^alpha        [erg/g]
+//
+// applied at every grid point (no cutoff and no blending -- for alpha > 0 the
+// term falls off as rho^-alpha, so it becomes negligible well below rho_c and
+// eventually drops below the last bit of eps + energy_shift entirely, which
+// makes "above rho_c" automatic while the added function stays analytic in
+// rho and exactly independent of T and Ye). The field must be stored as
+// log10(eps + energy_shift) (i.e.
+// "logenergy"): the term is added to 10^value and the result re-logged, which
+// is the same as adding it to eps since energy_shift is a constant.
+//
+// Purpose: mimic a stiff high-density corner. Since eps then grows like
+// rho^alpha along every adiabat, c_s^2 = (eps_x + eps_xx)/h -> (alpha +
+// alpha^2) eps / h at the top of the rho axis, which exceeds 1 -- i.e. the
+// constructed U is superluminal -- once eps (in units of c^2) passes roughly
+// 1/(alpha^2 - 1), for every T and Ye at once. That is the shape of the real
+// LS220/SRO acausal corner (eos-causality-repair.md S2) and what the repair's
+// causal-cap stage is built to fix. Being exactly T-independent, the term
+// also leaves monotonicity in T untouched, so it exercises the causal-cap
+// stage without perturbing the two monotonicity stages.
+struct StiffenDefect {
+  std::string field;
+  double rho_c_gcc = 1.0;
+  double alpha = 0.0;
+  double amplitude = 0.0; // erg/g; the term's value exactly at rho = rho_c_gcc
+};
+
 // Sets the stored value of `field` at grid index (irho, jT, kYe) outright
 // (replacing it, not adding to it). Unlike SeededViolation's additive delta,
 // this can plant Inf/NaN cleanly -- used to mimic real tables' occasional
@@ -120,6 +149,7 @@ struct SyntheticOptions {
   std::vector<FlattenDefect> flatten;
   std::vector<WiggleDefect> wiggle;
   std::vector<OffsetDefect> offset;
+  std::vector<StiffenDefect> stiffen;
   std::vector<SeededViolation> seed;
   std::vector<SetValue> setvalue;
 };
@@ -173,14 +203,16 @@ double synthetic_cs2(double rho_gcc, double temp_MeV, double ye, const Synthetic
 //   1. opts.flatten  (plateaus)
 //   2. opts.wiggle    (oscillatory perturbation)
 //   3. opts.offset    (constant shift)
-//   4. opts.seed      (existing per-point additive violations)
-//   5. opts.setvalue  (outright sets, last, so a planted Inf/NaN cannot be
+//   4. opts.stiffen   (smooth high-density power-law energy excess)
+//   5. opts.seed      (existing per-point additive violations)
+//   6. opts.setvalue  (outright sets, last, so a planted Inf/NaN cannot be
 //                       perturbed by any earlier or later step)
 // Every FlattenDefect/WiggleDefect/OffsetDefect/SetValue index (and, for the
 // block defects, irho0<=irho1, kYe0<=kYe1, jT0<=jT1) is validated against
 // the table's actual grid size; an out-of-range index throws
 // std::out_of_range (as does naming a field the table does not have, via
-// RawTable::field()). All defects are deterministic -- no RNG anywhere.
+// RawTable::field()). A StiffenDefect with a non-positive rho_c_gcc throws
+// std::invalid_argument. All defects are deterministic -- no RNG anywhere.
 RawTable make_synthetic_table(const SyntheticOptions &opts = SyntheticOptions());
 
 // Default grid (40 x 30 x 10), with opts.with_aux_fields = true and a fixed
@@ -194,6 +226,9 @@ RawTable make_synthetic_table(const SyntheticOptions &opts = SyntheticOptions())
 //   - a "entropy" OffsetDefect at the low-rho/low-T/low-Ye corner, driving
 //     that whole block negative (mimics SRO's slightly negative cold-corner
 //     entropies);
+//   - a "logenergy" StiffenDefect making the top rho cells superluminal at
+//     every T and Ye (mimics the LS220/SRO acausal high-density corner --
+//     eos-causality-repair.md S2 -- and exercises repair's causal-cap stage);
 //   - "cs2"/"gamma" SetValue defects planting Inf/NaN (mimics LS220's
 //     handful of non-finite cs2/gamma points).
 SyntheticOptions dirty_synthetic_options();

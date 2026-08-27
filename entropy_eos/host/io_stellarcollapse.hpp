@@ -103,9 +103,14 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //     n_modified == 0;
 //   - scalar attributes on the /repair group (always written): the two
 //     min-slope options used ("min_slope_entropy"/"min_slope_logenergy",
-//     double), "tool_version"/"input_path" (fixed-length string datasets --
-//     sic, see the .cpp: HDF5 *attributes* here, not top-level datasets),
-//     "input_fnv1a" (uint64_t) and "n_modified" (uint64_t).
+//     double), the M3f causal-cap stage's parameters and headline outcome
+//     ("causal_cap" 0/1, "cs2_max"/"cs2_cap" double, "causal_rounds_max"/
+//     "trace_depth_max"/"anchor_pad" uint64, plus "causal_nodes_capped",
+//     "causal_cs2_violations_before"/"_after" and "causal_reverted" 0/1 --
+//     see RepairResult::CausalCapSummary), "tool_version"/"input_path"
+//     (fixed-length string datasets -- sic, see the .cpp: HDF5 *attributes*
+//     here, not top-level datasets), "input_fnv1a" (uint64_t) and
+//     "n_modified" (uint64_t).
 // Throws std::runtime_error if `path` can't be opened for writing, already
 // has a "/repair" group, or any write fails.
 void append_repair_group(const std::string &path, const RepairResult &result,

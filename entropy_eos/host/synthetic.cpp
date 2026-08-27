@@ -145,7 +145,30 @@ void apply_offset(RawTable &table, const std::vector<OffsetDefect> &defects) {
   }
 }
 
-// Step 5 (last): outright sets, so a planted Inf/NaN cannot be perturbed by
+// Step 4: smooth high-density power-law energy excess (see StiffenDefect).
+// Applied to the stored log10 representation: 10^v + A*(rho/rho_c)^alpha,
+// re-logged. No cutoff -- for alpha > 0 the term is negligible well below
+// rho_c by construction, which is what keeps it analytic in rho.
+void apply_stiffen(RawTable &table, const std::vector<StiffenDefect> &defects) {
+  for (const StiffenDefect &d : defects) {
+    if (!(d.rho_c_gcc > 0.0)) {
+      throw std::invalid_argument("StiffenDefect: rho_c_gcc must be positive, got " +
+                                   std::to_string(d.rho_c_gcc));
+    }
+    std::vector<double> &data = table.field(d.field);
+    for (size_t irho = 0; irho < table.nrho(); ++irho) {
+      const double term = d.amplitude * std::pow(table.rho(irho) / d.rho_c_gcc, d.alpha);
+      for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+        for (size_t jT = 0; jT < table.ntemp(); ++jT) {
+          const size_t idx = table.index(irho, jT, kYe);
+          data[idx] = std::log10(std::pow(10.0, data[idx]) + term);
+        }
+      }
+    }
+  }
+}
+
+// Step 6 (last): outright sets, so a planted Inf/NaN cannot be perturbed by
 // any earlier step (see SetValue).
 void apply_setvalue(RawTable &table, const std::vector<SetValue> &defects) {
   for (const SetValue &v : defects) {
@@ -241,6 +264,7 @@ RawTable make_synthetic_table(const SyntheticOptions &opts) {
   apply_flatten(table, opts.flatten);
   apply_wiggle(table, opts.wiggle);
   apply_offset(table, opts.offset);
+  apply_stiffen(table, opts.stiffen);
   for (const SeededViolation &v : opts.seed) {
     table.field(v.field)[table.index(v.irho, v.jT, v.kYe)] += v.delta;
   }
@@ -272,6 +296,26 @@ SyntheticOptions dirty_synthetic_options() {
   // round number) is chosen with that margin in mind so every entry in the
   // block lands below zero.
   opts.offset.push_back(OffsetDefect{"entropy", 0, 3, 0, 2, 0, 2, -50.0});
+
+  // Mimics the LS220/SRO acausal high-density corner (eos-causality-repair.md
+  // S2): a smooth rho^2 energy excess that makes the *constructed* U
+  // superluminal over the top two rho layers at EVERY T and Ye, while leaving
+  // monotonicity in T (which it does not depend on) untouched. Numbers set on
+  // the default grid (rho 1e5..1e15 over 40 cells): at rho = 1e15 the term is
+  // 1.35e17 * (100)^2 = 1.35e21 erg/g, i.e. ~1.5 c^2, giving c_s^2 up to
+  // ~1.63 at the top two nodes and comfortably causal values below them.
+  //
+  // The default grid's rho axis is coarse for this defect on purpose --
+  // 0.256 dex per cell, so a capped profile (ln h growing at cs2_cap per
+  // unit ln rho) advances 0.585 per cell and a cubic spline's second
+  // derivative, which is what c_s^2 is built from, carries an O((0.585)^2/12)
+  // ~ 3% error there, larger than the 1% cs2_max/cs2_cap hysteresis. The
+  // causal-cap stage therefore collapses this corner's severity (max c_s^2
+  // ~1.63 -> ~1.01) but cannot drive the count to zero on THIS grid; the
+  // dedicated unit test (tests/test_causal_cap.cpp) plants the same defect
+  // on a rho-resolved grid, where the same stage does reach zero. See
+  // tests/integration.sh for the narrative.
+  opts.stiffen.push_back(StiffenDefect{"logenergy", 1e13, 2.0, 1.35e17});
 
   // Mimics LS220's corruption: a few Inf/NaN points in cs2/gamma.
   opts.setvalue.push_back(SetValue{"cs2", 20, 15, 5, std::numeric_limits<double>::infinity()});

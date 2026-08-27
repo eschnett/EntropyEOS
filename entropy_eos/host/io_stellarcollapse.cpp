@@ -613,6 +613,24 @@ void append_repair_group(const std::string &path, const RepairResult &result,
 
   write_attr_double(group.get(), "min_slope_entropy", options.min_slope_entropy);
   write_attr_double(group.get(), "min_slope_logenergy", options.min_slope_logenergy);
+  // M3f causal-cap parameters (eos-causality-repair.md S5): recorded like
+  // every other option that can change what the repair did, so a repaired
+  // table carries the settings its acausal corner was projected under.
+  write_attr_uint64(group.get(), "causal_cap", options.causal_cap ? 1u : 0u);
+  write_attr_double(group.get(), "cs2_max", options.cs2_max);
+  write_attr_double(group.get(), "cs2_cap", options.cs2_cap);
+  write_attr_uint64(group.get(), "causal_rounds_max",
+                     static_cast<std::uint64_t>(options.causal_rounds_max));
+  write_attr_uint64(group.get(), "trace_depth_max",
+                     static_cast<std::uint64_t>(options.trace_depth_max));
+  write_attr_uint64(group.get(), "anchor_pad", static_cast<std::uint64_t>(options.anchor_pad));
+  write_attr_uint64(group.get(), "causal_nodes_capped",
+                     static_cast<std::uint64_t>(result.causal_cap.nodes_capped));
+  write_attr_uint64(group.get(), "causal_cs2_violations_before",
+                     static_cast<std::uint64_t>(result.causal_cap.violations_before));
+  write_attr_uint64(group.get(), "causal_cs2_violations_after",
+                     static_cast<std::uint64_t>(result.causal_cap.violations_after));
+  write_attr_uint64(group.get(), "causal_reverted", result.causal_cap.reverted ? 1u : 0u);
   write_attr_string(group.get(), "tool_version", tool_version);
   write_attr_string(group.get(), "input_path", input_path);
   write_attr_uint64(group.get(), "input_fnv1a", static_cast<std::uint64_t>(input_fnv1a));

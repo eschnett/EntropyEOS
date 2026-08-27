@@ -54,7 +54,7 @@ EntropyEOS/
       units.hpp/.cpp           #   constants, unit conversions, m_B conventions, κ
       synthetic.hpp/.cpp       #   manufactured analytic EOS → RawTable (ground truth)
       check.hpp/.cpp           #   table-level diagnostics, library-first (see test harness)
-      repair.hpp/.cpp          #   isotonic repair + change log (see repair harness)
+      repair.hpp/.cpp          #   isotonic + spline-safe + causal-cap repair, change log
       bspline_fit.hpp/.cpp     #   B-spline coefficient fitting (banded solves)  (M2)
       adapter_build.hpp/.cpp   #   RawTable → EntropyEOS (fit, extend, κ, audits) (M2)
       io_stellarcollapse.hpp/.cpp  # the only files including hdf5.h
@@ -115,12 +115,15 @@ Rules that keep the CUDA port honest:
 ## Repair harness — `tools/eos_repair` (M1)
 
 ```
-eos_repair in.h5 out.h5 [--check-only] [--min-slope-s X] [--min-slope-loge X] [--log FILE]
+eos_repair in.h5 out.h5 [--check-only] [--min-slope-s X] [--min-slope-loge X]
+           [--no-spline-safe] [--no-spline-safe-3d] [--no-causal-cap] [--cs2-cap X]
+           [--log FILE]
 ```
 
 Purpose: make a table satisfy the hard requirements of `eos-adapter-F-to-U.md` §8 —
-above all strict monotonicity in T of entropy and energy at every (ρ, Ye) — and leave an
-auditable trail. Design points:
+above all strict monotonicity in T of entropy and energy at every (ρ, Ye), and (M3f)
+causality `0 < c_s² < 1` of the constructed potential — and leave an auditable trail.
+Design points:
 
 - **Repairs act on the stored variables** (`entropy`, `logenergy`) directly:
   monotonicity of `logenergy` in T is equivalent to monotonicity of ε (log is monotone,
@@ -130,6 +133,18 @@ auditable trail. Design points:
   separately, then a strictification pass imposing the minimum slopes (PAVA leaves flat
   runs; the adapter needs strictly positive σ_T, e_T). Min-slope defaults are still open:
   tune on real LS220 violations first.
+- **Causality (M3f, `eos-causality-repair.md`)**: a final stage, on by default
+  (`--no-causal-cap` opts out), audits `c_s²` of the *fitted* entropy/logenergy splines
+  on the refined grid via the analytic chain rule (κ-free, m_B-free — only `c²` and
+  `energy_shift` enter, so auditing the raw-variable fit *is* auditing the adapter's
+  interior) and, for violation runs that reach the ρ_max edge, projects `logenergy`
+  (only) onto the causal Lipschitz envelope along adiabats: trace each node's adiabat
+  down to a causal anchor, cap `∂ln h/∂x|_s` at `cs2_cap = 0.99`, integrate the
+  energy-consistency ODE back up, write only where ε drops. Interior violation runs (the
+  σ_T pockets) and `c_s² ≤ 0` samples are reported, never edited. The stage carries the
+  M2d-1 harness verbatim (audit-driven rounds, per-column re-repair of touched columns,
+  best-state tracking) plus a *lexicographic* backstop: the kept state's (4,4,4)
+  monotonicity counts must not regress, else the whole stage reverts.
 - Structural problems are *fatal*, not repaired — they indicate a broken file, not
   physics noise. Fatal means: non-monotone/non-finite axes, missing `energy_shift`, or
   a missing or non-finite **interpreted** field (`logenergy`, `entropy`). Non-finite
@@ -180,9 +195,11 @@ violations must be found and repaired). This makes M1 fully testable without any
 table and without con2prim. A deterministic **dirty preset**
 (`eos_test --synthetic-dirty`) additionally fabricates the pathology patterns observed
 in the real tables — clustered non-monotone entropy across a T-window (LS220's nuclear
-transition), flat logenergy plateaus (SRO), a negative-entropy cold corner (SRO), and
-planted Inf/NaN in auxiliary fields (LS220's cs2/gamma) — so the full
-detect → repair → residual-classes-persist narrative runs in CI.
+transition), flat logenergy plateaus (SRO), a negative-entropy cold corner (SRO), a
+smooth `ρ²` energy excess making the constructed `U` superluminal over the top two ρ
+layers at every (T, Ye) (the M3f acausal corner), and planted Inf/NaN in auxiliary
+fields (LS220's cs2/gamma) — so the full detect → repair → residual-classes-persist
+narrative runs in CI.
 
 **Real tables are local-only.** CI never downloads or stores the LS220/SRO files
 (~1 GB; Git LFS quotas and stellarcollapse.org bandwidth both rule it out);
@@ -260,6 +277,67 @@ and OpenMP builds).
   (second run: zero changes). The adversarial synthetic wiggle defect does not reach a
   single-run fixed point and is documented as such in integration.sh.
 
+**M3f empirical findings — causal-cap outcome** (`eos-causality-repair.md`, measured
+2026-08-27 on the two local tables; "nodes" are the fitted `c_s²` evaluated at table
+nodes, "samples" are the stage's own (4,4,4) refined audit):
+
+- **The systematic acausal corner is gone.** LS220-2009: acausal nodes
+  **67,107 (4.2%) → 206 (0.013%)**, and the structure that motivated the stage — 6,792
+  (T, Ye) columns whose acausal set is a contiguous suffix reaching ρ_max — goes to
+  **0 columns**. SRO-LS220: **182,269 (4.3%) → 575 (0.014%)**. Refined samples:
+  4,076,091 → 7,622 (LS220), 11,188,863 → 21,283 (SRO). Cost: 24 s (LS220) / 76 s (SRO)
+  for the whole `eos_repair` run, serial; 11 s for LS220 on 8 OpenMP threads.
+- **What the residual is.** 98.8% (LS220) / 99.5% (SRO) of the remaining refined
+  violations sit in *interior* runs — the σ_T-pocket spikes the stage reports and never
+  edits, exactly as scoped. Of the residual nodes, LS220's 9 and SRO's 194 (172 of them
+  the known full-T sliver at irho 311–312, Ye = 0.645) are those documented pockets; the
+  rest (197 LS220 / 381 SRO) are a small new residue at the *joint* ρ_max/T_max corner
+  (LS220 irho 226–233 × jT 132–135, i.e. T ≳ 200 MeV; SRO irho 377–390 × jT 159–162),
+  where after capping the violating run no longer reaches the ρ_max edge sample and so
+  falls outside the edge-anchored scoping rule. `c_s² ≤ 0` counts are untouched
+  (LS220 12,022 → 12,022; SRO 6,197 → 6,197 for the in-box fit), i.e. the stage creates
+  no new defect of that class.
+- **Nothing was traded for it.** Only `logenergy` is edited (66,419 / 182,210 nodes;
+  max |Δ log₁₀(ε+Δ)| = 0.081 / 0.085, rms 0.036 / 0.032); `entropy` gains no entry.
+  (4,4,4) `L_u` monotonicity: LS220 20,650 → 20,650 (unchanged), SRO 221,537 → 219,886
+  (improved); `σ_u` untouched by construction. Both tables stay **idempotent** (a second
+  `eos_repair --check-only` reports 0 changes, exit 0), and the output is bit-identical
+  across 1/4/8 OpenMP threads.
+- **Independent confirmation, via the adapter audit.** `eos_test --level adapter` class C
+  `cs2_acausal`: LS220 **7,364 → 132** (worst excess over 1 falls 0.328 → 0.023), SRO
+  **7,639 → 135** (0.333 → 0.016). The plain in-box fit and the adapter's own extended
+  build agree node for node, so the residual is real data, not an extension artifact.
+- **`cs2_cap` sits on a knife edge (open item).** At the approved default 0.99 the stage
+  is kept. At **0.95** it does much better — LS220 residual nodes 206 → **16** (the 9
+  pockets + 7 at irho 233), refined 7,622 → 248 — and is still kept. At **0.97 or 0.90
+  the lexicographic backstop reverts the entire stage**: those projected states would
+  have had 840 / 13,461 refined violations (far better than 0.99's 7,622) but `L_u`
+  monotonicity counts of 20,652 / 20,683 against the 20,650 baseline. A *2-sample*
+  monotonicity regression out of 20,650 therefore discards a ~5,000× causality
+  improvement. That is the design's rule working as written (never trade the T-solve's
+  hard requirement for causality), but it makes the outcome discontinuous in `cs2_cap` —
+  worth revisiting together with the 0.99-vs-0.95 choice.
+- **The M3 acceptance metric did *not* move.** `eos_test --level con2prim` at 40,000
+  states, before → after: LS220 warm failures 87 → 86, cold 18 → 16; SRO warm 162 → 163,
+  cold 32 → 30; `rt_tau` p999/max unchanged on both. So the ~0.2–0.8% failure tail of M3
+  open item (i) is **not** caused by in-box `c_s² ≥ 1`: it survives a 55× reduction of
+  the adapter's causality violations. Remaining candidates for it are the σ_T pockets
+  (which this stage deliberately leaves alone), states outside the physical box where the
+  x_hi extension tail is relaunched from the now-capped boundary values
+  (`eos-causality-repair.md` §9 item 4), and the bracketing/`max_iter` paths themselves.
+  The stage's value is therefore the conditioning argument (`z_w = z(1−c_s²)tanh w`
+  positive in-box, which is what a GPU fixed-iteration path needs) and table validity —
+  not a measured failure-rate win.
+- **Grid resolution is the stage's real limit.** The projection controls ε at *nodes*
+  while `c_s²` is a second derivative of the fitted spline, so on a grid where a capped
+  profile advances `cs2_cap·Δx` per cell the cubic's second-derivative error is
+  ~(cs2_cap·Δx)²/12 relative. Real tables (Δlog₁₀ρ ≈ 0.056) sit at ~0.1%, comfortably
+  inside the 1% `cs2_max`/`cs2_cap` hysteresis; the synthetic dirty preset's 0.256 dex
+  axis sits at ~3% and provably cannot converge, which is why
+  `tests/test_causal_cap.cpp` plants the same defect on a ρ-resolved grid (where the
+  identical stage reaches exactly zero) while `integration.sh` asserts only detection
+  plus reduction on the coarse preset.
+
 ## Milestones
 
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,
@@ -288,8 +366,15 @@ and OpenMP builds).
   throughput ×9; no tuned constants (seed_passes = 3; s-bisection cap 16, 8 suffices
   for a GPU fixed-trip count). Known open items: (i) the shared ~0.2–0.8% failure
   tail confined to the hot-edge/high-w acausal-cs² corner (beyond table validity —
-  §11 invalid-state policy territory); (ii) the RePrimAnd benchmark (external
-  library build — decide separately).
+  §11 invalid-state policy territory) — **M3f now rules out in-box `c_s² ≥ 1` as its
+  cause**: the tail is unchanged after the acausal corner is repaired away (see the M3f
+  findings above), so it is still open, with different suspects; (ii) the RePrimAnd
+  benchmark (external library build — decide separately).
+- **M3f:** ✅ complete — the causal-cap repair stage of `eos-causality-repair.md`
+  (`RepairOptions::causal_cap`, on by default; `eos_repair --no-causal-cap` / `--cs2-cap
+  X`), which makes the *data* causal before the fit rather than clamping `c_s²` at run
+  time (a clamped `cs2` would correspond to no single potential `U` and would silently
+  break the Newton's identities). Measured outcome above.
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
   fixed-iteration evaluate/con2prim variants.
 
@@ -310,3 +395,8 @@ and OpenMP builds).
    con2prim (M3) guards against them (flags, fallback), and shape-constrained
    monotone tensor fitting is deferred unless M3 testing shows actual recovery
    failures.
+5. ~~Whether the acausal high-density corner is repairable in the data~~ — resolved by
+   M3f (see the causal-cap outcome above): yes, as a logged physics edit to `logenergy`,
+   with the residual and the `cs2_cap` sensitivity measured. Still open under it: whether
+   the default `cs2_cap = 0.99` should move to 0.95, and whether the lexicographic
+   backstop's "no monotonicity regression at all" rule wants a tolerance.

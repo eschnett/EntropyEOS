@@ -9,8 +9,9 @@
 # (entropy_eos/host/synthetic.hpp's dirty_synthetic_options()) that mirrors
 # pathologies actually found in the real LS220/SRO stellarcollapse tables --
 # a handful of non-finite cs2/gamma points, a clustered non-monotone-T
-# entropy patch, a near-flat logenergy plateau, and slightly negative
-# cold-corner entropies -- so CI (which has no tables/*.h5) still exercises
+# entropy patch, a near-flat logenergy plateau, slightly negative cold-corner
+# entropies, and (M3f) a stiffened high-density corner whose constructed U is
+# superluminal -- so CI (which has no tables/*.h5) still exercises
 # eos_test/eos_repair against them. Part B exercises the two real
 # stellarcollapse-format tables under tables/*.h5 when present on this
 # machine, and is skipped gracefully (not failed) when they are absent.
@@ -67,7 +68,7 @@ fi
 # on the repaired table is expected to still exit 1, and its CSV dump is
 # used below to confirm exactly which classes persist.
 expect_exit 1 "$TEST" --synthetic-dirty --write-synthetic "$T/dirty.h5"
-expect_exit 1 "$REPAIR" "$T/dirty.h5" "$T/dirty_rep.h5"
+expect_exit 1 "$REPAIR" "$T/dirty.h5" "$T/dirty_rep.h5" --log "$T/dirty_repair.log"
 # M2d-1: unlike the base PAVA/strictify + per-column spline-safe stages
 # (both proven idempotent), a *second* eos_repair --check-only here is not
 # exit 0: dirty_synthetic_options()'s "entropy" WiggleDefect (a +-0.5
@@ -96,6 +97,60 @@ if [ -f "$T/dirty_rep_entropy_negative.csv" ] && [ -f "$T/dirty_rep_nonfinite_cs
     "(repair_table() never touches either)"
 else
   echo "FAIL: expected dirty_rep_entropy_negative.csv and dirty_rep_nonfinite_cs2.csv to exist"
+  exit 1
+fi
+
+# 11b (M3f): the causal-cap stage's own narrative on the dirty preset. The
+# preset plants a smooth rho^2 energy excess that makes the *constructed* U
+# superluminal over the top two rho layers at every T and Ye
+# (dirty_synthetic_options()'s StiffenDefect, mimicking the LS220/SRO acausal
+# high-density corner of eos-causality-repair.md S2). What must hold here is
+# (a) the stage ran and detected the corner, (b) it capped nodes, (c) it did
+# not revert, and (d) it did not trade monotonicity for causality. What must
+# NOT be asserted is a zero residual: the default synthetic grid's rho axis is
+# 0.256 dex per cell, coarse enough that the fitted cubic's second derivative
+# -- which is what c_s^2 is built from -- carries a ~3% error on a capped
+# profile, larger than the 1% cs2_max/cs2_cap hysteresis, so the stage
+# collapses the corner's severity but cannot drive the sample count to zero on
+# THIS grid. tests/test_causal_cap.cpp plants the same defect on a
+# rho-resolved grid, where the identical stage does reach zero; the real
+# tables (Part B) are rho-resolved like that one, not like this one.
+cc_line=$(grep -E '^  causal-cap: ' "$T/dirty_repair.log" || true)
+if [ -z "$cc_line" ]; then
+  echo "FAIL: eos_repair log has no causal-cap summary line"
+  exit 1
+fi
+echo "PASS: causal-cap ran on the dirty preset -- $cc_line"
+case "$cc_line" in
+  *REVERTED*)
+    echo "FAIL: the causal-cap stage reverted on the dirty preset (its lexicographic backstop" \
+      "rejected the projection -- see the 'rejected state' line in $T/dirty_repair.log)"
+    exit 1
+    ;;
+esac
+cc_before=$(echo "$cc_line" | sed -E 's/.*cs2_violations ([0-9]+) -> ([0-9]+).*/\1/')
+cc_after=$(echo "$cc_line" | sed -E 's/.*cs2_violations ([0-9]+) -> ([0-9]+).*/\2/')
+cc_nodes=$(echo "$cc_line" | grep -oE 'nodes_capped=[0-9]+' | cut -d= -f2)
+if [ "$cc_before" -gt 0 ] && [ "$cc_after" -lt "$cc_before" ] && [ "${cc_nodes:-0}" -gt 0 ]; then
+  echo "PASS: causal-cap detected and reduced the stiffened corner" \
+    "(cs2 violation samples $cc_before -> $cc_after at (4,4,4), $cc_nodes logenergy nodes capped)"
+else
+  echo "FAIL: causal-cap did not detect/reduce the stiffened corner" \
+    "(before=$cc_before after=$cc_after nodes=$cc_nodes)"
+  exit 1
+fi
+
+# The stage edits "logenergy" only -- "entropy" must never gain an entry from
+# it. The log lists every changed value as "<field> (irho,jT,kYe) old -> new",
+# so a run with the stage off must produce exactly the same entropy entries.
+expect_exit 1 "$REPAIR" "$T/dirty.h5" "$T/dirty_rep_nocap.h5" --no-causal-cap \
+  --log "$T/dirty_repair_nocap.log"
+s_with=$(grep -cE '^entropy \(' "$T/dirty_repair.log" || true)
+s_without=$(grep -cE '^entropy \(' "$T/dirty_repair_nocap.log" || true)
+if [ "$s_with" = "$s_without" ]; then
+  echo "PASS: causal-cap changed no entropy value ($s_with entropy entries with and without it)"
+else
+  echo "FAIL: entropy entries differ with/without --no-causal-cap ($s_with vs $s_without)"
   exit 1
 fi
 
@@ -327,6 +382,40 @@ run_real_table() {
   s_v3d=${s_v3d:-?}
   e_v3d=${e_v3d:-?}
 
+  # M3f causal-cap: the stage's own summary block in the same eos_repair
+  # output ("  causal-cap: rounds_used=... nodes_capped=... cs2_violations A
+  # -> B (4,4,4)" plus its two nested lines). On a real table the acausal
+  # high-density corner is genuine table physics (eos-causality-repair.md S2),
+  # so a large `capped` count and a large drop in `cs2_before -> cs2_after`
+  # are the expected outcome, while the residual is dominated by the interior
+  # sigma_T-pocket spikes the stage reports and never edits.
+  local cc_line cc_scope cc_before cc_after cc_nodes cc_rounds cc_interior cc_nonpos cc_rev
+  cc_line=$( (grep -E '^  causal-cap: ' "$repair_out" || true) | head -1)
+  cc_scope=$( (grep -E '^    causal-cap scope: ' "$repair_out" || true) | head -1)
+  cc_before=$(echo "$cc_line" | sed -nE 's/.*cs2_violations ([0-9]+) -> ([0-9]+).*/\1/p')
+  cc_after=$(echo "$cc_line" | sed -nE 's/.*cs2_violations ([0-9]+) -> ([0-9]+).*/\2/p')
+  cc_nodes=$(echo "$cc_line" | grep -oE 'nodes_capped=[0-9]+' | cut -d= -f2)
+  cc_rounds=$(echo "$cc_line" | grep -oE 'rounds_used=[0-9]+' | cut -d= -f2)
+  cc_interior=$(echo "$cc_scope" | grep -oE 'interior_untouched=[0-9]+' | cut -d= -f2)
+  cc_nonpos=$(echo "$cc_scope" | grep -oE 'cs2_nonpositive=[0-9]+' | cut -d= -f2)
+  case "$cc_line" in *REVERTED*) cc_rev=yes ;; *) cc_rev=no ;; esac
+
+  # The stage's lexicographic backstop guarantees this; check it, since it is
+  # the one causal-cap property that must hold for ANY table a user drops in.
+  if [ -n "$cc_before" ] && [ -n "$cc_after" ] && [ "$cc_after" -gt "$cc_before" ]; then
+    echo "FAIL: causal-cap left $name with MORE cs2 violations than before" \
+      "($cc_before -> $cc_after at (4,4,4)); its backstop should have reverted"
+    exit 1
+  fi
+  echo "PASS: causal-cap $name cs2 violation samples $cc_before -> $cc_after at (4,4,4)" \
+    "(${cc_nodes:-?} logenergy nodes capped, reverted=$cc_rev)"
+  cc_before=${cc_before:-?}
+  cc_after=${cc_after:-?}
+  cc_nodes=${cc_nodes:-?}
+  cc_rounds=${cc_rounds:-?}
+  cc_interior=${cc_interior:-?}
+  cc_nonpos=${cc_nonpos:-?}
+
   # Best-effort extraction of the adapter report's headline numbers
   # (AdapterReport::print()'s "kappa=...", "<class>: count=... max=...",
   # its "  quantiles: p50=... p90=... p99=... p999=... max=..." follow-up
@@ -350,6 +439,17 @@ run_real_table() {
     cut -d= -f2)
   a_sigma_count=$( (grep -E '^spline_sigma_u_nonpositive:' "$adapter_report" || true) |
     grep -oE 'count=[0-9]+' | head -1 | cut -d= -f2)
+  # M3f: the adapter audit's own class C causality map -- the independent
+  # confirmation that eos_repair's causal-cap stage did what its own summary
+  # says (this report is built from the SAME raw table, repaired in memory by
+  # eos_test itself, so the two paths agree only if the stage is reproducible).
+  local a_cs2_count a_cs2_max
+  a_cs2_count=$( (grep -E '^cs2_acausal:' "$adapter_report" || true) | grep -oE 'count=[0-9]+' |
+    head -1 | cut -d= -f2)
+  a_cs2_max=$( (grep -E '^cs2_acausal:' "$adapter_report" || true) | grep -oE 'max=[0-9.eE+-]+' |
+    head -1 | cut -d= -f2)
+  a_cs2_count=${a_cs2_count:-?}
+  a_cs2_max=${a_cs2_max:-?}
   a_maxiter=$( (grep -E '^physicality soak:' "$adapter_report" || true) | grep -oE 'maxiter_count=[0-9]+' |
     head -1 | cut -d= -f2)
   a_evals=$( (grep -E '^physicality soak:' "$adapter_report" || true) | grep -oE 'evals_per_sec=[0-9.eE+-]+' |
@@ -418,9 +518,13 @@ run_real_table() {
   echo "SUMMARY $name: eos_test(raw)=$test_exit eos_repair=$repair_exit" \
     "eos_test(repaired)=$rep_test_exit entropy_repaired=$s_changed logenergy_repaired=$e_changed" \
     "violations3d_remaining_entropy=$s_v3d violations3d_remaining_logenergy=$e_v3d" \
+    "causal_cap_nodes=$cc_nodes causal_cap_rounds=$cc_rounds causal_cap_reverted=$cc_rev" \
+    "cs2_violations_before=$cc_before cs2_violations_after=$cc_after" \
+    "cs2_interior_untouched=$cc_interior cs2_nonpositive=$cc_nonpos" \
     "eos_test(adapter)=$adapter_test_exit kappa=$a_kappa roundtrip_T_count=$a_rt_count" \
     "delta_T_max=$a_dT_max delta_T_p99=$a_dT_p99 delta_p_max=$a_dp_max delta_p_p99=$a_dp_p99" \
-    "sigma_monotonicity_count=$a_sigma_count maxiter_count=$a_maxiter evals_per_sec=$a_evals" \
+    "sigma_monotonicity_count=$a_sigma_count adapter_cs2_acausal=$a_cs2_count" \
+    "adapter_cs2_acausal_max=$a_cs2_max maxiter_count=$a_maxiter evals_per_sec=$a_evals" \
     "eos_test(con2prim)=$con2prim_test_exit c2p_newton=$c_newton c2p_fallback=$c_fallback" \
     "c2p_failed=$c_failed rt_tau_p99=$c_rt_tau_p99 rt_tau_max=$c_rt_tau_max" \
     "solves_per_sec_warm=$c_solves_warm solves_per_sec_cold=$c_solves_cold" \

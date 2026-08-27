@@ -345,7 +345,7 @@ TEST_CASE("dirty_synthetic_options: flatten block is constant along its T-range"
   }
 }
 
-TEST_CASE("dirty_synthetic_options: no defects outside the specified blocks") {
+TEST_CASE("dirty_synthetic_options: no block defect outside the specified blocks") {
   // Same grid and aux fields, but no defects, for a fair bit-for-bit
   // comparison against dirty_synthetic_options()'s table.
   SyntheticOptions clean_opts;
@@ -367,8 +367,11 @@ TEST_CASE("dirty_synthetic_options: no defects outside the specified blocks") {
       {25, 25, 0}, {39, 0, 9}, {0, 29, 9}, {20, 0, 0}, {36, 20, 3}, {5, 20, 9},
   };
 
-  const std::vector<std::string> field_names = {"entropy",   "logenergy", "logpress",
-                                                 "cs2",       "gamma",     "mu_e"};
+  // "logenergy" is excluded here: the preset's StiffenDefect is by design NOT
+  // a block defect -- it adds a smooth A*(rho/rho_c)^alpha term at every grid
+  // point (negligible far below rho_c, dominant above it), so it is checked
+  // by its own test below rather than by a block-exclusion argument.
+  const std::vector<std::string> field_names = {"entropy", "logpress", "cs2", "gamma", "mu_e"};
   for (const std::string &name : field_names) {
     const std::vector<double> &clean_field = clean.field(name);
     const std::vector<double> &dirty_field = dirty.field(name);
@@ -376,5 +379,51 @@ TEST_CASE("dirty_synthetic_options: no defects outside the specified blocks") {
       const size_t idx = clean.index(pt.irho, pt.jT, pt.kYe);
       CHECK(clean_field[idx] == dirty_field[idx]);
     }
+  }
+}
+
+TEST_CASE("dirty_synthetic_options: the stiffened corner adds A*(rho/rho_c)^alpha to eps, "
+          "independent of T and Ye") {
+  // The preset's StiffenDefect: {"logenergy", rho_c = 1e13, alpha = 2,
+  // A = 1.35e17 erg/g} (see synthetic.cpp).
+  const double rho_c = 1e13, alpha = 2.0, amp = 1.35e17;
+
+  SyntheticOptions clean_opts;
+  clean_opts.with_aux_fields = true;
+  RawTable clean = eeos::make_synthetic_table(clean_opts);
+  RawTable dirty = eeos::make_synthetic_table(dirty_synthetic_options());
+  const std::vector<double> &lc = clean.field("logenergy");
+  const std::vector<double> &ld = dirty.field("logenergy");
+
+  // Away from the other defects' blocks (irho >= 20 excludes flatten; kYe = 0
+  // excludes wiggle), the dirty logenergy is exactly the clean one with the
+  // power-law term added to 10^value.
+  for (size_t irho = 20; irho < dirty.nrho(); ++irho) {
+    const double term = amp * std::pow(dirty.rho(irho) / rho_c, alpha);
+    for (size_t jT = 0; jT < dirty.ntemp(); ++jT) {
+      const size_t idx = dirty.index(irho, jT, 0);
+      const double expect = std::log10(std::pow(10.0, lc[idx]) + term);
+      CHECK(ld[idx] == doctest::Approx(expect).epsilon(1e-14));
+    }
+  }
+
+  // Top rho node: the term is ~1.35e21 erg/g, i.e. of order c^2 -- big enough
+  // that the constructed U is superluminal there (the point of the defect).
+  const size_t top = dirty.nrho() - 1;
+  const double top_term = amp * std::pow(dirty.rho(top) / rho_c, alpha);
+  CHECK(top_term > 1e21);
+  CHECK(top_term < 2e21);
+
+  // Far below rho_c the rho^-alpha falloff makes the term negligible: at the
+  // bottom decades of the rho axis it perturbs the stored value by less than
+  // 1e-12 relative, and at the very first nodes not at all (bit-identical).
+  for (size_t irho = 0; irho < 10; ++irho) {
+    for (size_t jT = 20; jT < dirty.ntemp(); ++jT) {
+      const size_t idx = dirty.index(irho, jT, 9);
+      CHECK(std::fabs(ld[idx] - lc[idx]) <= 1e-12 * std::fabs(lc[idx]));
+    }
+  }
+  for (size_t jT = 0; jT < dirty.ntemp(); ++jT) {
+    CHECK(ld[dirty.index(0, jT, 9)] == lc[dirty.index(0, jT, 9)]);
   }
 }
