@@ -206,8 +206,16 @@ TEST_CASE("EntropyEOSView::evaluate: node round trip at every 5th table node") {
         // for the same convention.
         const EOSPoint pt = view.evaluate(kappa * rho, s, ye, nan_guess());
 
+        // Tolerances are cross-platform bounds, not tuned to one host. The
+        // round trip is a spline evaluation plus a Newton T-solve, so its
+        // relative error floor moves with FP contraction and libm: measured
+        // max is ~3.7e-13 (arm64/clang, no FMA contraction here) and
+        // ~1.21e-12 (x86-64/g++ -O2, which contracts FMA by default). 1e-11
+        // clears both with ~8x headroom while staying three orders tighter
+        // than anything the physics needs. A regression that actually
+        // matters moves this by orders of magnitude, not by 3x.
         CHECK(rel_err(pt.T_F_MeV, T_j) <= 1e-10);
-        CHECK(rel_err(pt.U, U_expected) <= 1e-12);
+        CHECK(rel_err(pt.U, U_expected) <= 1e-11);
         ++n_checked;
       }
     }

@@ -34,12 +34,27 @@
 // cover clang's ASan and UBSan explicitly (UBSan defines no analogous
 // GCC-style macro). Any one of the three being set means this test binary
 // was built with SAN=1 (see the Makefile).
-#if defined(__SANITIZE_ADDRESS__) || \
-    (defined(__has_feature) && (__has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)))
-constexpr bool eeos_sanitized = true;
-#else
-constexpr bool eeos_sanitized = false;
+//
+// The __has_feature probes MUST sit inside a nested #if guarded by
+// defined(__has_feature), never alongside it in one `&&` expression: the
+// preprocessor macro-expands the whole controlling expression before it
+// evaluates any operator, so there is no short-circuit to protect the
+// probes. On a compiler without __has_feature (GCC < 14, i.e. CI's g++)
+// the one-line form leaves a bare `__has_feature(address_sanitizer)` in
+// the expression and hard-errors with "missing binary operator before
+// token '('".
+#define EEOS_SANITIZED_BUILD 0
+#if defined(__SANITIZE_ADDRESS__)
+#undef EEOS_SANITIZED_BUILD
+#define EEOS_SANITIZED_BUILD 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#undef EEOS_SANITIZED_BUILD
+#define EEOS_SANITIZED_BUILD 1
 #endif
+#endif
+
+constexpr bool eeos_sanitized = EEOS_SANITIZED_BUILD != 0;
 
 // Returns `sanitized` when built with ASan/UBSan, `full` otherwise. Use this
 // for every knob covered by this header's principle: random-sample counts,
