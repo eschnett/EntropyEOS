@@ -240,10 +240,16 @@ say $\rho$ and mean $\rho^\ast$.
 ## 7. Out-of-bounds handling
 
 Guiding principle: **during iteration, the adapter must always return finite, smooth,
-monotone values — extension plus flag, never a hard clamp** (a clamp zeroes derivatives
-and stalls or misleads Newton). Validity is judged once, on the *converged* state, by the
-con2prim failure policies (parent §11): a converged state carrying an extension flag is
-handled there (clamp-and-flag, atmosphere, or error), not inside the EOS call.
+monotone, causal values — extension plus flag, never a hard clamp** (a clamp zeroes
+derivatives and stalls or misleads Newton). Validity is judged once, on the *converged*
+state, by the con2prim failure policies (parent §11): a converged state carrying an
+extension flag is handled there (clamp-and-flag, atmosphere, or error), not inside the EOS
+call.
+
+("Causal" was added in M3g: the inner $w$-solve's monotonicity proof rests on
+$c_s^2 < 1$, so an acausal *extension* breaks it just as surely as acausal table data
+would. See `eos-causal-tail.md` for the log-$\sigma$ hot tail and the causal slope clamp
+that make the $u$-high extension obey it.)
 
 All extensions live at the **$F$ level** — the splines $\hat L$ and $\sigma$ are extended
 in $(x, u)$ beyond the physical box — so the run-time path (§3) stays uniform and the

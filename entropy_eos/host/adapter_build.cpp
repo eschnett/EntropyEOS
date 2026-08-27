@@ -137,10 +137,17 @@ struct ScanResult {
 // u-low tail can dip eps_hat below the table's own minimum) and why it is
 // safe to run with the *unshifted* x0 (kappa is not yet known at this
 // point in build_entropy_eos()). Only L is needed (eps_hat is purely a
-// function of it); sigma does not participate in the eps floor.
-double scan_extended_eps_floor(const BsplineView3 &L_view, double x0, double hx, int nx, double u0,
-                                double hu, int nu, double y0, double hy, int ny, int refine, int ext_cells,
-                                double slope_floor_L, double shift_hat, double inv_c2) {
+// function of it); sigma does not participate in the eps floor directly,
+// but M3g's causal slope clamp makes L's u-HIGH tail depend on sigma's own
+// log-tail growth rate, so the sigma view is threaded in too and the scan
+// keeps evaluating exactly what evaluate() would (the clamp is
+// kappa-independent -- it only involves eps_hat and dln(sigma)/du -- so it
+// is as safe to run before the kappa relabeling as the rest of this scan).
+double scan_extended_eps_floor(const BsplineView3 &L_view, const BsplineView3 &sigma_view, double x0,
+                                double hx, int nx, double u0, double hu, int nu, double y0, double hy,
+                                int ny, int refine, int ext_cells, double slope_floor_sigma,
+                                double slope_floor_L, double cs2_ext_cap, double shift_hat,
+                                double inv_c2) {
   const double x_lo = x0, x_hi = x0 + static_cast<double>(nx - 1) * hx;
   const double u_lo = u0, u_hi = u0 + static_cast<double>(nu - 1) * hu;
   const double x_ext_lo = x_lo - static_cast<double>(ext_cells) * hx;
@@ -166,11 +173,30 @@ double scan_extended_eps_floor(const BsplineView3 &L_view, double x0, double hx,
 
     for (int ju = 0; ju < ru; ++ju) {
       const double u = u_ext_lo + static_cast<double>(ju) * du;
+      const bool u_above = u > u_hi;
       for (int ix = 0; ix < rx; ++ix) {
         const double x = x_ext_lo + static_cast<double>(ix) * dx;
 
-        const BsplineEval3 Lv =
-            detail::aeval_extended(L_view, x, u, y, x_lo, x_hi, u_lo, u_hi, slope_floor_L, /*x_low_slope_zero=*/true);
+        // M3g causal clamp (u-high side only): b_cap = (1+cs2_ext_cap)*alpha
+        // with alpha = sigma's log-tail growth rate at the seam.
+        double b_cap = 0.0;
+        if (u_above) {
+          const double x_seam = std::min(std::max(x, x_lo), x_hi);
+          const double alpha = detail::aeval_sigma_u_high_alpha(sigma_view, x_seam, u_hi, y,
+                                                                 slope_floor_sigma);
+          if (alpha > 0.0) b_cap = (1.0 + cs2_ext_cap) * alpha;
+        }
+        const detail::ExtSpec spec{x_lo,
+                                   x_hi,
+                                   u_lo,
+                                   u_hi,
+                                   slope_floor_L,
+                                   /*x_low_slope_zero=*/true,
+                                   /*u_high_log=*/false, // sigma-only; this scan evaluates L
+                                   b_cap,
+                                   shift_hat,
+                                   inv_c2};
+        const BsplineEval3 Lv = detail::aeval_extended(L_view, x, u, y, spec);
         const double eps_hat = std::pow(10.0, Lv.f) * inv_c2 - shift_hat;
         if (eps_hat < m) m = eps_hat;
       }
@@ -251,12 +277,13 @@ EntropyEOS::EntropyEOS(Bspline3 sigma, Bspline3 L, double kappa, double m_B_star
                         double shift_hat, double conv_t, double x_lo, double x_hi, double u_lo, double u_hi,
                         double y_lo, double y_hi, double x_ext_lo, double x_ext_hi, double u_ext_lo,
                         double u_ext_hi, double ext_slope_floor_sigma, double ext_slope_floor_L,
-                        AdapterAudit audit, int max_iter)
+                        double cs2_ext_cap, AdapterAudit audit, int max_iter)
     : sigma_(std::move(sigma)), L_(std::move(L)), kappa_(kappa), m_B_star_g_(m_B_star_g),
       m_B_table_g_(m_B_table_g), shift_hat_(shift_hat), conv_t_(conv_t), x_lo_(x_lo), x_hi_(x_hi),
       u_lo_(u_lo), u_hi_(u_hi), y_lo_(y_lo), y_hi_(y_hi), x_ext_lo_(x_ext_lo), x_ext_hi_(x_ext_hi),
       u_ext_lo_(u_ext_lo), u_ext_hi_(u_ext_hi), ext_slope_floor_sigma_(ext_slope_floor_sigma),
-      ext_slope_floor_L_(ext_slope_floor_L), max_iter_(max_iter), audit_(std::move(audit)) {}
+      ext_slope_floor_L_(ext_slope_floor_L), cs2_ext_cap_(cs2_ext_cap), max_iter_(max_iter),
+      audit_(std::move(audit)) {}
 
 EntropyEOSView EntropyEOS::view() const {
   EntropyEOSView v;
@@ -278,6 +305,7 @@ EntropyEOSView EntropyEOS::view() const {
   v.u_ext_hi = u_ext_hi_;
   v.ext_slope_floor_sigma = ext_slope_floor_sigma_;
   v.ext_slope_floor_L = ext_slope_floor_L_;
+  v.cs2_ext_cap = cs2_ext_cap_;
   v.max_iter = max_iter_;
   return v;
 }
@@ -337,9 +365,9 @@ EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
   // doc comment step 3) -- scan the extended box too, with the unshifted x0
   // (kappa-independent, see that comment), and fold its min in alongside
   // the physical-box scan's own.
-  const double ext_eps_min =
-      scan_extended_eps_floor(L_raw.view(), x0, hx, inx, u0, hu, inu, y0, hy, iny, opts.refine,
-                               opts.ext_cells, opts.ext_slope_floor_L, shift_hat, inv_c2);
+  const double ext_eps_min = scan_extended_eps_floor(
+      L_raw.view(), sigma_raw.view(), x0, hx, inx, u0, hu, inu, y0, hy, iny, opts.refine, opts.ext_cells,
+      opts.ext_slope_floor_sigma, opts.ext_slope_floor_L, opts.cs2_ext_cap, shift_hat, inv_c2);
   const double eps_hat_min = std::min(scan.eps_hat_min, ext_eps_min);
 
   const double eps_floor =
@@ -371,8 +399,8 @@ EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
 
   return EntropyEOS(std::move(sigma_final), std::move(L_final), kappa, m_B_star_g, opts.m_B_table_g,
                      shift_hat, conv_t, x_lo, x_hi, u_lo, u_hi, y_lo, y_hi, x_ext_lo, x_ext_hi, u_ext_lo,
-                     u_ext_hi, opts.ext_slope_floor_sigma, opts.ext_slope_floor_L, scan.audit,
-                     /*max_iter=*/50);
+                     u_ext_hi, opts.ext_slope_floor_sigma, opts.ext_slope_floor_L, opts.cs2_ext_cap,
+                     scan.audit, /*max_iter=*/50);
 }
 
 } // namespace eeos

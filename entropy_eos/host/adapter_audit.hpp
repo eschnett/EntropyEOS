@@ -54,6 +54,18 @@ struct AdapterCheckOptions {
   // violation class.
   double tol_roundtrip = 1e-8;
 
+  // M3g extension-band map (class E; eos-causal-tail.md S5): oversampling
+  // per table cell along the extension axis being scanned
+  // (ext_band_refine -- 8 extension cells at refine 4 give 32 samples across
+  // a band) and along the two other axes (ext_band_other_refine). The band
+  // axis is sampled finer because that is where the tail construction
+  // actually varies; the defaults keep the whole four-band scan's cost
+  // comparable to the class B node audit's on the real tables. Setting
+  // either to 0 skips class E entirely (the classes are still reported, with
+  // count 0 and the NaN "skipped" sentinel).
+  size_t ext_band_refine = 4;
+  size_t ext_band_other_refine = 2;
+
   // M2d-2: when true, the class C physicality soak samples the *extended*
   // box (EntropyEOSView::x_ext_lo/hi, srange_extended()) instead of the
   // physical one -- exercising the eos-adapter-F-to-U.md S7 domain
@@ -99,6 +111,12 @@ struct AdapterReport {
   //   C. "That_nonpositive", "p_nonpositive", "cs2_nonpositive", "cs2_acausal" (violations)
   //   D. "extension_seam_jump" (diagnostic; M2d-2, never affects
   //      adapter_needs_attention() -- see check_adapter()'s doc comment)
+  //   E. the M3g extension-band map, four classes per band in the fixed band
+  //      order {u_low, u_high, x_low, x_high}:
+  //      "ext_<band>_cs2_acausal", "ext_<band>_p_nonpositive",
+  //      "ext_<band>_sigma_u_nonpositive" -- violations for u_low/u_high/
+  //      x_low, REPORT-ONLY for x_high -- plus "ext_<band>_cs2_nonpositive",
+  //      which is REPORT-ONLY in every band (see check_adapter()'s doc comment)
   std::vector<CheckClassResult> classes;
 
   // Quantiles {p50,p90,p99,p999,max} of "delta_T"/"delta_p" over every
@@ -108,6 +126,21 @@ struct AdapterReport {
   // "logpress" field).
   QuantileStats delta_T_quantiles;
   QuantileStats delta_p_quantiles;
+
+  // M3g extension-band map statistics (class E). Band order is fixed:
+  // {u_low, u_high, x_low, x_high}.
+  size_t ext_band_n[4] = {}; // samples taken per band (0 = class E skipped)
+
+  // u_hi seam points (sampled at the class E "other axes" resolution over
+  // (x*, Ye)) where the causal slope clamp binds at all, and -- the number
+  // eos-causal-tail.md S3 asks to be reported -- where the causal cap fell
+  // BELOW the monotonicity floor ext_slope_floor_L, so the floor won
+  // lexicographically and causality is not enforced at that seam point.
+  // Expected 0 on real tables; report-only either way (any actual damage
+  // shows up as an "ext_u_high_cs2_acausal" count).
+  size_t ext_clamp_seam_n = 0;
+  size_t ext_clamp_active = 0;
+  size_t ext_clamp_floor_wins = 0;
 
   // Physicality-soak statistics (class C).
   size_t soak_n = 0;
@@ -164,6 +197,44 @@ struct AdapterReport {
 //      designed C2, C1 only where the monotonicity/slope-zero overrides
 //      activate), never a violation (count stays 0; see
 //      adapter_needs_attention()).
+//   E. Extension-band map (M3g, eos-causal-tail.md S5). A deterministic
+//      refined scan of each of the four extension bands -- u_low
+//      (u in (u_ext_lo, u_lo)), u_high ((u_hi, u_ext_hi]), x_low
+//      ([x_ext_lo, x_lo)), x_high ((x_hi, x_ext_hi]) -- each crossed with
+//      the two other axes over their PHYSICAL ranges, at
+//      opts.ext_band_refine samples per cell along the band axis and
+//      opts.ext_band_other_refine along the others. Points are evaluated in
+//      native (x, u, y) coordinates through EntropyEOSView::eval_at(), i.e.
+//      the same chain rule evaluate() runs, minus the T-solve that would
+//      only re-derive the u it was handed. Per band, four classes:
+//      "ext_<band>_cs2_acausal" (c_s^2 >= 1; the metric is c_s^2 - 1),
+//      "ext_<band>_p_nonpositive", "ext_<band>_sigma_u_nonpositive" (the
+//      extended entropy spline's own u-derivative, i.e. the tail's
+//      monotonicity guard seen from outside), and "ext_<band>_cs2_nonpositive".
+//
+//      That fourth class is REPORT-ONLY in every band, and is one metric more
+//      than eos-causal-tail.md S5 asked for. It is here because the M3g
+//      log-sigma tail's measured trade is exactly this: it removes the u-high band's
+//      c_s^2 >= 1 (88% of the band, saturating ~3.8) and leaves behind a ~0.5%
+//      population of c_s^2 <= 0 deep in the same band. c_s^2 <= 0 is harmless
+//      where c_s^2 >= 1 was fatal -- the con2prim S9 inner-solve proof needs
+//      z_w = z(1-c_s^2)tanh w > 0, i.e. only c_s^2 < 1 -- and physicality in
+//      the extensions is explicitly not guaranteed (eos-adapter-F-to-U.md S7).
+//      Reporting it keeps a future regression visible without changing any
+//      exit code.
+//
+//      x_high is REPORT-ONLY -- it never contributes to
+//      adapter_needs_attention(). Deliberate: eos-adapter-F-to-U.md S7
+//      makes a converged state above rho_max invalid outright
+//      (flag_oob_rho_high is a hard failure, not an extension flag), so that
+//      band's tail exists only to keep an iterate finite until the caller
+//      throws the state away; causality there is nice-to-have, not
+//      load-bearing. The other three bands ARE places a converged, flagged,
+//      legitimately-used state can live, so their counts are violations.
+//
+//      The scan also walks the u_hi seam itself and counts where M3g's
+//      causal slope clamp binds, and where it lost to the monotonicity floor
+//      (AdapterReport::ext_clamp_active / ext_clamp_floor_wins).
 //
 // Never throws on its own account: a non-finite EOSPoint anywhere in B or C
 // is recorded in fatal_messages (status becomes Status::fatal) and that
@@ -174,9 +245,12 @@ AdapterReport check_adapter(const EntropyEOS &adapter, const RawTable &table,
 
 // True iff the report indicates something a caller should look at:
 // any monotonicity/roundtrip_T/physicality violation class has count > 0,
-// or maxiter_count > 0. (status == Status::fatal is a separate, more severe
-// signal callers should check on its own -- see tools/eos_test.cpp.)
-// "delta_T"/"delta_p" are diagnostics and never contribute here.
+// any class E extension-band class of the u_low/u_high/x_low bands has
+// count > 0, or maxiter_count > 0. (status == Status::fatal is a separate,
+// more severe signal callers should check on its own -- see
+// tools/eos_test.cpp.) "delta_T"/"delta_p", "extension_seam_jump", every
+// "ext_<band>_cs2_nonpositive", and the whole x_high band are diagnostics and
+// never contribute here.
 bool adapter_needs_attention(const AdapterReport &report);
 
 } // namespace eeos

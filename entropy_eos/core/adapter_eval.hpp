@@ -103,6 +103,66 @@
 // host/adapter_build.cpp's extended kappa/eps-floor scan) -- and which is
 // exactly transparent (falls through to a single plain bspline_eval3()
 // call) for any interior point, so it never perturbs an in-box evaluation.
+//
+// === M3g CAUSAL TAILS (eos-causal-tail.md) ================================
+//
+// The S7 guiding principle above is missing one word: the values an
+// iterating solver sees must also be **causal**. They were not: continuing
+// sigma LINEARLY in u past the hot seam forces T (and with it eps) to climb
+// far too fast along adiabats, and the resulting c_s^2 crosses 1 about one
+// grid cell past u_hi and saturates ~3.8 -- which breaks the con2prim inner
+// solve's monotonicity proof (z_w = z(1-c_s^2)tanh w flips sign, f1(w;s)
+// stops being monotone) and produced ~95% of M3's con2prim failure tail
+// (CODE.md "M3 failure-tail root cause"). Two changes, u-HIGH side only:
+//
+// 1. **Log-sigma u-high tail** (sigma only). Physical entropy grows
+//    exponentially in u (s ~ T^3/rho), so the tail is built on g = ln sigma
+//    instead of sigma: transform the whole boundary sample
+//      g = ln f, g_a = f_a/f, g_ab = f_ab/f - (f_a/f)(f_b/f)
+//    (detail::aeval_log_sample()), run the *unchanged* curvature-ramp
+//    machinery above on it -- primary track (g, g_u, g_uu), secondary
+//    (g_x, g_xu, 0), frozen g_xx/g_y, exactly the same table -- and map back
+//      f = e^g, f_a = f g_a, f_ab = f (g_ab + g_a g_b)
+//    (detail::aeval_exp_sample()). The corner composition order is
+//    untouched: the log transform lives entirely inside the u-high tail
+//    operator, so the x-tail still acts afterwards on the mapped-back
+//    tracks. sigma_b > 0 at the u_hi seam by construction (it is the
+//    column's largest entropy); should a pathological table violate that,
+//    the tail falls back to the linear construction (the guard is explicit
+//    in aeval_extended()).
+//    The monotonicity guard transfers exactly: flooring the LOG slope at
+//    m_floor/sigma_b keeps sigma_u = sigma*g' >= sigma_b*g' >= m_floor,
+//    since sigma >= sigma_b throughout a growing tail.
+//    Why it works: with ln sigma and ln eps both asymptotically linear in u
+//    (rates alpha = dln(sigma)/du and b = dln(eps)/du) and 1/rho seam
+//    scaling, the far-tail fixed-s slope q = dlnW/dx|_s is *constant*, so
+//    c_s^2(tail) = b/alpha - 1 exactly; radiation slopes (b = 4 ln10,
+//    alpha = 3 ln10) give 1/3 -- the physically correct hot-gas asymptote --
+//    and p > 0 <=> b > alpha.
+//
+// 2. **Causal slope clamp on L's u-high tail.** Nothing guarantees
+//    b/alpha - 1 <= 1 at every seam point, so L's phase-2 slope is capped:
+//    with b_eff = ln10 * m_L * (eps_b + Delta)/eps_b and alpha_eff the
+//    sigma tail's log slope, enforce b_eff <= (1 + cs2_ext_cap)*alpha_eff
+//    (EntropyEOSView::cs2_ext_cap, BuildOptions::cs2_ext_cap, default 0.99)
+//    by lowering the effective (f1, f2) -- the exact mirror image of the
+//    monotonicity guard (detail::aeval_cap_slope()), C2 dropping to C1 only
+//    inside flagged territory. Guard priority is lexicographic as
+//    everywhere else: the monotonicity floor ext_slope_floor_L wins if the
+//    two ever conflict (host/adapter_audit.cpp's extension-band map reports
+//    such points; none occur on the real tables).
+//
+// Unchanged by M3g: both u-LOW tails (sigma must run linearly to -infinity
+// so every s < s_min maps to a finite T -- the escape hatch stands), both
+// x-tails, all flag semantics, srange()/physical-box logic, and every
+// in-box evaluation (aeval_extended() still falls straight through; the
+// tail operator is exactly transparent inside the box -- asserted
+// bit-for-bit in tests/test_adapter_tail.cpp).
+//
+// Consequence to expect, not fear: srange_extended().s_max grows (an
+// 8-cell log tail reaches ~10^0.8 ~ 6x s_max where the linear tail reached
+// ~1.8x). The bracket scan is log-spaced and the T-solve is a safeguarded
+// Newton on a still strictly monotone sigma, so no solver mechanics change.
 
 #pragma once
 
@@ -200,16 +260,22 @@ EEOS_HOST_DEVICE inline Track1D aeval_ramp_track(Track1D t, real d, real w) {
   return o;
 }
 
-// Generic tail with the optional monotonicity guard (module header):
-// m_floor <= 0 skips the guard entirely (every track except the
-// u-direction primary track of sigma/L); m_floor > 0 raises the effective
-// f1 to at least m_floor, then caps the effective f2 so the asymptotic
-// slope m = f1 +- f2*w/2 (sign per side) does not fall back below m_floor,
-// before evaluating aeval_ramp_track().
-EEOS_HOST_DEVICE inline Track1D aeval_generic_track(Track1D t, real d, real w, real m_floor) {
+// The phase-2 (|d| > w) asymptotic slope aeval_ramp_track() will produce
+// for a track already carrying its *effective* (f1, f2): m = f1 + sgn*f2*w/2.
+EEOS_HOST_DEVICE inline real aeval_phase2_slope(const Track1D &t, real sgn, real w) {
+  return t.f1 + sgn * t.f2 * w * real(0.5);
+}
+
+// The monotonicity guard's effective-track rewrite (module header), factored
+// out of aeval_generic_track() so the M3g causal clamp and the audit hook
+// (EntropyEOSView::u_high_tail_info()) reuse the identical arithmetic:
+// m_floor <= 0 is a no-op (every track except the u-direction primary track
+// of sigma/L); m_floor > 0 raises the effective f1 to at least m_floor, then
+// caps the effective f2 so the asymptotic slope m = f1 +- f2*w/2 (sign per
+// side) does not fall back below m_floor.
+EEOS_HOST_DEVICE inline Track1D aeval_floor_slope(Track1D t, real sgn, real w, real m_floor) {
   if (m_floor > real(0)) {
     const real f1_eff = t.f1 < m_floor ? m_floor : t.f1;
-    const real sgn = d < real(0) ? real(-1) : real(1);
     const real cap = real(2) * (f1_eff - m_floor) / w; // >= 0
     real f2_eff = t.f2;
     if (sgn < real(0)) {
@@ -220,7 +286,95 @@ EEOS_HOST_DEVICE inline Track1D aeval_generic_track(Track1D t, real d, real w, r
     t.f1 = f1_eff;
     t.f2 = f2_eff;
   }
-  return aeval_ramp_track(t, d, w);
+  return t;
+}
+
+// M3g causal slope cap -- the counterpart of aeval_floor_slope() on the HIGH
+// side, and the only guard that ever lowers a slope: if the phase-2 slope
+// m = f1 + f2*w/2 exceeds m_cap, lower the effective CURVATURE (f2 alone) to
+// 2*(m_cap - f1)/w so it equals m_cap exactly.
+//
+// f1 is deliberately left alone, unlike the monotonicity guard: the seam
+// value AND seam slope must keep matching the boundary spline sample, so the
+// tail stays C1 there (only f'' jumps) and U/U_s are continuous across the
+// seam -- check_adapter()'s class D measures exactly that. The price is that
+// f'(d) inside the blend cell rides down from f1 to m_cap and can therefore
+// transiently exceed the cap over that one cell, which eos-causal-tail.md S4
+// anticipates and hands to the class E extension-band map to adjudicate.
+// Since aeval_capped_track() only ever passes m_cap >= m_floor, and phase 1's
+// f'(d) stays between f1 and m_cap, the monotonicity guarantee survives.
+// Never called with m_cap <= 0.
+EEOS_HOST_DEVICE inline Track1D aeval_cap_slope(Track1D t, real w, real m_cap) {
+  if (aeval_phase2_slope(t, real(1), w) > m_cap) {
+    t.f2 = real(2) * (m_cap - t.f1) / w;
+  }
+  return t;
+}
+
+// Generic tail with the optional monotonicity guard (module header):
+// m_floor <= 0 skips the guard entirely; otherwise aeval_floor_slope()
+// rewrites the track before aeval_ramp_track() evaluates it.
+EEOS_HOST_DEVICE inline Track1D aeval_generic_track(Track1D t, real d, real w, real m_floor) {
+  const real sgn = d < real(0) ? real(-1) : real(1);
+  return aeval_ramp_track(aeval_floor_slope(t, sgn, w, m_floor), d, w);
+}
+
+// M3g: the generic tail with BOTH u-HIGH guards, used only for L's u-high
+// primary track (module header point 2). The monotonicity floor is applied
+// first and wins lexicographically: a causal cap that fell below the floor
+// is raised back to it (the audit reports such points; they do not occur on
+// the real tables). Only ever called with d > 0 and m_cap > 0.
+EEOS_HOST_DEVICE inline Track1D aeval_capped_track(Track1D t, real d, real w, real m_floor, real m_cap) {
+  t = aeval_floor_slope(t, real(1), w, m_floor);
+  const real hi = (m_floor > real(0) && m_cap < m_floor) ? m_floor : m_cap;
+  return aeval_ramp_track(aeval_cap_slope(t, w, hi), d, w);
+}
+
+// M3g: the log-space image g = ln(f) of one BsplineEval3 sample (module
+// header point 1). Requires f > 0 -- aeval_extended() checks that before
+// calling. Plain chain rule, field by field:
+//   g = ln f, g_a = f_a/f, g_ab = f_ab/f - (f_a/f)(f_b/f).
+EEOS_HOST_DEVICE inline BsplineEval3 aeval_log_sample(const BsplineEval3 &b) {
+  const real inv = real(1) / b.f;
+  BsplineEval3 g;
+  g.f = std::log(b.f);
+  g.fx = b.fx * inv;
+  g.fu = b.fu * inv;
+  g.fy = b.fy * inv;
+  g.fxx = b.fxx * inv - g.fx * g.fx;
+  g.fxu = b.fxu * inv - g.fx * g.fu;
+  g.fuu = b.fuu * inv - g.fu * g.fu;
+  return g;
+}
+
+// M3g: the exact inverse of aeval_log_sample() -- f = e^g, f_a = f g_a,
+// f_ab = f (g_ab + g_a g_b). Applied to the tail-evolved log sample, so the
+// secondary (fx) and frozen (fxx, fy) tracks are mapped back with the
+// tail-evolved f, exactly as the design's composition table requires.
+EEOS_HOST_DEVICE inline BsplineEval3 aeval_exp_sample(const BsplineEval3 &g) {
+  const real f = std::exp(g.f);
+  BsplineEval3 b;
+  b.f = f;
+  b.fx = f * g.fx;
+  b.fu = f * g.fu;
+  b.fy = f * g.fy;
+  b.fxx = f * (g.fxx + g.fx * g.fx);
+  b.fxu = f * (g.fxu + g.fx * g.fu);
+  b.fuu = f * (g.fuu + g.fu * g.fu);
+  return b;
+}
+
+// M3g: convert a cap on b = dln(eps_hat)/du into a cap on L's own phase-2
+// slope at a u-high seam whose L value is L_b. With E = 10^L * inv_c2 and
+// eps_hat = E - shift_hat, b = ln10 * L_u * E / eps_hat, so
+// m_L_cap = b_cap * eps_hat / (ln10 * E). Returns 0 ("no cap") when
+// eps_hat <= 0: there is no causal statement to make there, and the
+// monotonicity floor is then the only meaningful guard.
+EEOS_HOST_DEVICE inline real aeval_L_slope_cap(real L_b, real b_cap, real shift_hat, real inv_c2) {
+  const real E = std::pow(real(10), L_b) * inv_c2;
+  const real eps = E - shift_hat;
+  if (!(eps > real(0)) || !(E > real(0))) return real(0);
+  return b_cap * eps / (kLn10 * E);
 }
 
 // Slope-to-zero variant (module header; L's x-low primary track only):
@@ -238,11 +392,14 @@ enum class TailAxis { x, u };
 // cell (BsplineView3::hx or hu), m_floor = the primary track's slope floor
 // (<=0 to skip the guard -- every tail except a u-direction one),
 // slope_zero = use aeval_slope_zero_track for the primary track instead of
-// the (possibly guarded) generic one (true only for L's x-low tail).
+// the (possibly guarded) generic one (true only for L's x-low tail),
+// m_cap = the M3g causal cap on the primary track's phase-2 slope (<=0 to
+// skip it -- every tail except L's u-HIGH one).
 struct TailSpec {
   real w;
   real m_floor;
   bool slope_zero;
+  real m_cap;
 };
 
 // Applies one axis's designed tail to a full BsplineEval3-shaped sample by
@@ -259,6 +416,8 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
                                            : aeval_generic_track(f_in, d, spec.w, spec.m_floor);
     const Track1D fu_in{b.fu, b.fxu, real(0)};
     const Track1D fu_out = aeval_generic_track(fu_in, d, spec.w, real(0));
+    // (m_cap is not consulted on an x-tail: causality is a u-direction
+    // statement in this construction -- see the module header's M3g note.)
     out.f = f_out.f0;
     out.fx = f_out.f1;
     out.fxx = f_out.f2;
@@ -267,7 +426,12 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
     // fuu, fy: frozen (no fxuu available -- module header).
   } else {
     const Track1D f_in{b.f, b.fu, b.fuu};
-    const Track1D f_out = aeval_generic_track(f_in, d, spec.w, spec.m_floor);
+    // M3g: the causal cap only ever applies to L's u-HIGH primary track;
+    // every other track (and every d < 0) takes the pre-M3g path
+    // bit-for-bit.
+    const Track1D f_out = (spec.m_cap > real(0) && d > real(0))
+                              ? aeval_capped_track(f_in, d, spec.w, spec.m_floor, spec.m_cap)
+                              : aeval_generic_track(f_in, d, spec.w, spec.m_floor);
     const Track1D fx_in{b.fx, b.fxu, real(0)};
     const Track1D fx_out = aeval_generic_track(fx_in, d, spec.w, real(0));
     out.f = f_out.f0;
@@ -280,11 +444,36 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
   return out;
 }
 
+// Per-field extension parameters for aeval_extended(), assembled by
+// EntropyEOSView::sigma_ext_spec() / L_ext_spec() (and, at build time,
+// by host/adapter_build.cpp's extended eps-floor scan):
+//   x_lo..u_hi          the *physical* box (the extended box is the caller's
+//                       business -- see aeval_extended()'s doc comment)
+//   u_m_floor           this field's u-direction monotonicity-guard floor
+//                       (ext_slope_floor_sigma or _L)
+//   x_low_slope_zero    slope-to-zero variant for the x-low primary track
+//                       (true only for L)
+//   u_high_log          M3g: build the u-HIGH tail in log space (true only
+//                       for sigma)
+//   u_high_b_cap        M3g: cap on b = dln(eps_hat)/du at the u-high seam,
+//                       i.e. (1 + cs2_ext_cap)*alpha (>0 only for L, and
+//                       only where sigma's log tail supplied an alpha)
+//   shift_hat, inv_c2   energy zero point, which turns u_high_b_cap into a
+//                       cap on L's own slope (aeval_L_slope_cap())
+struct ExtSpec {
+  real x_lo, x_hi, u_lo, u_hi;
+  real u_m_floor;
+  bool x_low_slope_zero;
+  bool u_high_log;
+  real u_high_b_cap;
+  real shift_hat, inv_c2;
+};
+
 // Full designed-extension evaluation of one fitted spline (`field` is
 // `sigma` or `L`) at a query point (x,u,y). x and u are assumed already
 // clamped into the *extended* box by the caller (evaluate()'s x_use / the
 // T-solve's u bracket / srange_extended() / sigma_extended() all do this --
-// see their call sites); x_lo/x_hi/u_lo/u_hi are the *physical* box.
+// see their call sites); spec.x_lo/x_hi/u_lo/u_hi are the *physical* box.
 // Interior points (x in [x_lo,x_hi] and u in [u_lo,u_hi]) fall through to a
 // single plain bspline_eval3() call with no tail applied at all, so this
 // function is exactly transparent to every existing interior evaluation.
@@ -292,37 +481,79 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
 // Corner composition order (module header): the raw spline sample is
 // always taken at the seam clamped to the *physical* box in both
 // directions, the u-tail is applied first, then the x-tail is applied to
-// the (possibly already u-tailed) result.
-//
-// `u_m_floor` is the u-direction monotonicity-guard floor for this field
-// (ext_slope_floor_sigma or _L); `x_low_slope_zero` selects the slope-to-
-// zero variant for this field's x-low primary track (true only for L).
+// the (possibly already u-tailed) result. M3g's log-space u-high tail sits
+// entirely inside the u-tail step, so that order is unchanged.
 EEOS_HOST_DEVICE inline BsplineEval3 aeval_extended(const BsplineView3 &field, real x, real u, real y,
-                                                      real x_lo, real x_hi, real u_lo, real u_hi,
-                                                      real u_m_floor, bool x_low_slope_zero) {
-  const bool u_below = u < u_lo;
-  const bool u_above = u > u_hi;
-  const bool x_below = x < x_lo;
-  const bool x_above = x > x_hi;
+                                                      const ExtSpec &spec) {
+  const bool u_below = u < spec.u_lo;
+  const bool u_above = u > spec.u_hi;
+  const bool x_below = x < spec.x_lo;
+  const bool x_above = x > spec.x_hi;
 
-  const real u_seam = u_below ? u_lo : (u_above ? u_hi : u);
-  const real x_seam = x_below ? x_lo : (x_above ? x_hi : x);
+  const real u_seam = u_below ? spec.u_lo : (u_above ? spec.u_hi : u);
+  const real x_seam = x_below ? spec.x_lo : (x_above ? spec.x_hi : x);
 
   BsplineEval3 b = bspline_eval3(field, x_seam, u_seam, y);
 
   if (u_below || u_above) {
-    const real seam = u_below ? u_lo : u_hi;
-    b = aeval_apply_tail(b, u - seam, TailAxis::u, TailSpec{field.hu, u_m_floor, false});
+    const real seam = u_below ? spec.u_lo : spec.u_hi;
+    const real d = u - seam;
+    if (u_above && spec.u_high_log && b.f > real(0)) {
+      // M3g log-sigma tail: the same machinery, run on g = ln(sigma). The
+      // monotonicity floor transfers as m_floor/sigma_b (module header).
+      const real m_floor_g = spec.u_m_floor > real(0) ? spec.u_m_floor / b.f : real(0);
+      const BsplineEval3 g = aeval_apply_tail(aeval_log_sample(b), d, TailAxis::u,
+                                               TailSpec{field.hu, m_floor_g, false, real(0)});
+      b = aeval_exp_sample(g);
+    } else {
+      // M3g causal clamp (L's u-high tail only; 0 everywhere else, which
+      // reproduces the pre-M3g construction bit-for-bit).
+      const real m_cap = (u_above && spec.u_high_b_cap > real(0))
+                             ? aeval_L_slope_cap(b.f, spec.u_high_b_cap, spec.shift_hat, spec.inv_c2)
+                             : real(0);
+      b = aeval_apply_tail(b, d, TailAxis::u, TailSpec{field.hu, spec.u_m_floor, false, m_cap});
+    }
   }
   if (x_below || x_above) {
-    const real seam = x_below ? x_lo : x_hi;
+    const real seam = x_below ? spec.x_lo : spec.x_hi;
     b = aeval_apply_tail(b, x - seam, TailAxis::x,
-                          TailSpec{field.hx, real(0), x_below && x_low_slope_zero});
+                          TailSpec{field.hx, real(0), x_below && spec.x_low_slope_zero, real(0)});
   }
   return b;
 }
 
+// M3g: sigma's u-HIGH log-space asymptotic (phase-2) growth rate
+// alpha = dln(sigma)/du -- exactly the slope the log tail continues with,
+// and the quantity L's causal clamp is measured against
+// (c_s^2(tail) = b/alpha - 1). Returns 0 when the log tail is inactive
+// (sigma_b <= 0 at the seam), which disables the clamp. `x_seam` must
+// already be clamped to the physical [x_lo, x_hi].
+EEOS_HOST_DEVICE inline real aeval_sigma_u_high_alpha(const BsplineView3 &sigma, real x_seam, real u_hi,
+                                                        real y, real m_floor) {
+  const BsplineEval3 b = bspline_eval3(sigma, x_seam, u_hi, y);
+  if (!(b.f > real(0))) return real(0);
+  const BsplineEval3 g = aeval_log_sample(b);
+  const real m_floor_g = m_floor > real(0) ? m_floor / b.f : real(0);
+  const Track1D t = aeval_floor_slope(Track1D{g.f, g.fu, g.fuu}, real(1), sigma.hu, m_floor_g);
+  return aeval_phase2_slope(t, real(1), sigma.hu);
+}
+
 } // namespace detail
+
+// M3g audit hook: everything the u-HIGH causal slope clamp is built from at
+// one seam point, so host/adapter_audit.cpp's extension-band map can report
+// the (never expected, but lexicographically resolved) monotonicity-floor /
+// causal-cap conflicts without duplicating the arithmetic. See
+// EntropyEOSView::u_high_tail_info().
+struct UHighTailInfo {
+  real alpha;      // sigma's log-tail growth rate dln(sigma)/du (0: log tail inactive)
+  real b_raw;      // L's asymptotic b = dln(eps_hat)/du after the monotonicity floor, before the cap
+  real b_cap;      // the causal cap on b, (1 + cs2_ext_cap)*alpha (0: inactive)
+  real m_L_raw;    // L's phase-2 slope after the monotonicity floor, before the cap
+  real m_L_cap;    // b_cap expressed in L-slope units (0: inactive)
+  bool clamped;    // the cap actually lowers the effective slope at this point
+  bool floor_wins; // the cap fell below ext_slope_floor_L -- the floor wins (lexicographic)
+};
 
 // Device-portable POD view of a built EntropyEOS (see
 // host/adapter_build.hpp): the two fitted splines (sigma = entropy,
@@ -352,9 +583,71 @@ struct EntropyEOSView {
   real u_ext_lo, u_ext_hi;
   real ext_slope_floor_sigma, ext_slope_floor_L;
 
+  // M3g (eos-causal-tail.md / this file's "CAUSAL TAILS"): the causality
+  // bound the u-HIGH tail's asymptotic slopes are held to,
+  // b_eff <= (1 + cs2_ext_cap)*alpha_eff, i.e. c_s^2(tail) <= cs2_ext_cap.
+  // BuildOptions::cs2_ext_cap, default 0.99 (matching the M3f data-side
+  // cs2_cap).
+  real cs2_ext_cap;
+
   int max_iter; // T-solve iteration cap (default 50, set at build)
 
   EEOS_HOST_DEVICE EOSPoint evaluate(real rho_star, real s, real ye, real u_guess) const;
+
+  // The per-field extension parameters aeval_extended() takes (M3g; see
+  // detail::ExtSpec). `b_cap` for L comes from u_high_b_cap() below, and is
+  // 0 whenever the query does not sit above the u_hi seam.
+  EEOS_HOST_DEVICE detail::ExtSpec sigma_ext_spec() const {
+    return detail::ExtSpec{x_lo,
+                           x_hi,
+                           u_lo,
+                           u_hi,
+                           ext_slope_floor_sigma,
+                           /*x_low_slope_zero=*/false,
+                           /*u_high_log=*/true,
+                           /*u_high_b_cap=*/real(0),
+                           shift_hat,
+                           inv_c2};
+  }
+  EEOS_HOST_DEVICE detail::ExtSpec L_ext_spec(real b_cap) const {
+    return detail::ExtSpec{x_lo,
+                           x_hi,
+                           u_lo,
+                           u_hi,
+                           ext_slope_floor_L,
+                           /*x_low_slope_zero=*/true,
+                           /*u_high_log=*/false,
+                           b_cap,
+                           shift_hat,
+                           inv_c2};
+  }
+
+  // M3g: the causal cap on b = dln(eps_hat)/du for an L evaluation whose u
+  // sits above the u_hi seam, at the x already clamped into the extended
+  // box (x_use in evaluate()). One extra sigma spline sample, taken only on
+  // the u-high tail path -- in-box evaluations never call this.
+  EEOS_HOST_DEVICE real u_high_b_cap(real x_use, real y) const {
+    const real x_seam = detail::aeval_clamp(x_use, x_lo, x_hi);
+    const real alpha =
+        detail::aeval_sigma_u_high_alpha(sigma, x_seam, u_hi, y, ext_slope_floor_sigma);
+    return alpha > real(0) ? (real(1) + cs2_ext_cap) * alpha : real(0);
+  }
+
+  // M3g audit hook (see UHighTailInfo): the u-high seam's clamp arithmetic
+  // at (rho*, Ye), for host/adapter_audit.cpp's extension-band map.
+  EEOS_HOST_DEVICE UHighTailInfo u_high_tail_info(real rho_star, real ye) const;
+
+  // The chain-rule half of evaluate() (its steps 4-6), at an already-located
+  // point: `x_use` is x = log10(rho*) clamped into the EXTENDED box, `u` the
+  // solved log10(T_MeV), `y` the clamped Ye, and `flags`/`iters` are copied
+  // into the returned EOSPoint verbatim. evaluate() is exactly "locate u,
+  // then call this", so the two never drift apart.
+  //
+  // Exposed because M3g's extension-band map (host/adapter_audit.cpp class E)
+  // walks a band in NATIVE (x, u, y) coordinates, where running the T-solve
+  // would only re-derive the u it was handed -- 3 spline samples per point
+  // instead of ~12, over tens of millions of points.
+  EEOS_HOST_DEVICE EOSPoint eval_at(real x_use, real u, real y, unsigned flags, int iters) const;
 
   // Pointwise PHYSICAL entropy range [sigma(u_lo), sigma(u_hi)] (unchanged
   // from M2b/M2c -- see eos-adapter-F-to-U.md S7's srange definition).
@@ -388,10 +681,9 @@ EEOS_HOST_DEVICE inline SRange EntropyEOSView::srange(real rho_star, real ye) co
 EEOS_HOST_DEVICE inline SRange EntropyEOSView::srange_extended(real rho_star, real ye) const {
   const real x = detail::aeval_clamp(std::log10(rho_star), x_ext_lo, x_ext_hi);
   const real y = detail::aeval_clamp(ye, y_lo, y_hi);
-  const BsplineEval3 slo =
-      detail::aeval_extended(sigma, x, u_ext_lo, y, x_lo, x_hi, u_lo, u_hi, ext_slope_floor_sigma, false);
-  const BsplineEval3 shi =
-      detail::aeval_extended(sigma, x, u_ext_hi, y, x_lo, x_hi, u_lo, u_hi, ext_slope_floor_sigma, false);
+  const detail::ExtSpec spec = sigma_ext_spec();
+  const BsplineEval3 slo = detail::aeval_extended(sigma, x, u_ext_lo, y, spec);
+  const BsplineEval3 shi = detail::aeval_extended(sigma, x, u_ext_hi, y, spec);
   return SRange{slo.f, shi.f};
 }
 
@@ -399,7 +691,36 @@ EEOS_HOST_DEVICE inline real EntropyEOSView::sigma_extended(real rho_star, real 
   const real x = detail::aeval_clamp(std::log10(rho_star), x_ext_lo, x_ext_hi);
   const real y = detail::aeval_clamp(ye, y_lo, y_hi);
   const real uu = detail::aeval_clamp(u, u_ext_lo, u_ext_hi);
-  return detail::aeval_extended(sigma, x, uu, y, x_lo, x_hi, u_lo, u_hi, ext_slope_floor_sigma, false).f;
+  return detail::aeval_extended(sigma, x, uu, y, sigma_ext_spec()).f;
+}
+
+// M3g: recompute the u-high seam's clamp arithmetic at one (rho*, Ye) --
+// exactly the quantities aeval_extended() derives internally on the L
+// u-high path, exposed for the extension-band audit.
+EEOS_HOST_DEVICE inline UHighTailInfo EntropyEOSView::u_high_tail_info(real rho_star, real ye) const {
+  const real x_seam = detail::aeval_clamp(std::log10(rho_star), x_lo, x_hi);
+  const real y = detail::aeval_clamp(ye, y_lo, y_hi);
+
+  UHighTailInfo info;
+  info.alpha = detail::aeval_sigma_u_high_alpha(sigma, x_seam, u_hi, y, ext_slope_floor_sigma);
+  info.b_cap = info.alpha > real(0) ? (real(1) + cs2_ext_cap) * info.alpha : real(0);
+
+  const BsplineEval3 Lb = bspline_eval3(L, x_seam, u_hi, y);
+  const detail::Track1D t =
+      detail::aeval_floor_slope(detail::Track1D{Lb.f, Lb.fu, Lb.fuu}, real(1), L.hu, ext_slope_floor_L);
+  info.m_L_raw = detail::aeval_phase2_slope(t, real(1), L.hu);
+  info.m_L_cap =
+      info.b_cap > real(0) ? detail::aeval_L_slope_cap(Lb.f, info.b_cap, shift_hat, inv_c2) : real(0);
+
+  const real E = std::pow(real(10), Lb.f) * inv_c2;
+  const real eps = E - shift_hat;
+  info.b_raw = eps > real(0) ? detail::kLn10 * info.m_L_raw * E / eps : real(0);
+
+  info.floor_wins = info.m_L_cap > real(0) && ext_slope_floor_L > real(0) &&
+                     info.m_L_cap < ext_slope_floor_L;
+  const real hi = info.floor_wins ? ext_slope_floor_L : info.m_L_cap;
+  info.clamped = info.m_L_cap > real(0) && info.m_L_raw > hi;
+  return info;
 }
 
 EEOS_HOST_DEVICE inline EOSPoint EntropyEOSView::evaluate(real rho_star, real s, real ye,
@@ -437,10 +758,9 @@ EEOS_HOST_DEVICE inline EOSPoint EntropyEOSView::evaluate(real rho_star, real s,
   // sigma was before; the safeguarded Newton/bisection loop itself is
   // unchanged apart from its bracket and its point evaluator (S3 point 2's
   // safeguard still applies verbatim). -------------------------------------
-  const BsplineEval3 sig_lo = detail::aeval_extended(sigma, x_use, u_ext_lo, y, x_lo, x_hi, u_lo, u_hi,
-                                                       ext_slope_floor_sigma, false);
-  const BsplineEval3 sig_hi = detail::aeval_extended(sigma, x_use, u_ext_hi, y, x_lo, x_hi, u_lo, u_hi,
-                                                       ext_slope_floor_sigma, false);
+  const detail::ExtSpec sig_spec = sigma_ext_spec();
+  const BsplineEval3 sig_lo = detail::aeval_extended(sigma, x_use, u_ext_lo, y, sig_spec);
+  const BsplineEval3 sig_hi = detail::aeval_extended(sigma, x_use, u_ext_hi, y, sig_spec);
 
   real u;
   int iters = 0;
@@ -469,8 +789,7 @@ EEOS_HOST_DEVICE inline EOSPoint EntropyEOSView::evaluate(real rho_star, real s,
 
     while (iters < max_iter) {
       ++iters;
-      const BsplineEval3 e =
-          detail::aeval_extended(sigma, x_use, uu, y, x_lo, x_hi, u_lo, u_hi, ext_slope_floor_sigma, false);
+      const BsplineEval3 e = detail::aeval_extended(sigma, x_use, uu, y, sig_spec);
       const real g = e.f - s;
 
       // Maintain the bracket by sign (sigma_ext strictly increasing in u).
@@ -523,11 +842,19 @@ EEOS_HOST_DEVICE inline EOSPoint EntropyEOSView::evaluate(real rho_star, real s,
     flags |= flag_ext_s_high;
   }
 
-  // --- 4: final spline evaluations at the solved point (extended) --------
-  const BsplineEval3 sig =
-      detail::aeval_extended(sigma, x_use, u, y, x_lo, x_hi, u_lo, u_hi, ext_slope_floor_sigma, false);
-  const BsplineEval3 Lv =
-      detail::aeval_extended(L, x_use, u, y, x_lo, x_hi, u_lo, u_hi, ext_slope_floor_L, true);
+  // --- 4-6: chain rule and derived quantities at the located point -------
+  return eval_at(x_use, u, y, flags, iters);
+}
+
+EEOS_HOST_DEVICE inline EOSPoint EntropyEOSView::eval_at(real x_use, real u, real y, unsigned flags,
+                                                          int iters) const {
+  // --- 4: spline evaluations at the located point (extended) -------------
+  const BsplineEval3 sig = detail::aeval_extended(sigma, x_use, u, y, sigma_ext_spec());
+  // M3g: above the u_hi seam, L's tail slope is held to the causal bound
+  // b <= (1 + cs2_ext_cap)*alpha, alpha being sigma's own log-tail growth
+  // rate at the same seam (one extra sigma sample, on this path only).
+  const real b_cap = u > u_hi ? u_high_b_cap(x_use, y) : real(0);
+  const BsplineEval3 Lv = detail::aeval_extended(L, x_use, u, y, L_ext_spec(b_cap));
 
   // --- 5: chain rule -------------------------------------------------------
   const real lambda = detail::kLn10;

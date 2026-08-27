@@ -1,10 +1,31 @@
 # Causal extension tails: the log-σ u-high tail (M3g)
 
 Draft v0.2, August 27, 2026. Companion to `eos-adapter-F-to-U.md` (§7 domain
-extensions), `core/adapter_eval.hpp` ("TAIL MATHEMATICS"), and CODE.md's "M3
-failure-tail root cause" findings block (the evidence base). **Approved
-2026-08-27** (`cs2_ext_cap = 0.99`; §7 principle amendment goes in with the
-implementation); implementation handed to a separate session.
+extensions), `core/adapter_eval.hpp` ("TAIL MATHEMATICS" / "CAUSAL TAILS"), and
+CODE.md's "M3 failure-tail root cause" findings block (the evidence base).
+**Approved 2026-08-27** (`cs2_ext_cap = 0.99`; §7 principle amendment ships with
+the implementation). **Implemented 2026-08-27** — measurements in CODE.md's
+"M3g empirical findings" block; §3 as specified, §5's map added, §7 still open.
+
+**Results in one paragraph.** The u-high band's `c_s² ≥ 1` fraction goes
+**88.4% → 0.007%** (LS220) and **88.0% → 0.009%** (SRO), with the far tail
+measuring `c_s² = 0.339 / 0.340` — the predicted radiation asymptote `b/α − 1`,
+not merely a bound — and the only survivors sitting in the blend cell above the
+known residual ρ_max/T_max *data* corner. At 40,000 con2prim states the warm
+failure count falls 86 → 31 (LS220) and 163 → 82 (SRO), cold 16 → 8 and 30 → 15,
+the **silent wrong-root class 18 → 0 and 25 → 0**, and `rt_tau`'s p999 collapses
+from 4.6e-3 / 9.5e-1 to 9.6e-13 / 9.9e-13, i.e. into the 1e-13 bulk. The whole
+residual now carries the class-B signature (f2 precision floor at high rapidity;
+35/39 resp. 95/97 recover on a bigger iteration budget), so §7's solver
+follow-ups are the next lever, not this design. The causal slope clamp never
+fires on either real table (b/α − 1 ≈ 1/3 is far below 0.99) and fires at every
+seam point of the synthetic *ideal* gas, which is what keeps it covered in CI.
+The §5 map's real news: the **x-low band is ~50–58% acausal** — the follow-up
+that §7 anticipated, and where the last acausal failure paths live. The one
+thing the fix makes worse: ~0.5% of the u-high band acquires `c_s² ≤ 0` (and
+~0.02% `p ≤ 0`) deep in the tail, where it previously had `c_s² ≥ 1`; that is
+harmless for the §9 inner-solve proof (which needs only `c_s² < 1`) but the map
+carries a report-only `cs2_nonpositive` class per band so it stays visible.
 
 ## 1. Problem
 
@@ -104,6 +125,16 @@ If the map shows the x-low band matters beyond that one path, its fix is a
 follow-up (same effective-track clamp toolbox). The x-hi band stays hard-invalid
 (`flag_oob_rho_high`) regardless — causality there is nice-to-have, not load-
 bearing.
+
+**Measured (2026-08-27, first run of the map).** It matters: **50.5% (SRO) /
+58.3% (LS220) of the x-low band has `c_s² ≥ 1`** (worst excess 0.84 / 0.79), and
+after M3g every remaining acausal con2prim failure path lands there — including
+the same three sampled states on *both* tables, which is the signature of a tail
+construction rather than of table data. The u-low band is nearly clean (23 / 46
+points), x-hi is 98–99% acausal and stays report-only. Implementation choice made
+here: the u-low/u-high/x-low bands count toward `adapter_needs_attention()`, x-hi
+does not, since §7 of `eos-adapter-F-to-U.md` already makes a converged state
+there invalid outright. Full numbers in CODE.md's M3g findings block.
 
 ## 6. Tests and acceptance
 

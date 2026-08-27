@@ -373,6 +373,143 @@ which is why the M3f cap could not move the tail:
   identical stage reaches exactly zero) while `integration.sh` asserts only detection
   plus reduction on the coarse preset.
 
+**M3g empirical findings — causal extension tails** (`eos-causal-tail.md`, measured
+2026-08-27 on the two local tables; "before" is the same binary built at the pre-M3g
+commit, same seeds, same states, so every pair below is apples to apples):
+
+- **The u-high extension is causal now.** Public-API scan of the whole u-HIGH band
+  (120 ρ columns × 24 Ye × 32 samples across the 8-cell extension = 92,160 points):
+  LS220 `c_s² ≥ 1` **88.4% → 0.007%** (max `c_s²` **3.814 → 1.012**), SRO
+  **88.0% → 0.009%** (max **3.857 → 1.009**). Before, the crossing began in the first
+  blend cell (45% of it) and saturated ≈ 3.8 everywhere beyond; after, cells 1–8 past the
+  seam are *exactly* clean and every survivor sits in the blend cell above the known
+  residual ρ_max/T_max acausal corner — i.e. the tail now inherits the data's own residue
+  (in-box `cs2_acausal` max excess 0.023 / 0.016, unchanged by M3g) instead of
+  manufacturing a defect of its own. Deep in the tail `c_s²` measures **0.339 / 0.340**:
+  the fitted slopes are b = 4·ln10 and α ≈ 3·ln10 per decade of T, so the far-tail value
+  is b/α − 1 = 1/3 — the design's claim, and the physically correct hot-gas asymptote,
+  not merely a bound.
+- **What the u-high band trades for it: a little `c_s² ≤ 0`, in place of a lot of
+  `c_s² ≥ 1`.** Same 92,160-point scan, before → after: `c_s² ≤ 0` **0 → 424 (0.46%)**
+  on LS220 and **0 → 459 (0.50%)** on SRO, `p ≤ 0` **0 → 15 (0.016%)** and
+  **0 → 26 (0.028%)**, both deep in the tail where the log-σ tail's fixed-s slope turns
+  the pressure gradient over. This is a *good* trade, not a hidden cost: the con2prim §9
+  inner-solve proof needs `z_w = z(1 − c_s²)tanh w > 0`, i.e. only `c_s² < 1` — a negative
+  `c_s²` makes `z_w` more positive, while `c_s² > 1` flipped its sign, which is what broke
+  the proof in the first place. Physicality in the extensions is explicitly not guaranteed
+  (`eos-adapter-F-to-U.md` §7), the whole band is flagged, and the measured con2prim
+  outcome below is the arbiter. It is nonetheless the one thing this change makes *worse*,
+  so class E carries a report-only `ext_<band>_cs2_nonpositive` per band (one metric more
+  than `eos-causal-tail.md` §5 asked for) to keep it visible.
+- **The causal slope clamp never fires on a real table — and always fires on the
+  synthetic one.** Seam scan over (ρ*, Ye) at 46,233 (LS220) / 102,311 (SRO) points:
+  clamp active **0**, monotonicity-floor conflicts **0**. Both hot seams have
+  b/α − 1 ≈ 1/3, a factor 3 below `cs2_ext_cap = 0.99`. The synthetic ideal gas is the
+  opposite case — its entropy is *linear* in u, so α = σ_u/σ is small and the raw
+  b/α − 1 ≈ 21 — and trips the clamp at 100% of its seam points, which is what keeps the
+  clamp arithmetic covered in CI. What it costs there, and only there: class D
+  `extension_seam_jump` **4.60e-7 → 1.36e-6** (the clamp is C1, not C2 — it lowers L's
+  tail *curvature* and leaves the seam value and slope alone, so U and U_s stay continuous
+  and only their derivatives jump), and 456/20,000 `soak_extended` samples acquire
+  `c_s² ≤ 0` (worst −0.25) inside that one blend cell, where the strongly negative L_uu
+  lives. Both are flagged territory only; `c_s² ≤ 0` does not endanger the §9 inner-solve
+  proof, which needs `c_s² < 1`. On the real tables `extension_seam_jump` is
+  **bit-identical** before and after (2.301928 / 94.58427).
+- **The failure tail — the acceptance metric — at 40,000 states**
+  (`eos_test --level con2prim`, before → after):
+
+  | metric | LS220 | SRO |
+  |---|---|---|
+  | warm failures (no_bracket + max_iter) | 86 → **31** | 163 → **82** |
+  | cold failures (of 4,000) | 16 → **8** | 30 → **15** |
+  | silent wrong-root convergences | 18 → **0** | 25 → **0** |
+  | `c2p_roundtrip` count | 94 → **14** | 164 → **23** |
+  | `rt_tau` p999 | 4.61e-3 → **9.63e-13** | 9.46e-1 → **9.88e-13** |
+  | `rt_tau` max | 1.000 → 0.968 | 2.118 → 0.481 |
+  | `rt_S` p999 | 1.47e-12 → 1.23e-12 | 9.58e-1 → **1.21e-12** |
+  | M3e policy interventions | 103 → 31 | 183 → 82 |
+  | warm throughput (solves/s) | 1.97e5 → 1.87e5 | 1.58e5 → 1.69e5 |
+
+  (The throughput row is run-to-run noise on a loaded laptop, in both directions; the
+  controlled measurement is the micro-benchmark in the "Nothing inside the box moved"
+  bullet below.)
+
+  The wrong-root class is gone outright, and `rt_tau`'s p999 collapses by ~5×10⁹ (LS220)
+  and ~10¹² (SRO) into the 1e-13 bulk — the design's sharpest prediction, confirmed. The
+  policy layer's `ceiling` interventions (the τ-runaway signature of a wrong root) go
+  **44 → 0** and **73 → 0**, and its battery's cold-re-solve misses **2 → 0** / **1 → 0**.
+- **What the residual is: class B, as scoped.** Path probes at fixed truth s over
+  w ∈ [0, 6.5] (scratch `c2p_tail`): failing paths that go acausal anywhere
+  **97/102 → 4/39** (LS220) and **185/193 → 5/97** (SRO); paths with `z_w ≤ 0` anywhere
+  **97 → 4** and **185 → 5**. Every remaining failure carries residuals at the f2
+  precision floor (|f1| ~ 1e-12, |f2| ~ 1e-14) at high rapidity, and **35/39** resp.
+  **95/97** converge on a retry with a larger iteration budget — the class-B signature of
+  the previous findings block, whose fix is solver-side and out of this design's scope.
+  The 4 (LS220) resp. 5 (SRO) still-acausal paths reach an **x**-tail, never the u-high
+  one: all 4 LS220 and 4 of the 5 SRO carry `flag_ext_rho_low` (the **x-low** band —
+  `eos-causal-tail.md` §5's follow-up, and the same three sampled states k = 20628, 21010,
+  24201 on *both* tables, which is the signature of a tail construction rather than of
+  table data), the fifth `flag_oob_rho_high` (the hard-invalid x-high band). (The probe's
+  `f1_slope_flips` counter stays nonzero on many paths, but it is a finite-difference sign
+  test applied to an f1 that is itself ~1e-12 there — noise, not non-monotonicity.
+  `z_w > 0` is the meaningful statement, and it now holds on 35/39 resp. 92/97.)
+- **The new extension-band map (check_adapter class E) is what makes the rest visible.**
+  Deterministic (4-per-cell along the band, 2-per-cell along the other two axes) scan of
+  all four bands. M3g changed only the u-HIGH band's construction, so for the other three
+  this is a *first measurement*, not a before/after:
+
+  | LS220 band | samples | `c_s² ≥ 1` | `c_s² ≤ 0` | `p ≤ 0` | `σ_u ≤ 0` |
+  |---|---|---|---|---|---|
+  | u_low  | 1,479,456 | 23 | 11,992 | 2,440 | 0 |
+  | u_high | 1,479,456 | 237 | 6,883 | 226 | 0 |
+  | x_low  | 858,528 | 500,561 | 79,634 | 0 | 0 |
+  | x_high | 858,528 | 846,501 | 0 | 0 | 0 |
+
+  | SRO band | samples | `c_s² ≥ 1` | `c_s² ≤ 0` | `p ≤ 0` | `σ_u ≤ 0` |
+  |---|---|---|---|---|---|
+  | u_low  | 3,273,952 | 46 | 6,932 | 0 | 0 |
+  | u_high | 3,273,952 | 262 | 16,573 | 933 | 0 |
+  | x_low  | 1,362,400 | 688,076 | 107,006 | 0 | 0 |
+  | x_high | 1,362,400 | 1,353,891 | 0 | 0 | 0 |
+
+  (`c_s² ≤ 0` is the report-only fourth metric; in the u_low and both x bands, which M3g
+  does not touch, it is pre-existing.) u_high's `c_s² ≥ 1` residue is the ρ_max/T_max data
+  corner (max excess over 1: 0.040 / 0.015).
+  **x_low is the real news**: ~50–58% of that band is acausal (max excess 0.79 / 0.84),
+  confirming §5's suspicion from a single failing path — that band is a genuine follow-up,
+  and it is exactly where the surviving acausal failure paths live. x_high is 98–99%
+  acausal but is *report-only* by design: `flag_oob_rho_high` already makes any converged
+  state there invalid outright (`eos-adapter-F-to-U.md` §7), so its tail exists only to
+  keep an iterate finite until the caller discards it; the other three bands are places a
+  converged, flagged, legitimately-used state can live, so they count as violations.
+  `σ_u ≤ 0` is zero in every band on both tables — the monotonicity guard holds, in log
+  space as it did in linear space.
+- **Nothing inside the box moved.** `aeval_extended()` is *bit-identical* to a plain
+  `bspline_eval3()` at every in-box point (asserted bit-for-bit, both fields, all 7 spline
+  outputs, in `tests/test_adapter_tail.cpp`), and every in-box **warm** `evaluate()` is
+  bit-identical across the change at 6,000 random points (4,000 synthetic + 2,000 LS220,
+  all 12 `EOSPoint` members compared as raw bits). In-box **cold** solves do move, in
+  their last digits only, because the secant seed is built from the extended bracket's
+  endpoints and `srange_extended().s_max` legitimately grew: LS220 mean cold iterations
+  9.23 → 9.28, 11 of 2,000 points differing in `u_solved` by more than 1e-12 relative
+  (all inside the T-solve's own 1e-12 convergence tolerance). Adapter class B
+  `roundtrip_T` LS220 **10 → 8**, SRO **3000 → 3001**; `cs2_acausal` 132 → 132 and
+  135 → 135; `cs2_nonpositive` 5 → 4 and 4 → 4. `evaluate()` throughput is unchanged
+  (micro-benchmark on LS220: cold 0.59 → 0.59 Meval/s, warm 1.34 → 1.52 Meval/s).
+- **`srange_extended().s_max` grows, as designed.** LS220 ratio to the physical `s_max`
+  is **2.3–3.0× → 3.3–6.0×** (the design's ~10^0.8 ≈ 6 at the top of the range); on
+  the synthetic ideal gas it barely moves (1.06–1.11×), because the growth factor is
+  `exp(α·(u_ext_hi − u_hi))` and α is small there. Nothing downstream is sized to it;
+  `tests/test_adapter_tail.cpp` pins both numbers deliberately.
+- **Two 1-in-10⁵ leftovers, both benign and both flagged.** The LS220 physicality soak
+  picks up one `flag_maxiter` per 200k–400k samples where it had none: (a) in-box, a cold
+  Newton oscillation inside one of the documented σ_u pockets at ρ ≈ 1e14 (10 of 11 warm
+  starts at the same state converge; the whole solve is in-box, so the tails cannot be the
+  cause — only the seed changed); (b) in the extended soak, a point in the *hard-invalid*
+  ρ > ρ_max corner that converged to |σ_ext − s| = 2.5e-12 against a 1.7e-12 threshold,
+  i.e. a sub-2× tolerance miss at the corner's roundoff floor. Both are reported, flagged,
+  and unrelated to causality.
+
 ## Milestones
 
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,
@@ -402,14 +539,25 @@ which is why the M3f cap could not move the tail:
   for a GPU fixed-trip count). Known open items: (i) ~~the shared ~0.2–0.8% failure
   tail~~ — **root-caused 2026-08-27** (see "M3 failure-tail root cause" above): ~95%
   is the acausal u-high extension breaking the inner solve's monotonicity proof
-  (fix designed, `eos-causal-tail.md`), ~5% is bracket-scan coarseness plus an f2
-  precision floor at radiation-dominated low-ρ states (solver-side follow-ups listed
-  there); (ii) the RePrimAnd benchmark (external library build — decide separately).
+  (**fixed by M3g** below — that class is gone, the wrong-root class with it), ~5% is
+  bracket-scan coarseness plus an f2 precision floor at radiation-dominated low-ρ states
+  (solver-side follow-ups, still open, and now the whole of the residual);
+  (ii) the RePrimAnd benchmark (external library build — decide separately).
 - **M3f:** ✅ complete — the causal-cap repair stage of `eos-causality-repair.md`
   (`RepairOptions::causal_cap`, on by default; `eos_repair --no-causal-cap` / `--cs2-cap
   X`), which makes the *data* causal before the fit rather than clamping `c_s²` at run
   time (a clamped `cs2` would correspond to no single potential `U` and would silently
   break the Newton's identities). Measured outcome above.
+- **M3g:** ✅ complete — the causal extension tails of `eos-causal-tail.md`, the run-time
+  counterpart of M3f: the u-HIGH σ tail is built in **log space** (`g = lnσ` run through
+  the same curvature-ramp machinery, mapped back), which makes the far tail's fixed-s
+  slope constant and equal to the radiation asymptote `b/α − 1 = 1/3` instead of crossing
+  `c_s² = 1` one grid cell past every hot seam; and L's u-high tail carries a **causal
+  slope clamp** (`b_eff ≤ (1 + cs2_ext_cap)·α_eff`, `BuildOptions::cs2_ext_cap = 0.99`,
+  the monotonicity floor winning any conflict). `check_adapter()` grew the class E
+  **extension-band map** over all four bands. `eos-adapter-F-to-U.md` §7's guiding
+  principle gained the word *causal*. Measured outcome above; the x-low band's acausality
+  and the class-B solver work are the tracked follow-ups (`eos-causal-tail.md` §7).
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
   fixed-iteration evaluate/con2prim variants.
 

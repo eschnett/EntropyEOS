@@ -592,6 +592,176 @@ void audit_seam_jumps(const EntropyEOSView &view, size_t worst_n, CheckClassResu
   out = total.finalize("extension_seam_jump");
 }
 
+// --- E. Extension-band c_s^2 map (M3g, eos-causal-tail.md S5) -------------
+//
+// See check_adapter()'s doc comment for the design. One band = one of the
+// four extension zones; the band axis is walked at opts.ext_band_refine
+// samples per grid cell (skipping the seam itself, which is in-box), the two
+// other axes at opts.ext_band_other_refine over their physical ranges.
+// Points are evaluated through EntropyEOSView::eval_at() -- native (x,u,y)
+// coordinates, no T-solve -- plus one extended sigma sample for the tail's
+// own sigma_u.
+
+// The four bands, in the report's fixed order.
+enum class Band { u_low = 0, u_high = 1, x_low = 2, x_high = 3 };
+const char *const kBandNames[4] = {"u_low", "u_high", "x_low", "x_high"};
+
+// Sample count for one axis spanned by `n_nodes` table nodes at `refine`
+// samples per cell.
+size_t axis_samples(int n_nodes, size_t refine) {
+  return static_cast<size_t>(n_nodes - 1) * refine + 1;
+}
+
+void audit_ext_band(const EntropyEOSView &view, const AdapterCheckOptions &opts, Band band,
+                     std::vector<CheckClassResult> &out, size_t &n_samples) {
+  const std::string suffix = std::string("ext_") + kBandNames[static_cast<int>(band)] + "_";
+  const size_t refine = opts.ext_band_refine;
+  const size_t other = opts.ext_band_other_refine;
+
+  if (refine == 0 || other == 0) {
+    n_samples = 0;
+    out.push_back(skipped_class(suffix + "cs2_acausal"));
+    out.push_back(skipped_class(suffix + "p_nonpositive"));
+    out.push_back(skipped_class(suffix + "sigma_u_nonpositive"));
+    out.push_back(skipped_class(suffix + "cs2_nonpositive"));
+    return;
+  }
+
+  const bool u_band = band == Band::u_low || band == Band::u_high;
+  // Band axis: `n_band` samples strictly inside the extension zone, from the
+  // seam outward (index 1..n_band, so the in-box seam itself is excluded).
+  const double seam = band == Band::u_low   ? view.u_lo
+                      : band == Band::u_high ? view.u_hi
+                      : band == Band::x_low  ? view.x_lo
+                                              : view.x_hi;
+  const double edge = band == Band::u_low   ? view.u_ext_lo
+                      : band == Band::u_high ? view.u_ext_hi
+                      : band == Band::x_low  ? view.x_ext_lo
+                                              : view.x_ext_hi;
+  const double h = u_band ? view.sigma.hu : view.sigma.hx;
+  const int ext_cells = std::max(1, static_cast<int>(std::lround(std::fabs(edge - seam) / h)));
+  const size_t n_band = static_cast<size_t>(ext_cells) * refine;
+  const double d_band = (edge - seam) / static_cast<double>(n_band);
+
+  // The two other axes, over their physical ranges.
+  const size_t n_a = u_band ? axis_samples(view.sigma.nx, other) : axis_samples(view.sigma.nu, other);
+  const double a_lo = u_band ? view.x_lo : view.u_lo;
+  const double a_hi = u_band ? view.x_hi : view.u_hi;
+  const size_t n_y = axis_samples(view.sigma.ny, other);
+
+  n_samples = n_band * n_a * n_y;
+
+  const int nthreads = max_threads();
+  std::vector<Accum> local_cs2(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+  std::vector<Accum> local_p(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+  std::vector<Accum> local_sig(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+  std::vector<Accum> local_cs2neg(static_cast<size_t>(nthreads), Accum(opts.worst_n));
+
+  const detail::ExtSpec sig_spec = view.sigma_ext_spec();
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long long ia_ll = 0; ia_ll < static_cast<long long>(n_a); ++ia_ll) {
+    const size_t ia = static_cast<size_t>(ia_ll);
+    const size_t tid = static_cast<size_t>(this_thread());
+    const double a = n_a > 1 ? a_lo + (a_hi - a_lo) * static_cast<double>(ia) /
+                                          static_cast<double>(n_a - 1)
+                             : a_lo;
+    for (size_t iy = 0; iy < n_y; ++iy) {
+      const double y = n_y > 1 ? view.y_lo + (view.y_hi - view.y_lo) * static_cast<double>(iy) /
+                                                 static_cast<double>(n_y - 1)
+                                : view.y_lo;
+      for (size_t ib = 1; ib <= n_band; ++ib) {
+        const double c = seam + d_band * static_cast<double>(ib);
+        const double x = u_band ? a : c;
+        const double u = u_band ? c : a;
+
+        const EOSPoint pt = view.eval_at(x, u, y, 0u, 0);
+        const double sigma_u = detail::aeval_extended(view.sigma, x, u, y, sig_spec).fu;
+
+        Loc loc;
+        loc.rho = std::pow(10.0, x);
+        loc.temp = std::pow(10.0, u);
+        loc.ye = y;
+
+        if (std::isfinite(pt.cs2)) {
+          Loc l = loc;
+          l.value = pt.cs2 - 1.0;
+          local_cs2[tid].add_violation(pt.cs2 - 1.0, pt.cs2 >= 1.0, l);
+          Loc l2 = loc;
+          l2.value = pt.cs2;
+          local_cs2neg[tid].add_violation(pt.cs2, pt.cs2 <= 0.0, l2);
+        }
+        if (std::isfinite(pt.p)) {
+          Loc l = loc;
+          l.value = pt.p;
+          local_p[tid].add_violation(pt.p, pt.p <= 0.0, l);
+        }
+        if (std::isfinite(sigma_u)) {
+          Loc l = loc;
+          l.value = sigma_u;
+          local_sig[tid].add_violation(sigma_u, sigma_u <= 0.0, l);
+        }
+      }
+    }
+  }
+
+  Accum acc_cs2(opts.worst_n), acc_p(opts.worst_n), acc_sig(opts.worst_n), acc_cs2neg(opts.worst_n);
+  for (int t = 0; t < nthreads; ++t) {
+    acc_cs2.merge_from(local_cs2[static_cast<size_t>(t)]);
+    acc_p.merge_from(local_p[static_cast<size_t>(t)]);
+    acc_sig.merge_from(local_sig[static_cast<size_t>(t)]);
+    acc_cs2neg.merge_from(local_cs2neg[static_cast<size_t>(t)]);
+  }
+  out.push_back(acc_cs2.finalize(suffix + "cs2_acausal"));
+  out.push_back(acc_p.finalize(suffix + "p_nonpositive"));
+  out.push_back(acc_sig.finalize(suffix + "sigma_u_nonpositive"));
+  out.push_back(acc_cs2neg.finalize(suffix + "cs2_nonpositive"));
+}
+
+// The u_hi seam walk that reports where M3g's causal slope clamp binds and
+// where it lost to the monotonicity floor (eos-causal-tail.md S3).
+void audit_causal_clamp_seam(const EntropyEOSView &view, const AdapterCheckOptions &opts, size_t &n,
+                              size_t &active, size_t &floor_wins) {
+  n = active = floor_wins = 0;
+  const size_t other = opts.ext_band_other_refine;
+  if (other == 0 || opts.ext_band_refine == 0) return;
+
+  const size_t n_x = axis_samples(view.sigma.nx, other);
+  const size_t n_y = axis_samples(view.sigma.ny, other);
+
+  const int nthreads = max_threads();
+  std::vector<size_t> local_active(static_cast<size_t>(nthreads), 0),
+      local_floor(static_cast<size_t>(nthreads), 0);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long long ix_ll = 0; ix_ll < static_cast<long long>(n_x); ++ix_ll) {
+    const size_t ix = static_cast<size_t>(ix_ll);
+    const size_t tid = static_cast<size_t>(this_thread());
+    const double x = n_x > 1 ? view.x_lo + (view.x_hi - view.x_lo) * static_cast<double>(ix) /
+                                               static_cast<double>(n_x - 1)
+                             : view.x_lo;
+    const double rho = std::pow(10.0, x);
+    for (size_t iy = 0; iy < n_y; ++iy) {
+      const double y = n_y > 1 ? view.y_lo + (view.y_hi - view.y_lo) * static_cast<double>(iy) /
+                                                 static_cast<double>(n_y - 1)
+                                : view.y_lo;
+      const UHighTailInfo info = view.u_high_tail_info(rho, y);
+      if (info.clamped) ++local_active[tid];
+      if (info.floor_wins) ++local_floor[tid];
+    }
+  }
+
+  n = n_x * n_y;
+  for (int t = 0; t < nthreads; ++t) {
+    active += local_active[static_cast<size_t>(t)];
+    floor_wins += local_floor[static_cast<size_t>(t)];
+  }
+}
+
 } // namespace
 
 AdapterReport check_adapter(const EntropyEOS &adapter, const RawTable &table,
@@ -647,6 +817,14 @@ AdapterReport check_adapter(const EntropyEOS &adapter, const RawTable &table,
   audit_seam_jumps(view, opts.worst_n, seam_jump);
   report.classes.push_back(std::move(seam_jump));
 
+  // --- E. Extension-band map (M3g) -----------------------------------------
+  for (int b = 0; b < 4; ++b) {
+    audit_ext_band(view, opts, static_cast<Band>(b), report.classes,
+                   report.ext_band_n[static_cast<size_t>(b)]);
+  }
+  audit_causal_clamp_seam(view, opts, report.ext_clamp_seam_n, report.ext_clamp_active,
+                           report.ext_clamp_floor_wins);
+
   report.fatal_messages = std::move(fatal_messages);
   report.status = any_fatal ? Status::fatal : Status::ok;
   return report;
@@ -657,7 +835,19 @@ bool adapter_needs_attention(const AdapterReport &report) {
   static const char *const kRelevant[] = {"spline_sigma_u_nonpositive", "spline_L_u_nonpositive",
                                            "roundtrip_T",                "That_nonpositive",
                                            "p_nonpositive",              "cs2_nonpositive",
-                                           "cs2_acausal"};
+                                           "cs2_acausal",
+                                           // M3g class E: the three bands a converged, flagged,
+                                           // legitimately-used state can live in. The x_high band is
+                                           // deliberately absent -- see adapter_audit.hpp.
+                                           "ext_u_low_cs2_acausal",
+                                           "ext_u_low_p_nonpositive",
+                                           "ext_u_low_sigma_u_nonpositive",
+                                           "ext_u_high_cs2_acausal",
+                                           "ext_u_high_p_nonpositive",
+                                           "ext_u_high_sigma_u_nonpositive",
+                                           "ext_x_low_cs2_acausal",
+                                           "ext_x_low_p_nonpositive",
+                                           "ext_x_low_sigma_u_nonpositive"};
   for (const CheckClassResult &c : report.classes) {
     for (const char *name : kRelevant) {
       if (c.name == name && c.count > 0) return true;
@@ -703,6 +893,12 @@ void AdapterReport::print(std::ostream &os) const {
       }
     }
   }
+
+  os << "\nextension-band map (M3g): samples u_low=" << ext_band_n[0] << " u_high=" << ext_band_n[1]
+     << " x_low=" << ext_band_n[2] << " x_high=" << ext_band_n[3]
+     << " (x_high is report-only, never an exit-code violation)\n";
+  os << "  u_hi causal slope clamp: seam points=" << ext_clamp_seam_n << " clamp active="
+     << ext_clamp_active << " monotonicity floor won=" << ext_clamp_floor_wins << "\n";
 
   os << "\nphysicality soak: n=" << soak_n << " maxiter_count=" << maxiter_count
      << " evals_per_sec=" << std::scientific << std::setprecision(6) << evals_per_sec << " evals/sec\n";

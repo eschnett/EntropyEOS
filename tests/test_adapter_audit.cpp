@@ -111,6 +111,33 @@ TEST_CASE("check_adapter: clean synthetic (default grid) reports zero violations
   CHECK(find_class(report, "cs2_nonpositive").count == 0);
   CHECK(find_class(report, "cs2_acausal").count == 0);
 
+  // M3g class E: on a clean synthetic table every extension band -- the
+  // report-only x_high one included -- must come out clean on the three
+  // violation metrics.
+  for (const char *band : {"u_low", "u_high", "x_low", "x_high"}) {
+    const std::string prefix = std::string("ext_") + band + "_";
+    CHECK(find_class(report, prefix + "cs2_acausal").count == 0);
+    CHECK(find_class(report, prefix + "p_nonpositive").count == 0);
+    CHECK(find_class(report, prefix + "sigma_u_nonpositive").count == 0);
+  }
+  // "ext_<band>_cs2_nonpositive" is REPORT-ONLY and nonzero by design on this
+  // table: the ideal gas's linear entropy makes M3g's causal clamp bind at
+  // every u_hi seam point, and the strongly negative L_uu it installs inside
+  // the single blend cell drives c_s^2 slightly negative there. Harmless --
+  // the con2prim inner-solve proof needs c_s^2 < 1, not c_s^2 > 0 -- so this
+  // is printed, not asserted (see adapter_audit.hpp's class E note).
+  MESSAGE("test_adapter_audit 1: ext_<band>_cs2_nonpositive counts u_low="
+          << find_class(report, "ext_u_low_cs2_nonpositive").count
+          << " u_high=" << find_class(report, "ext_u_high_cs2_nonpositive").count
+          << " x_low=" << find_class(report, "ext_x_low_cs2_nonpositive").count
+          << " x_high=" << find_class(report, "ext_x_high_cs2_nonpositive").count);
+  for (size_t b = 0; b < 4; ++b) CHECK(report.ext_band_n[b] > 0);
+  // The causal slope clamp binds everywhere on this (ideal-gas, i.e.
+  // linear-entropy) table, and never loses to the monotonicity floor.
+  CHECK(report.ext_clamp_seam_n > 0);
+  CHECK(report.ext_clamp_active == report.ext_clamp_seam_n);
+  CHECK(report.ext_clamp_floor_wins == 0);
+
   CHECK(report.maxiter_count == 0);
   CHECK_FALSE(eeos::adapter_needs_attention(report));
 }
@@ -292,6 +319,38 @@ TEST_CASE("adapter_needs_attention: physicality/monotonicity/roundtrip/maxiter d
     CHECK(eeos::adapter_needs_attention(r));
   }
 
+  // M3g class E: the three bands a converged, flagged, legitimately-used
+  // state can live in are violations; the x_high band is report-only,
+  // because eos-adapter-F-to-U.md S7 makes any converged state above
+  // rho_max invalid outright (see adapter_audit.hpp's class E note).
+  SUBCASE("an extension-band violation in u_low/u_high/x_low forces true") {
+    for (const char *name : {"ext_u_low_cs2_acausal", "ext_u_high_cs2_acausal",
+                              "ext_x_low_cs2_acausal", "ext_u_high_p_nonpositive",
+                              "ext_x_low_sigma_u_nonpositive"}) {
+      AdapterReport r = clean;
+      CheckClassResult c;
+      c.name = name;
+      c.count = 1;
+      r.classes.push_back(c);
+      CHECK_MESSAGE(eeos::adapter_needs_attention(r), "class '" << name << "' should be a violation");
+    }
+  }
+
+  SUBCASE("the x_high band and every per-band cs2_nonpositive are report-only") {
+    AdapterReport r = clean;
+    for (const char *name : {"ext_x_high_cs2_acausal", "ext_x_high_p_nonpositive",
+                              "ext_x_high_sigma_u_nonpositive", "ext_u_low_cs2_nonpositive",
+                              "ext_u_high_cs2_nonpositive", "ext_x_low_cs2_nonpositive",
+                              "ext_x_high_cs2_nonpositive"}) {
+      CheckClassResult c;
+      c.name = name;
+      c.count = 1000000;
+      r.classes.push_back(c);
+    }
+    r.ext_clamp_floor_wins = 42; // also report-only
+    CHECK_FALSE(eeos::adapter_needs_attention(r));
+  }
+
   SUBCASE("delta_T/delta_p are diagnostics: a forced nonzero count never triggers it") {
     AdapterReport r = clean;
     CheckClassResult dT, dp;
@@ -306,9 +365,32 @@ TEST_CASE("adapter_needs_attention: physicality/monotonicity/roundtrip/maxiter d
 
   SUBCASE("every class present but all zero-count is still clean") {
     AdapterReport r = clean;
-    for (const char *name : {"spline_sigma_u_nonpositive", "spline_L_u_nonpositive", "roundtrip_T",
-                              "delta_T", "delta_p", "That_nonpositive", "p_nonpositive",
-                              "cs2_nonpositive", "cs2_acausal"}) {
+    for (const char *name : {"spline_sigma_u_nonpositive",
+                              "spline_L_u_nonpositive",
+                              "roundtrip_T",
+                              "delta_T",
+                              "delta_p",
+                              "That_nonpositive",
+                              "p_nonpositive",
+                              "cs2_nonpositive",
+                              "cs2_acausal",
+                              "extension_seam_jump",
+                              "ext_u_low_cs2_acausal",
+                              "ext_u_low_p_nonpositive",
+                              "ext_u_low_sigma_u_nonpositive",
+                              "ext_u_low_cs2_nonpositive",
+                              "ext_u_high_cs2_acausal",
+                              "ext_u_high_p_nonpositive",
+                              "ext_u_high_sigma_u_nonpositive",
+                              "ext_u_high_cs2_nonpositive",
+                              "ext_x_low_cs2_acausal",
+                              "ext_x_low_p_nonpositive",
+                              "ext_x_low_sigma_u_nonpositive",
+                              "ext_x_low_cs2_nonpositive",
+                              "ext_x_high_cs2_acausal",
+                              "ext_x_high_p_nonpositive",
+                              "ext_x_high_sigma_u_nonpositive",
+                              "ext_x_high_cs2_nonpositive"}) {
       CheckClassResult c;
       c.name = name;
       c.count = 0;
@@ -372,10 +454,23 @@ TEST_CASE("check_adapter: extension_seam_jump small and soak_extended clean on s
   // core/adapter_eval.hpp's TAIL MATHEMATICS; the guard/slope-zero
   // overrides that would drop to C1/C0 do not activate on this table's
   // comfortably-positive boundary slopes).
+  //
+  // M3g raised this bound from 1e-6 to 3e-6 DELIBERATELY, measured
+  // 4.60e-7 -> 1.36e-6 on this table. The causal slope clamp
+  // (eos-causal-tail.md S3) binds at every u_hi seam point of the SYNTHETIC
+  // IDEAL GAS -- whose entropy is linear, not exponential, in u, so the
+  // criterion b <= (1 + cs2_ext_cap)*alpha is far stricter there than actual
+  // causality -- and the clamp is C1, not C2: it lowers L's tail curvature
+  // while leaving its seam value and slope alone, so U and U_s stay
+  // continuous (which is what this metric measures) but their derivatives
+  // jump, and a +-1e-7 straddle of the seam picks that up at exactly this
+  // scale. The metric is UNCHANGED to the last digit on both real tables
+  // (LS220 2.301928, SRO 94.58427 -- see test 7), where the radiation-like
+  // hot seam has b/alpha - 1 ~ 1/3 and the clamp never fires at all.
   const CheckClassResult &seam = find_class(report, "extension_seam_jump");
   MESSAGE("test_adapter_audit 6: extension_seam_jump max = " << seam.max);
   CHECK(seam.count == 0);
-  CHECK(seam.max <= 1e-6);
+  CHECK(seam.max <= 3e-6);
 
   // soak_extended (opts.soak_extended=true): the S7/M2d-2 extension zones
   // must be finite (status==ok already established that: a non-finite
@@ -436,6 +531,13 @@ void run_real_table_soak_extended(const std::string &full_path, const char *labe
   aopts.node_stride = 25;
   aopts.soak_n = eeos_n(20000, 1000); // soak_extended; see test_scale.hpp
   aopts.soak_extended = true;
+  // Skip M3g's class E band map here: at the defaults it is ~5-9 million
+  // evaluated points per real table, several times this whole test's own
+  // cost, and it is not what this test is about (soak_extended and the
+  // seam-jump diagnostic are). The band map's real home is
+  // `eos_test --level adapter`, which tests/integration.sh runs on both real
+  // tables; tests/test_adapter_tail.cpp covers its u-high content directly.
+  aopts.ext_band_refine = 0;
   const AdapterReport report = eeos::check_adapter(adapter, table, aopts);
 
   CHECK(report.status != eeos::Status::fatal);

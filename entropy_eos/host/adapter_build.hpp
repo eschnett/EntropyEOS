@@ -56,6 +56,15 @@ struct BuildOptions {
   // log10(eps+shift) per decade of T for L). Must be > 0.
   double ext_slope_floor_sigma = 1e-6;
   double ext_slope_floor_L = 1e-8;
+
+  // M3g causal extension tails (eos-causal-tail.md; core/adapter_eval.hpp's
+  // "CAUSAL TAILS"): the causality bound the u-HIGH tail's asymptotic
+  // slopes are held to, c_s^2(tail) = b/alpha - 1 <= cs2_ext_cap, enforced
+  // by lowering L's effective tail slope where needed. Default 0.99, the
+  // same value as the M3f data-side RepairOptions::cs2_cap. The
+  // monotonicity floor ext_slope_floor_L wins lexicographically if the two
+  // ever conflict (reported by check_adapter()'s extension-band map).
+  double cs2_ext_cap = 0.99;
 };
 
 // One location recorded by the monotonicity audit below: the refined-grid
@@ -94,7 +103,8 @@ public:
   EntropyEOS(Bspline3 sigma, Bspline3 L, double kappa, double m_B_star_g, double m_B_table_g,
              double shift_hat, double conv_t, double x_lo, double x_hi, double u_lo, double u_hi,
              double y_lo, double y_hi, double x_ext_lo, double x_ext_hi, double u_ext_lo, double u_ext_hi,
-             double ext_slope_floor_sigma, double ext_slope_floor_L, AdapterAudit audit, int max_iter = 50);
+             double ext_slope_floor_sigma, double ext_slope_floor_L, double cs2_ext_cap,
+             AdapterAudit audit, int max_iter = 50);
 
   EntropyEOSView view() const;
 
@@ -120,6 +130,9 @@ public:
   double ext_slope_floor_sigma() const { return ext_slope_floor_sigma_; }
   double ext_slope_floor_L() const { return ext_slope_floor_L_; }
 
+  // M3g (BuildOptions::cs2_ext_cap).
+  double cs2_ext_cap() const { return cs2_ext_cap_; }
+
   int max_iter() const { return max_iter_; }
   const AdapterAudit &audit() const { return audit_; }
 
@@ -128,7 +141,7 @@ private:
   double kappa_, m_B_star_g_, m_B_table_g_, shift_hat_, conv_t_;
   double x_lo_, x_hi_, u_lo_, u_hi_, y_lo_, y_hi_;
   double x_ext_lo_, x_ext_hi_, u_ext_lo_, u_ext_hi_;
-  double ext_slope_floor_sigma_, ext_slope_floor_L_;
+  double ext_slope_floor_sigma_, ext_slope_floor_L_, cs2_ext_cap_;
   int max_iter_;
   AdapterAudit audit_;
 };
