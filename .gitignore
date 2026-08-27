@@ -7,13 +7,13 @@
 *.so
 *.dylib
 
-# Test and tool binaries
+# Test and tool binaries (pattern-based so a NEW tool's binary can never be
+# swept into a commit before .gitignore learns its name)
 tests/test_*
 !tests/test_*.cpp
 !tests/test_*.hpp
-tools/eos_crop
-tools/eos_repair
-tools/eos_test
+tools/*
+!tools/*.cpp
 
 # macOS debug-symbol bundles (clang -g)
 *.dSYM/
