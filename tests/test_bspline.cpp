@@ -362,13 +362,28 @@ TEST_CASE("fit_bspline_3d/bspline_eval3: separable product of low-degree factors
     const double x = xq(rng), u = uq(rng), y = yq(rng);
     const BsplineEval3 e = eeos::bspline_eval3(view, x, u, y);
 
-    CHECK(rel_err(e.f, A(x) * B(u) * C(y)) <= 1e-9);
-    CHECK(rel_err(e.fx, Ap(x) * B(u) * C(y)) <= 1e-9);
-    CHECK(rel_err(e.fu, A(x) * Bp(u) * C(y)) <= 1e-9);
-    CHECK(rel_err(e.fy, A(x) * B(u) * Cp(y)) <= 1e-9);
-    CHECK(rel_err(e.fxx, App(x) * B(u) * C(y)) <= 1e-9);
-    CHECK(rel_err(e.fxu, Ap(x) * Bp(u) * C(y)) <= 1e-9);
-    CHECK(rel_err(e.fuu, A(x) * Bpp(u) * C(y)) <= 1e-9);
+    // Mixed abs/rel bound (rel_err's `floor`), not a pure relative one: every
+    // reference here is a PRODUCT with a factor that vanishes inside the
+    // sampled box -- A(x)=x(x-1)(x+1) at x=-1,0,1; Ap(x)=3x^2-1 at
+    // x=+-0.577; App(x)=6x at x=0; Cp(y)=3y^2 at y=0. Near such a point the
+    // absolute error stays at roundoff (~1e-16) while the relative error
+    // grows without bound as 1/|ref|, so a pure relative bound tests only
+    // how close a random sample happened to land to a root. Measured on fy
+    // (three vanishing factors, the worst case): ref=2.1e-4 -> 2.3e-12,
+    // ref=8.0e-6 -> 3.5e-11, ref=1.8e-7 -> 1.2e-10 (arm64/clang), and
+    // 1.08e-8 for that last sample on x86-64/g++ -- roundoff amplified, not
+    // a fit error. The 1e-2 floor caps the bound at 1e-11 absolute in the
+    // vanishing region, still ~4 orders above the roundoff floor and so
+    // still a real exactness check, while away from the roots the original
+    // 1e-9 relative bound applies unchanged.
+    const double fl = 1e-2;
+    CHECK(rel_err(e.f, A(x) * B(u) * C(y), fl) <= 1e-9);
+    CHECK(rel_err(e.fx, Ap(x) * B(u) * C(y), fl) <= 1e-9);
+    CHECK(rel_err(e.fu, A(x) * Bp(u) * C(y), fl) <= 1e-9);
+    CHECK(rel_err(e.fy, A(x) * B(u) * Cp(y), fl) <= 1e-9);
+    CHECK(rel_err(e.fxx, App(x) * B(u) * C(y), fl) <= 1e-9);
+    CHECK(rel_err(e.fxu, Ap(x) * Bp(u) * C(y), fl) <= 1e-9);
+    CHECK(rel_err(e.fuu, A(x) * Bpp(u) * C(y), fl) <= 1e-9);
   }
 }
 
