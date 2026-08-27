@@ -321,13 +321,48 @@ nodes, "samples" are the stage's own (4,4,4) refined audit):
   states, before → after: LS220 warm failures 87 → 86, cold 18 → 16; SRO warm 162 → 163,
   cold 32 → 30; `rt_tau` p999/max unchanged on both. So the ~0.2–0.8% failure tail of M3
   open item (i) is **not** caused by in-box `c_s² ≥ 1`: it survives a 55× reduction of
-  the adapter's causality violations. Remaining candidates for it are the σ_T pockets
-  (which this stage deliberately leaves alone), states outside the physical box where the
-  x_hi extension tail is relaunched from the now-capped boundary values
-  (`eos-causality-repair.md` §9 item 4), and the bracketing/`max_iter` paths themselves.
-  The stage's value is therefore the conditioning argument (`z_w = z(1−c_s²)tanh w`
-  positive in-box, which is what a GPU fixed-iteration path needs) and table validity —
-  not a measured failure-rate win.
+  the adapter's causality violations. The stage's value is therefore the conditioning
+  argument (`z_w = z(1−c_s²)tanh w` positive in-box, which is what a GPU
+  fixed-iteration path needs) and table validity — not a measured failure-rate win.
+  (The tail's actual root cause was found the same day — see the next findings block.)
+
+**M3 failure-tail root cause (post-M3f investigation, 2026-08-27).** The residual
+con2prim failure tail (LS220 86 warm + 16 cold, SRO 163 + 30, per 40k warm / 4k cold
+states) was dissected state by state: the audit's sampling replicated exactly, every
+failing state probed along its trial path `ρ = D/cosh w`, w ∈ [0, 6.5], at fixed trial
+s, plus retry ladders. Two disjoint classes, neither of them in-box table physics —
+which is why the M3f cap could not move the tail:
+
+- **Class A (~95% of failures; plus 18/40k LS220 and 25/40k SRO *silent wrong-root
+  convergences*): the u-high (hot-entropy) extension is acausal, and that breaks the
+  fallback's correctness proof.** Every truth state is healthy (c_s² ≈ 0.33, no
+  flags), but 86/102 (LS220) / 174/193 (SRO) sit in the top ~5% of the log-T axis. A
+  trial w below truth raises ρ_trial = D/cosh(w); s_max(ρ) falls with ρ, so the fixed
+  trial s exceeds s_max(ρ_trial) and the T-solve enters the u-high tail — where
+  measured c_s² = 0.45 / 0.78 / **1.55** at 1.02× / 1.1× / 1.3× s_max: it crosses 1
+  about one grid cell past the seam and saturates ≈ 3.8, numerically identical on
+  both tables, so it is the *tail construction*, not the data (the curvature-ramp
+  tail guards σ_u/L_u monotonicity but nothing guards causality). With c_s² > 1,
+  `z_w < 0` and f1(w; s) is measurably non-monotone (2–6 slope sign flips per path in
+  97/102 resp. 185/193 failures) — the §9 inner-solve monotonicity proof does not
+  hold on the extended domain, the inner w-solve lands on wrong branches, the outer
+  g(s) becomes effectively garbage, and the outcomes are `no_bracket`, `max_iter`,
+  and fallback "convergences" onto spurious roots (s off by orders of magnitude,
+  round-trip errors ≈ 1; all but one carry `flag_ext_s_high`/`flag_ext_rho_low` on
+  the output, so a flag-honoring caller catches them). Fix designed in
+  `eos-causal-tail.md` (approval pending).
+- **Class B (~5%; LS220 5, SRO ~8 per 40k): radiation-dominated bracket coarseness
+  plus an f2 precision floor.** These never touch an extension (paths fully causal,
+  z_w > 0): ρ ~ 10⁴–10⁷ g/cc, T ≈ 100–135 MeV, where srange spans 13–14.5 decades. A
+  dense scan shows g(s) has ~4 roots there and the true root's sign window is
+  10⁻⁷–10⁻³ of the bracket — unresolvable by the 17-point scan, whose local half is
+  sized to the local srange; g's s-sensitivity itself is healthy (s·∂g/∂s ≈ 1.3).
+  Newton's f2 floor sits between 1e-12 and 1e-10 at these states. Retries with
+  tol = 1e-10, a 65-point scan, or 200 Newton iterations recover essentially all of
+  class B (and the retry ladders recover 94–97/102 resp. 188–192/193 overall).
+  Solver-side follow-ups (out of `eos-causal-tail.md`'s scope): a relative-width
+  local scan window, and the same precision-floor acceptance for the Newton path's
+  f2 that the outer bisection's polish already has.
 - **Grid resolution is the stage's real limit.** The projection controls ε at *nodes*
   while `c_s²` is a second derivative of the fitted spline, so on a grid where a capped
   profile advances `cs2_cap·Δx` per cell the cubic's second-derivative error is
@@ -364,12 +399,12 @@ nodes, "samples" are the stage's own (4,4,4) refined audit):
   143→0 (LS220) / 131→4 (SRO) per 4000 states; at 40k statistics cold is within 2×
   of warm, sharing only the acausal-corner tail; warm path bit-identical; cold
   throughput ×9; no tuned constants (seed_passes = 3; s-bisection cap 16, 8 suffices
-  for a GPU fixed-trip count). Known open items: (i) the shared ~0.2–0.8% failure
-  tail confined to the hot-edge/high-w acausal-cs² corner (beyond table validity —
-  §11 invalid-state policy territory) — **M3f now rules out in-box `c_s² ≥ 1` as its
-  cause**: the tail is unchanged after the acausal corner is repaired away (see the M3f
-  findings above), so it is still open, with different suspects; (ii) the RePrimAnd
-  benchmark (external library build — decide separately).
+  for a GPU fixed-trip count). Known open items: (i) ~~the shared ~0.2–0.8% failure
+  tail~~ — **root-caused 2026-08-27** (see "M3 failure-tail root cause" above): ~95%
+  is the acausal u-high extension breaking the inner solve's monotonicity proof
+  (fix designed, `eos-causal-tail.md`), ~5% is bracket-scan coarseness plus an f2
+  precision floor at radiation-dominated low-ρ states (solver-side follow-ups listed
+  there); (ii) the RePrimAnd benchmark (external library build — decide separately).
 - **M3f:** ✅ complete — the causal-cap repair stage of `eos-causality-repair.md`
   (`RepairOptions::causal_cap`, on by default; `eos_repair --no-causal-cap` / `--cs2-cap
   X`), which makes the *data* causal before the fit rather than clamping `c_s²` at run
