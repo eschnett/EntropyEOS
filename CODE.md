@@ -35,6 +35,97 @@ its §10 audit list and §11 API are implemented here). Items marked **[decide]*
 - Error handling: host-side build/repair/I-O code may throw; `core/` never throws,
   never allocates — errors are status flags in return structs (device-compatible).
 
+## Versioning
+
+Semantic versioning, recorded in the source and mirrored by a git tag. **1.0.0** is the
+first release: M1–M3 complete and measured (see "Milestones"), the API below stable
+under the contract in this section, M4 (CUDA) additive on top of it.
+
+### Mechanism
+
+The three numbers live in exactly one place, `core/version.hpp`, and everything else is
+derived from them:
+
+- `EEOS_VERSION_MAJOR` / `_MINOR` / `_PATCH` — the numbers themselves; a release bump
+  edits this block and nothing else.
+- `EEOS_VERSION` — encoded as `major*10000 + minor*100 + patch` via
+  `EEOS_VERSION_ENCODE(maj, min, pat)`, so a consumer can guard a feature with
+  `#if EEOS_VERSION >= EEOS_VERSION_ENCODE(1, 1, 0)`. This is the piece a plain
+  `#define EEOS_VERSION "1.0.0"` cannot give: string literals do not compare.
+- `EEOS_VERSION_STRING` — `"1.0.0"`, *stringified from the numbers*, not spelled out
+  again, so it cannot drift out of sync.
+- `eeos::version{,_major,_minor,_patch,_string}` — the same values as `constexpr`, for
+  `static_assert`, templates, and device code that would rather not use the
+  preprocessor.
+
+`core/version.hpp` is in `core/` and header-only precisely so that all of the above is
+available to a consumer who embeds only `core/` — no HDF5, no `.cpp` files, nvcc. It is
+pulled in by the umbrella header, so `#include <entropy_eos/entropy_eos.hpp>` is enough.
+
+Two things sit on top of it:
+
+- `host/version.hpp` — `library_version()`, `library_version_string()`, and
+  `version_matches()`: the version the *compiled* `libentropy_eos.a` was built from,
+  against the macros as seen by the *caller's* compilation. This is for consumption mode
+  (b) (`make install PREFIX=…`, see "Environment"), where headers and the archive are two
+  separately installed artifacts and a stale archive under an updated include tree links
+  silently. Mode (a) (copied source) cannot drift and pays nothing for the check. The
+  archive also carries an `@(#)entropy_eos-1.0.0` ident string, so
+  `strings libentropy_eos.a | grep entropy_eos-` identifies a binary whose provenance is
+  otherwise lost.
+- `--version` on every tool (`eos_repair`, `eos_test`, `eos_crop`), answered before
+  argument validation so a provenance check never has to supply valid arguments, and
+  `eos_repair`'s `kToolVersion` — written into the `"/repair"` group's `tool_version`
+  attribute — derived from `EEOS_VERSION_STRING` rather than a literal of its own. (The
+  per-tool literal it replaced is the argument for deriving: it still read `0.1` at
+  1.0.0.)
+
+Deliberately *not* done, consistent with "no cmake/configure/autodetection": nothing is
+generated at build time from git, and no `version.hpp.in` is templated by a configure
+step. The header is the truth and the tag mirrors it, not the reverse — which also keeps
+mode (a) honest, since a copied source tree has no git history of ours to interrogate.
+
+### What a bump means
+
+The public API is the headers under `entropy_eos/`: function signatures, struct layouts,
+the `flag_*` bit values, the `Status`/enum values, and the `"/repair"` group's layout.
+
+- **MAJOR** — a change that breaks a consumer at compile time or silently changes what
+  existing code means: removed or renamed entities, changed signatures, a struct field
+  removed or reordered, the numeric value or meaning of an existing `flag_*` bit
+  changed, an incompatible change to the `"/repair"` layout.
+- **MINOR** — additions that leave existing code compiling and meaning the same thing:
+  new functions, new fields appended to option/result structs, new `flag_*` bits in the
+  reserved positions, new options whose defaults preserve behavior, new `"/repair"`
+  attributes.
+- **PATCH** — fixes with no API surface change at all.
+
+The case peculiar to a numerics library is a change that touches no API but moves the
+numbers a consumer gets — a new repair stage, a new extension tail, a different default
+`cs2_cap`. The rule here: **computed results are not covered by the version contract**,
+because they are measured rather than specified, and because bumping MAJOR for every
+improvement (M3f through M3i would each have qualified) would make the number
+meaningless. Instead:
+
+- A change to a **default** that moves results beyond round-off requires at least a
+  MINOR bump and an explicit "Milestones" entry with measured before/after — as M3f–M3i
+  have. The option always stays settable, so a consumer can pin the old behavior.
+- Bit-for-bit reproducibility of a *table* is served by provenance, not by the version
+  number: the `"/repair"` group records `tool_version`, `input_path`, `input_fnv1a`, and
+  every option used, which pins a result far more precisely than a release number can.
+
+### Releasing
+
+1. Edit the three numbers in `core/version.hpp`. No *code* anywhere else names a
+   version — `tests/test_version.cpp` included: it checks relations between the
+   mechanism's outputs plus a `>= 1.0.0` floor, never the current version, so a bump
+   does not touch it either.
+2. Update the three places prose names the release: this section's opening line, the
+   `Milestones` entry (with what the release contains), and README's
+   "Status and testing".
+3. `make test && make integration` (the latter with the real tables present locally).
+4. Commit, then `git tag -a v1.0.0 -m 'entropy_eos 1.0.0'`.
+
 ## Layout
 
 ```
@@ -45,6 +136,7 @@ EntropyEOS/
     entropy_eos.hpp            # umbrella header
     core/                      # header-only, device-ready (the CUDA boundary)
       defs.hpp                 #   real, EEOS_HOST_DEVICE macro, flag bits, status enums
+      version.hpp              #   EEOS_VERSION* macros, eeos::version* (see "Versioning")
       bspline_eval.hpp         #   tensor-product cubic B-spline evaluation, derivs ≤ 2nd
       adapter_eval.hpp         #   EntropyEOSView, EOSPoint, evaluate(), srange()
       prim2con.hpp             #   rapidity-form prim2con                    (M3)
@@ -52,6 +144,7 @@ EntropyEOS/
     host/                      # host-only: owns memory, may use STL/exceptions
       table.hpp/.cpp           #   RawTable: axes + generic named 3D fields + attributes
       units.hpp/.cpp           #   constants, unit conversions, m_B conventions, κ
+      version.hpp/.cpp         #   compiled-library version, header/binary mismatch check
       synthetic.hpp/.cpp       #   manufactured analytic EOS → RawTable (ground truth)
       check.hpp/.cpp           #   table-level diagnostics, library-first (see test harness)
       repair.hpp/.cpp          #   isotonic + spline-safe + causal-cap repair, change log
@@ -867,6 +960,8 @@ axis, one axis over.
 
 ## Milestones
 
+- **1.0.0** — tagged after M3i, August 28, 2026: M1–M3 complete and measured, the
+  API stable under the contract in "Versioning", M4 additive on top of it.
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,
   `io_stellarcollapse`, `check`, `repair`; tools `eos_repair` and
   `eos_test --level table`; unit tests. Acceptance: clean runs and repair reports on

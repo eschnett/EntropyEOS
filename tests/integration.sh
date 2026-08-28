@@ -45,6 +45,11 @@ expect_exit() {
 
 echo "=== Part A: synthetic (table-free, CI-safe) ==="
 
+# 0: every tool answers --version with exit 0 (CODE.md "Versioning"), which is
+# also the cheapest possible check that these binaries are the ones just built.
+expect_exit 0 "$TEST" --version
+expect_exit 0 "$REPAIR" --version
+
 # 1-6: --synthetic-seeded (four seeded monotonicity violations) round trip.
 expect_exit 0 "$TEST" --synthetic
 expect_exit 1 "$TEST" --synthetic-seeded --write-synthetic "$T/seeded.h5"

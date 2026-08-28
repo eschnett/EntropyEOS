@@ -61,6 +61,7 @@
 #include "entropy_eos/host/adapter_audit.hpp"
 #include "entropy_eos/host/con2prim_audit.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -81,6 +82,7 @@ void print_usage(std::ostream &os) {
         "  eos_test [--level table|adapter|con2prim] --synthetic [options]\n"
         "  eos_test [--level table|adapter|con2prim] --synthetic-seeded [options]\n"
         "  eos_test [--level table|adapter|con2prim] --synthetic-dirty [options]\n"
+        "  eos_test --version\n"
         "\n"
         "Runs check_table() (\"--level table\", CODE.md \"Test harness\"),\n"
         "check_adapter() (\"--level adapter\"), or check_con2prim() (\"--level\n"
@@ -803,6 +805,13 @@ int run_con2prim_level(const ParsedArgs &pa) {
 
 int main(int argc, char **argv) {
   const std::vector<std::string> args(argv + 1, argv + argc);
+
+  // Answered before argument validation (GNU convention): asking which
+  // entropy_eos a binary came from should not require valid arguments.
+  if (std::find(args.begin(), args.end(), "--version") != args.end()) {
+    std::cout << "eos_test (entropy_eos) " EEOS_VERSION_STRING "\n";
+    return kExitOk;
+  }
 
   ParsedArgs pa;
   if (!parse_args(args, pa)) {

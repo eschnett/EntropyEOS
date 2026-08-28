@@ -29,6 +29,7 @@
 
 #include "entropy_eos/entropy_eos.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
@@ -46,6 +47,7 @@ constexpr size_t kMinAxisPoints = 4;
 void print_usage(std::ostream &os) {
   os << "usage:\n"
         "  eos_crop IN.h5 OUT.h5 --irho A B --jt A B --kye A B\n"
+        "  eos_crop --version\n"
         "\n"
         "Crops a stellarcollapse-format (O'Connor-Ott) EOS table to the\n"
         "inclusive index box [A,B] on each of the three axes (0-based:\n"
@@ -228,6 +230,13 @@ eeos::RawTable crop_table(const eeos::RawTable &in, size_t ia, size_t ib, size_t
 
 int main(int argc, char **argv) {
   const std::vector<std::string> args(argv + 1, argv + argc);
+
+  // Answered before argument validation (GNU convention): asking which
+  // entropy_eos a binary came from should not require valid arguments.
+  if (std::find(args.begin(), args.end(), "--version") != args.end()) {
+    std::cout << "eos_crop (entropy_eos) " EEOS_VERSION_STRING "\n";
+    return kExitOk;
+  }
 
   ParsedArgs pa;
   if (!parse_args(args, pa)) {

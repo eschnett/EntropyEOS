@@ -13,6 +13,7 @@
 //   eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]
 //              [--no-spline-safe] [--no-spline-safe-3d]
 //              [--no-causal-cap] [--cs2-cap X]
+//   eos_repair --version
 //
 // Exit codes: 0 = already clean, 1 = repaired (or would repair, under
 // --check-only), 2 = fatal structural problem or other runtime error,
@@ -20,6 +21,7 @@
 
 #include "entropy_eos/entropy_eos.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <fstream>
@@ -35,7 +37,12 @@ constexpr int kExitChanged = 1;
 constexpr int kExitFatal = 2;
 constexpr int kExitUsage = 64;
 
-const char *const kToolVersion = "entropy_eos eos_repair 0.1";
+// Recorded in the "/repair" provenance group and the human-readable log.
+// Derived from EEOS_VERSION_STRING rather than a literal of its own: the
+// thing a reader of a repaired table wants to know is which entropy_eos
+// produced it, and a per-tool number would have to be bumped separately
+// (this one never was -- it still said 0.1 at 1.0.0).
+const char *const kToolVersion = "entropy_eos eos_repair " EEOS_VERSION_STRING;
 
 void print_usage(std::ostream &os) {
   os << "usage:\n"
@@ -45,6 +52,7 @@ void print_usage(std::ostream &os) {
         "  eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]\n"
         "             [--no-spline-safe] [--no-spline-safe-3d]\n"
         "             [--no-causal-cap] [--cs2-cap X]\n"
+        "  eos_repair --version\n"
         "\n"
         "Repairs a stellarcollapse-format EOS table so that \"entropy\" and\n"
         "\"logenergy\" are strictly monotone increasing in temperature at every\n"
@@ -328,6 +336,13 @@ void print_causal_cap_progress(std::ostream &os, const eeos::RepairResult &resul
 
 int main(int argc, char **argv) {
   const std::vector<std::string> args(argv + 1, argv + argc);
+
+  // Answered before argument validation (GNU convention): asking which
+  // entropy_eos a binary came from should not require valid arguments.
+  if (std::find(args.begin(), args.end(), "--version") != args.end()) {
+    std::cout << "eos_repair (entropy_eos) " EEOS_VERSION_STRING "\n";
+    return kExitOk;
+  }
 
   ParsedArgs pa;
   if (!parse_args(args, pa)) {

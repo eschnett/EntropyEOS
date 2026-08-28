@@ -16,6 +16,7 @@
 #include "entropy_eos/core/defs.hpp"
 #include "entropy_eos/core/prim2con.hpp"
 #include "entropy_eos/core/state_policy.hpp"
+#include "entropy_eos/core/version.hpp"
 
 #include "entropy_eos/host/adapter_build.hpp"
 #include "entropy_eos/host/bspline_fit.hpp"
@@ -25,4 +26,5 @@
 #include "entropy_eos/host/synthetic.hpp"
 #include "entropy_eos/host/table.hpp"
 #include "entropy_eos/host/units.hpp"
+#include "entropy_eos/host/version.hpp"
 // IWYU pragma: end_exports
