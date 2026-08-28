@@ -35,7 +35,12 @@ Node map of the fitted adapter's `c_s²` on the repaired real tables (round-trip
   stored `cs2` column is acausal at all 81,600 nodes with irho ≥ 222 (stored max
   18.4 c²). LS220's known superluminality at high density — the repair is a genuine
   physics edit to a region that is already unphysical, exactly like the
-  monotonicity repair, and must be logged the same way.
+  monotonicity repair, and must be logged the same way. (The high-density superluminality
+  of Skyrme-type EOS is discussed in Schneider, Roberts & Ott 2017; constant-$c_s$
+  extrapolation is the established precedent for editing a table's high-density end to
+  restore causality. Servignat et al. 2024 attack the same defect from the other side, by
+  replacing the table with a smooth fit having continuous $c_s$. See
+  [`RELATED.md`](RELATED.md).)
 - **9 isolated interior acausal nodes** (c_s² up to 151 at ρ ~ 10¹⁴, T ≤ 0.32 MeV,
   extreme Ye) — chain-rule blowups in the known σ_T ≈ 0 nuclear-transition pockets
   (CODE.md open decision 4, resolved accept-and-guard). Not part of this stage's

@@ -484,3 +484,12 @@ $\epsilon \to T$ inversion every tabulated-EOS con2prim already performs (Siegel
 potential interface, that monotonicity is guaranteed by construction rather than hoped
 for, and that the baryon-mass rescaling makes the $\epsilon \ge 0$ zero point exact
 rather than an ad-hoc shift.
+
+The lineage runs back one step further, to Swesty (1996), which introduced the
+consistent-by-differentiation construction that Timmes & Swesty (2000) then applied. The
+pair of requirements in §8 — consistency (derivability from a potential) and stability
+($c_s^2 > 0$) — is stated in exactly that form by Dilts (2006), which also observes that
+table interfaces typically enforce the second and not the first, and proposes fitting under
+thermodynamic constraints; that is the closest published relative of the repair stage.
+Baturin et al. (2019) is the methodological template for the fidelity audits of §10. Full
+citations and the wider landscape are in [`RELATED.md`](RELATED.md).

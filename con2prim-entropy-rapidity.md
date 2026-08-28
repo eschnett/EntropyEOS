@@ -43,6 +43,12 @@ manifold boundary. The rapidity is well conditioned in both limits: $w \simeq v$
 $v \to 0$ and $w \simeq \log(2W)$ as $v \to 1$, where velocity- or $W$-based schemes become
 stiff.
 
+The closest published scheme, Kastaun et al. (2021), also removes the velocity constraint,
+but by solving for $\mu = 1/(Wh)$ on the *bounded* interval $0 < \mu \le 1/h_0$; the
+rapidity is unbounded instead. Note also that entropy here is recovered from the conserved
+state, unlike the evolved-entropy backup solvers of IllinoisGRMHD and HARM, which advect
+$s$ separately and are therefore unreliable at shocks. See [`RELATED.md`](RELATED.md).
+
 ## 3. EOS interface
 
 The EOS is supplied as a single function

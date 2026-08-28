@@ -169,6 +169,12 @@ Rules that keep the CUDA port honest:
   runs on host or device once the arrays are mirrored.
 - `host/` owns all memory (owning `EntropyEOS` holds `std::vector`s and hands out an
   `EntropyEOSView`), does all fitting/repair/I-O, and is never needed on the device.
+
+Two prior-art points for this split, both reached independently: `singularity-eos`/`spiner`
+(performance-portable tabulated EOS behind one interface, host and device), and
+`primitive-solver`, which rebuilt the Kastaun inversion around compile-time `EOSPolicy` /
+`ErrorPolicy` template parameters specifically because virtual dispatch is costly in GPU
+kernels — the same reason `core/` forbids it. See [`RELATED.md`](RELATED.md).
 - Warm-start state (`u_solved` = ln T) is threaded explicitly through arguments and
   return values; no hidden mutable state anywhere. `evaluate()` is pure and re-entrant.
 
