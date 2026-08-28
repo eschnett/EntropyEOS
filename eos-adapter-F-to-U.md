@@ -249,7 +249,8 @@ call.
 ("Causal" was added in M3g: the inner $w$-solve's monotonicity proof rests on
 $c_s^2 < 1$, so an acausal *extension* breaks it just as surely as acausal table data
 would. See `eos-causal-tail.md` for the log-$\sigma$ hot tail and the causal slope clamp
-that make the $u$-high extension obey it.)
+that make the $u$-high extension obey it, and its §5 for the M3i follow-up that does the
+same for the $\rho$-low one.)
 
 All extensions live at the **$F$ level** — the splines $\hat L$ and $\sigma$ are extended
 in $(x, u)$ beyond the physical box — so the run-time path (§3) stays uniform and the
@@ -274,13 +275,27 @@ Per boundary:
   here are transient Newton overshoots or genuinely pathological states; the $w$-cap and
   §11 policies own the latter.
 - **$\rho$ below range.** The adapter owns this per the resolved open question 7: extend
-  in $x$ below $x_{\min}$ toward ideal-gas asymptotics — $\sigma_x \to$ const $< 0$
-  (entropy grows as density drops) and $e_x \to 0$ (energy density-independent at fixed
-  $T$), both as $C^2$ curvature-limited blends to linear tails. This is where the
-  atmosphere lives; the *policy* (floors, resets) stays with the caller. Note that common
-  tables reach $\rho_{\min} \sim 10^3\,$g cm⁻³, below typical atmosphere floors, in which
-  case this extension is rarely exercised — but it must exist so Newton can pass through.
-  Flag `EXT_RHO_LOW`.
+  in $x$ below $x_{\min}$ toward the correct **low-density asymptotics**, as $C^2$
+  curvature-limited blends to linear tails. Since M3i that means *log-linear in the
+  values on both fields*: $\ln\sigma$ and $\ln\epsilon$ are continued affinely in
+  $x = \log_{10}\rho$, i.e. $\sigma$ and $\epsilon$ become power laws in $\rho$ with the
+  seam's own exponents. That is the radiation-dominated behaviour at a hot seam
+  ($\sigma, \epsilon \propto 1/\rho$, so $q = \partial\ln W/\partial x|_s = -1 + 4/3 = 1/3$
+  and $c_s^2 \to 1/3$), and it *degenerates* to the old ideal-gas target at a cold seam,
+  where the measured seam slopes are $\sigma_x < 0$ (entropy grows as density drops) and
+  $e_x \approx 0$ (energy density-independent at fixed $T$) all by themselves. Before
+  M3i, $e_x \to 0$ was **imposed** at every seam by a slope-to-zero override; on both
+  real tables that was the measured cause of $c_s^2 = 4/3$ across ~50–58% of this band,
+  and of a $c_s^2 \le 0$ population inside its blend cell (the override reaches its
+  target by overriding the *curvature*). See `eos-causal-tail.md` §5 and CODE.md's "M3i
+  empirical findings". $\sigma$'s log tail carries a guard for the deep-cold corner where
+  the $u$-low tail has already driven $\sigma$ to (or through) zero and $\ln\sigma$ has
+  no meaning: there it falls back to the plain linear tail
+  (`core/adapter_eval.hpp`'s `aeval_xlow_log_ok()`; it never fires on the real tables).
+  This is where the atmosphere lives; the *policy* (floors, resets) stays with the
+  caller. Note that common tables reach $\rho_{\min} \sim 10^3\,$g cm⁻³, below typical
+  atmosphere floors, in which case this extension is rarely exercised — but it must exist
+  so Newton can pass through. Flag `EXT_RHO_LOW`.
 - **$\rho$ above range.** No defensible physical extension (causality is at risk).
   Extend $C^1$-linearly in $x$ just so the iteration remains finite and can converge to a
   reportable point, and flag `OOB_RHO_HIGH` as a hard failure: a converged state here is

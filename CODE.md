@@ -623,6 +623,172 @@ fallback.
   result *enum* changes for 395 (LS220) / 466 (SRO) warm states, almost all of them
   fallback → Newton.
 
+**M3i empirical findings — the x-low causal tails** (`eos-causal-tail.md` §5, measured
+2026-08-28 on the two local tables; "before" is the same source built against the M3h
+commit's library, same seeds, same states, so every pair below is apples to apples).
+This is the follow-up M3g's class E map identified — the x-LOW extension band was
+~50–58% acausal — and it turns out to be the same *family* error M3g fixed on the u
+axis, one axis over.
+
+- **The diagnosis, and why it is arithmetic rather than data.** At the seam densities of
+  both tables radiation dominates for T ≳ 0.05 MeV, so ε ∝ T⁴/ρ and s ∝ T³/ρ: `ln ε` and
+  `ln σ` are *linear in x = log₁₀ρ*, i.e. the values are exponential in x. Measured at the
+  x_lo seam, over the whole extended u range: `dlnσ/dx` → **−2.302 = −ln10** and `L_x` →
+  **−1.0000** for T ≳ 1 MeV on both tables, both to four digits. With
+  `q = ∂lnW/∂x|_s = b_x + b_u·(−a_x/a_u)` and `c_s² = (q + q² + q′)/(1 + q)` (≤ 1 exactly
+  when `q² + q′ ≤ 1`, the `eos-causal-tail.md` §2 condition), the correct radiation value
+  is `q = −1 + 4/3 = 1/3` ⇒ `c_s² = 1/3`. L's **slope-to-zero override** forced `b_x = 0`,
+  giving `q = 4/3` ⇒ `c_s² = 4/3` — the measured **1.35**, flat across the band, at every
+  depth past the blend cell and on both tables. The same override also *reaches* its
+  target by overriding the curvature to `L_xx_eff = 2·L_x/h_x ≈ −36` at a radiation seam,
+  which is the band's entire `c_s² ≤ 0` population: 75% of the first blend cell, ~0% of
+  every cell past it.
+- **The extension-band map (class E), before → after.** Sample counts per band unchanged.
+
+  | LS220 band | samples | `c_s² ≥ 1` | `c_s² ≤ 0` | `p ≤ 0` | `σ_u ≤ 0` |
+  |---|---|---|---|---|---|
+  | u_low  | 1,479,456 | 23 → 23 | 11,992 → 11,992 | 2,440 → 2,440 | 0 → 0 |
+  | u_high | 1,479,456 | 237 → 237 | 6,883 → 6,883 | 226 → 226 | 0 → 0 |
+  | x_low  | 858,528 | 500,561 → **0** | 79,634 → **683** | 0 → 0 | 0 → 0 |
+  | x_high | 858,528 | 846,501 → 846,501 | 0 → 0 | 0 → 0 | 0 → 0 |
+
+  | SRO band | samples | `c_s² ≥ 1` | `c_s² ≤ 0` | `p ≤ 0` | `σ_u ≤ 0` |
+  |---|---|---|---|---|---|
+  | u_low  | 3,273,952 | 46 → 46 | 6,932 → 6,932 | 0 → 0 | 0 → 0 |
+  | u_high | 3,273,952 | 262 → 262 | 16,573 → 16,573 | 933 → 933 | 0 → 0 |
+  | x_low  | 1,362,400 | 688,076 → **0** | 107,006 → **25,681** | 0 → 0 | 0 → 0 |
+  | x_high | 1,362,400 | 1,353,891 → 1,353,891 | 0 → 0 | 0 → 0 | 0 → 0 |
+
+  The three bands M3i does not touch come back **identical count for count** — and on
+  LS220 their max/rms values print identically too; SRO's move in the 6th significant
+  digit at worst (u_low `c_s² ≥ 1` max 3.178942 → 3.178933), which is the κ relabeling
+  below. The x_low
+  `c_s² ≤ 0` survivors are not the old population moved around: their worst excess falls
+  from **5.69 → 3.2e-4** (LS220) and **10.14 → 1.5e-3** (SRO) — i.e. from "`c_s²` is −5"
+  to "`c_s²` is −0.0003", in the cold/matter third of the band where `c_s²` is
+  legitimately ~0 and the sign is set by roundoff-scale curvature. That class is
+  report-only in every band by design (see `host/adapter_audit.hpp`), and `c_s² ≤ 0` is
+  harmless where `c_s² ≥ 1` was fatal: the con2prim §9 inner-solve proof needs
+  `z_w = z(1 − c_s²)tanh w > 0`, i.e. only `c_s² < 1`.
+- **The band's far tail is the 1/3 asymptote, not merely a bound.** Public-API scan of the
+  whole x-low band (32 depths × 120 u × 12 Ye = 46,080 points, scratch `xlow_map`), before
+  → after: LS220 `c_s² ≥ 1` **26,751 → 0**, `c_s² ≤ 0` 4,327 → 33, `c_s²` range
+  **[−8.06, 1.759] → [−0.0003, 0.3476]**; SRO **22,476 → 0**, 3,928 → 856, range
+  **[−13.93, 1.816] → [−0.0013, 0.3431]**. The depth × u-decile acausal matrix is all
+  zeros on both tables (it was 1.00 in every cell of u-deciles 3–9 past the first blend
+  cell before). Mid-band probes at T = 1.6 and 91 MeV: LS220 **1.3477 / 1.3504 → 0.3283 /
+  0.3300**, SRO **1.4840 / 1.5336 → 0.3156 / 0.3335**. At the deepest edge
+  (`x = x_ext_lo`, T ≥ 1 MeV) `tests/test_adapter_tail.cpp` measures 0.3268–0.3360 (LS220)
+  and 0.3271–0.3310 (SRO) — the same `b/α − 1 = 1/3` the u-high tail reaches from the
+  other side, now approached from the ρ direction.
+- **The DOUBLE corners, which class E never scans, resolve too.** Class E crosses each
+  band with the other axes' *physical* ranges, so the regions outside the box in x **and**
+  u — where M3g's log-u tail and M3i's log-x tail compose — are covered by neither band.
+  Scanned separately (33 depths × 33 × 16 Ye = 17,424 points per corner, scratch
+  `corners`), before → after: LS220's x-low × u-**HIGH** corner `c_s² ≥ 1`
+  **15,840 (91%) → 0** and `c_s² ≤ 0` **1,584 → 0**, with the range collapsing from
+  **[−5.76, 1.754]** to **[0.3382, 0.3637]** — the same 1/3 asymptote, reached with both
+  log tails composed; SRO is the same story, **15,840 → 0** and **1,584 → 0**, range
+  **[−10.26, 1.818] → [0.3396, 0.3608]**. The x-low × u-**LOW** corner (the one the guard
+  exists for) was already causal and stays so, its `c_s² ≤ 0` count going **275 → 0**
+  (LS220) and **269 → 0** (SRO) and its range from [−1.3e-5, 3.3e-5] to [2.6e-6, 1.4e-5]
+  resp. [−2.7e-6, 5.4e-6] to [1.6e-7, 1.5e-6]. Nothing is non-finite in either corner,
+  before or after, on either table.
+- **No causal slope clamp on this side, deliberately.** The mirror of M3g's
+  `u_high_b_cap` was designed and then not built: with both families corrected the
+  measured asymptote is 1/3 — a factor 3 below `cs2_ext_cap = 0.99` — on both real tables
+  *and* on the synthetic ideal gas (whose x-low band measures `c_s² ∈ [1.0e-4, 0.121]`,
+  `tests/test_adapter_tail.cpp` test 12). What keeps M3g's u-high clamp in the tree is
+  that the synthetic gas trips it at 100% of its seam points, so CI exercises the
+  arithmetic; an x-low clamp would be dead code on every table available, i.e. untested
+  machinery in a device-portable hot path guarding a bound nothing approaches. If a table
+  ever shows an acausal x-low band, class E reports it and the clamp toolbox is unchanged.
+- **The u-LOW × x-low corner guard, and why it never fires.** σ at the x_lo seam is *not*
+  positive by construction the way it is at the u_hi seam: σ's u-low tail runs linearly
+  toward −∞ by design (the escape hatch that maps every `s < s_min` to a finite T), so a
+  deep-cold column can hand the x-tail a σ_b ≤ 0 — `ln` undefined — or a σ_b so small that
+  `g_x = σ_x/σ_b` explodes and `e^{g_x d}` overflows across the band.
+  `aeval_xlow_log_ok()` admits the log branch only when σ_b > 0 *and* the log track's seam
+  and phase-2 slopes keep the band's total log excursion under 40 (`e⁴⁰ ≈ 2.4e17`, ~270
+  decades of headroom over any physical seam entropy); otherwise the plain linear x-tail
+  is used, bit-for-bit as before M3i. Bounding the excursion over the *band* rather than
+  per cell is what makes the guard grid-resolution independent. Measured: it never fires.
+  Minimum σ at the x_lo seam over the whole extended u range is **1.64** (LS220), **0.80**
+  (SRO), **37.2** (synthetic), and the largest band excursion is **1.03** against the
+  bound of 40 — a factor 39 of margin. Both branches are therefore provoked deliberately
+  in `tests/test_adapter_tail.cpp` test 10, which also asserts the fallback reproduces the
+  pre-M3i linear tail bit-for-bit. The switch is continuous *at the seam* (both
+  constructions reproduce the boundary sample exactly at d = 0) and differs only at
+  O(d²) into the band, so it is a curvature-level, not a value-level, discontinuity, in
+  flagged territory that is explicitly not a claim of physical validity (§7).
+- **What moved in the box: κ, and nothing else.** M3i changes L's x-low tail, and the
+  build's extended ε-floor scan (`scan_extended_eps_floor()`) walks exactly that band —
+  so κ legitimately moves: LS220 **0.9901486386911024 → 0.9901483794852888**
+  (−2.6e-7 relative), SRO **0.9900060922126621 → 0.9900060414568034** (−5.1e-8), synthetic
+  **bit-identical**. That is a global relabeling, and the census shows it is the *whole*
+  difference. Re-running the identical census with κ pinned to its pre-M3i value (scratch
+  `gold --kappa`, which redoes the build's step-3 relabeling arithmetic verbatim): all
+  **6,000 in-box `evaluate()` points** (3,000 cold + 3,000 warm, every `EOSPoint` member
+  compared as raw bits, plus `iters` and `flags`) and all **40,000 warm + 4,000 cold
+  con2prim solves** are **bit-identical**, on both tables. Without the pin, the drift at
+  those same in-box points is exactly the κ power counting and nothing else: `U`, `U_s`,
+  `That`, `h`, `mu_tilde` by `Δκ/κ = 2.618e-7`, `U_rho`/`U_rhos` by `2Δκ/κ`, `U_rhorho` by
+  `3Δκ/κ`, `T_F_MeV` **bit-identical at all 3,000 points**, and the κ-invariant `p` and
+  `cs2` differing only at 1.7e-15 / 4.0e-15 — roundoff. `iters` and `flags` are identical
+  at every point either way.
+- **No audit state's solve reaches the x-low band at all.** Censused rather than assumed:
+  each of the 44,000 con2prim solves was re-run against a view with `x_ext_lo` pinned to
+  `x_lo` (so any x < x_lo is hard-clamped at the seam instead of tailed); **0 of 40,000
+  warm and 0 of 4,000 cold** differ, i.e. no audit solve ever evaluates below ρ_min. The
+  detector is not vacuous: raising the pinned seam by 3 decades flags 824/4,000 warm and
+  89/400 cold. This is why the con2prim numbers below move only through κ — the sampler
+  draws truth 5% inside the ρ box and, since M3h, the solver no longer wanders.
+- **`eos_test --level con2prim --states 40000`, before → after.** LS220 warm failures
+  **1 → 1** (0 no_bracket + 1 max_iter — the same pathological state, ρ = 7.54e6,
+  T = 210 MeV, Ye = 0.206, w = 4.485), cold **0 → 0**, `c2p_roundtrip` **1 → 1**
+  (max 1.299e-4), `rt_tau` p999 9.947e-13 → 9.944e-13, policy `n_valid_touched` 0, battery
+  PASS. SRO warm **0 → 0**, cold **1 → 1** `no_bracket` — state k = 14800, ρ = 2.3e15,
+  `flag_oob_rho_high`: that is the **x-HIGH** band, which M3i does not touch and which
+  `eos-adapter-F-to-U.md` §7 makes hard-invalid anyway, so it stays, exactly as the M3h
+  findings block predicted. Fallback counts drift within noise (LS220 warm 88 → 91, cold
+  12 → 7; SRO warm 82 → 89, cold 13 → 13). One diagnostic regression, reported not hidden:
+  SRO's policy battery `n_cold_missed` **0 → 1** (a COLD re-solve of one repaired broken
+  state misses; the WARM re-solve is the contract, `n_invalid`/`n_no_flag` stay 0 and the
+  battery still PASSes).
+- **Nothing else in the audit moved.** Classes A–D, before → after: LS220 every class
+  **bit-identical**, including `extension_seam_jump` max 2.301928 and `cs2_acausal`
+  132/max 2.2946e-2; SRO likewise except `extension_seam_jump` max
+  **94.58427 → 94.58386** (−4.3e-6 relative) and `That_nonpositive` max in its last digit.
+  Class D is the interesting one: removing the slope-to-zero override *restores* C² at the
+  x_lo seam (the override was C1), and the measurement says the seam jump is unchanged to
+  6+ digits — that seam was never what those maxima were made of. On the synthetic gas
+  `extension_seam_jump` is bit-identical (1.356138e-06). The u_hi causal-clamp seam scan is
+  unchanged: 0 active, 0 floor-wins at 46,233 / 102,311 seam points.
+- **U ≥ 0 still holds on the extended box, and the ε floor is set exactly where M3i
+  works.** Deterministic 4-per-cell scan of the whole extended box through `eval_at()`
+  (LS220 997×605×197 = 119M points, SRO 1625×713×261 = 302M): `min U` **9.9503763e-09 →
+  9.9506405e-09** (LS220) and **1.0095794e-08 → 1.0095846e-08** (SRO), `U < 0` count
+  **0 → 0** on both, and the minimum sits at (`x_ext_lo`, `u_ext_lo`) — the x-low × u-low
+  corner — which is precisely why κ moved at all. Synthetic `min U` bit-identical
+  (7.7535089e-11).
+- **The extended physicality soak improves too, and every point it loses is an x-low
+  one.** `check_adapter()` with `soak_extended` (200,000 cold solves uniform over the
+  *whole* extended box, so all four bands at once), before → after: LS220 `cs2_acausal`
+  **9,279 → 3,507** and `cs2_nonpositive` **1,472 → 881** (worst 11.16 → 0.927); SRO
+  **5,454 → 1,965** and **1,291 → 853** (worst 19.05 → 0.363, worst acausal excess
+  **0.835 → 0.112**). `maxiter_count` stays 0 (SRO) / 2 (LS220, the documented in-box σ_u
+  pocket plus the ρ > ρ_max corner tolerance miss of the M3g block); `That_nonpositive`
+  and `p_nonpositive` are unchanged. Classifying LS220's acausal samples by their output
+  flags (scratch `soakcls`) shows the difference is *exactly* the x-low population and
+  nothing else — 9,279 before = 927 `x_low` + 4,845 `x_low|u_high` + 3,148 `x_high` + 287
+  `x_high|u_high` + 59 in-box + 13 `u_high`, and 3,507 after = the same 3,148 + 287 + 59 +
+  13 with **both x_low rows at 0**. The `c_s² ≤ 0` split is the same story (591 x-low
+  points removed, 1,472 − 591 = 881 left, none of them x-low). What remains is therefore
+  the hard-invalid x-HIGH band (98%), the known in-box ρ_max/T_max data corner, and M3g's
+  u-high residue — none of it in M3i's scope. On the synthetic gas the same soak keeps
+  `maxiter_count` 0 and `cs2_acausal` 0, with `cs2_nonpositive` 4,385 → 4,385 (worst
+  0.247 → 0.290, all of it in M3g's u-high clamp blend cell).
+
 ## Milestones
 
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,
@@ -656,9 +822,12 @@ fallback.
   with it), the remaining ~5% was a mis-scaled momentum-residual tolerance plus
   bracket-scan coarseness (fixed by **M3h** below). What remains is **2 states in 88,000**
   across both tables, and neither is class B: one pathological LS220 state that no retry
-  ladder recovers, and one SRO state on the acausal **x-tail** — i.e. the residual is now
-  (ii) the x-low/x-high band follow-up of `eos-causal-tail.md` §7, and (iii) the RePrimAnd
-  benchmark (external library build — decide separately).
+  ladder recovers, and one SRO state on the **x-HIGH** tail (`flag_oob_rho_high`, i.e.
+  hard-invalid by §7 whatever its `c_s²` does). The x-LOW half of open item (ii) is
+  **closed by M3i** below; what is left of (ii) is the report-only x-high band. So the
+  standing items are (ii′) that 1-per-44,000 pathological LS220 state plus the
+  report-only x-high band, (iii) the RePrimAnd benchmark (external library build — decide
+  separately), and open decision 5's `cs2_cap = 0.95` / lexicographic-backstop question.
 - **M3f:** ✅ complete — the causal-cap repair stage of `eos-causality-repair.md`
   (`RepairOptions::causal_cap`, on by default; `eos_repair --no-causal-cap` / `--cs2-cap
   X`), which makes the *data* causal before the fit rather than clamping `c_s²` at run
@@ -691,6 +860,28 @@ fallback.
   requested `tol` (`rt_tau` p90 7e-14 → 4e-13) because the old test was over-strict by
   `cosh w`; the `tol` sweep there shows that buying the old bulk back (1e-13) costs 46
   failures per 44,000 states, so the default stays 1e-12.
+- **M3i:** ✅ complete — the x-LOW half of `eos-causal-tail.md` §5/§7, the last extension
+  band a converged, flagged, legitimately-used state can live in. Same family argument as
+  M3g, one axis over: σ's x-low tail is built in **log space** (`g = lnσ` through the same
+  curvature-ramp machinery, mapped back), and L's **slope-to-zero override is removed** so
+  its plain linear-in-L tail continues ε as the power law in ρ that the seam actually has
+  (`L_x = −1` at a radiation seam, `0` at a matter seam — the old "ε becomes
+  ρ-independent" target now *emerges* where it was physical instead of being imposed
+  everywhere). Together they take the band's fixed-s slope from `q = 4/3` to `q = 1/3`,
+  i.e. `c_s²` from a flat 1.35 to the 1/3 radiation asymptote. σ's log branch carries a
+  u-LOW corner guard (`aeval_xlow_log_ok()`: the u-low tail can drive σ to or through
+  zero, where `lnσ` has no meaning) that falls back to the pre-M3i linear tail; it never
+  fires on any table available, so both branches are provoked deliberately in
+  `tests/test_adapter_tail.cpp`. **No** x-low causal slope clamp was added — the mirror of
+  M3g's `u_high_b_cap` would be dead code on every table (measured asymptote 1/3 against a
+  cap of 0.99), where M3g's is kept alive by the synthetic gas tripping it. Measured
+  outcome above: class E x_low `c_s² ≥ 1` **500,561 → 0** (LS220) and **688,076 → 0**
+  (SRO), the blend cell's `c_s² ≤ 0` artifact down 117× / 4.2× with its worst excess down
+  from 5.7 / 10.1 to 3e-4 / 1e-3, the other three bands unchanged count for count, and
+  con2prim at 40,000 states not worse anywhere. The only in-box change is a −2.6e-7 /
+  −5.1e-8 relative shift in κ (the extended ε-floor scan legitimately sees the new tail);
+  pin κ and all 6,000 in-box `evaluate()` points and all 44,000 con2prim solves are
+  bit-identical.
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
   fixed-iteration evaluate/con2prim variants.
 

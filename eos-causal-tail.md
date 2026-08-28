@@ -1,11 +1,14 @@
-# Causal extension tails: the log-σ u-high tail (M3g)
+# Causal extension tails: the log-σ u-high tail (M3g) and x-low tails (M3i)
 
 Draft v0.2, August 27, 2026. Companion to `eos-adapter-F-to-U.md` (§7 domain
-extensions), `core/adapter_eval.hpp` ("TAIL MATHEMATICS" / "CAUSAL TAILS"), and
-CODE.md's "M3 failure-tail root cause" findings block (the evidence base).
+extensions), `core/adapter_eval.hpp` ("TAIL MATHEMATICS" / "CAUSAL TAILS" /
+"M3i X-LOW CAUSAL TAILS"), and CODE.md's "M3 failure-tail root cause" findings
+block (the evidence base).
 **Approved 2026-08-27** (`cs2_ext_cap = 0.99`; §7 principle amendment ships with
 the implementation). **Implemented 2026-08-27** — measurements in CODE.md's
-"M3g empirical findings" block; §3 as specified, §5's map added, §7 still open.
+"M3g empirical findings" block; §3 as specified, §5's map added.
+**§5's x-low follow-up implemented 2026-08-28 (M3i)** — same family argument on
+the x axis; measurements in CODE.md's "M3i empirical findings" block.
 
 **Results in one paragraph.** The u-high band's `c_s² ≥ 1` fraction goes
 **88.4% → 0.007%** (LS220) and **88.0% → 0.009%** (SRO), with the far tail
@@ -136,6 +139,38 @@ here: the u-low/u-high/x-low bands count toward `adapter_needs_attention()`, x-h
 does not, since §7 of `eos-adapter-F-to-U.md` already makes a converged state
 there invalid outright. Full numbers in CODE.md's M3g findings block.
 
+**Repaired 2026-08-28 (M3i)** — same family argument as §2–§3, one axis over, and
+the map is the acceptance gauge. At these densities radiation dominates for
+T ≳ 0.05 MeV, so `ln σ` and `ln ε` are linear in `x = log₁₀ρ` (slope −ln10):
+*exponential in x for the values*, exactly as they were in `u`. Two changes,
+x-LOW only, both in `core/adapter_eval.hpp`:
+
+- **Log-σ x-low tail** (σ only), the mirror of §3's construction: log-sample,
+  run the unchanged curvature-ramp machinery on `g = lnσ`, map back. Unlike the
+  `u_hi` seam, `σ_b > 0` is *not* guaranteed here — the u-low tail drives σ
+  linearly toward −∞ by design — so `aeval_xlow_log_ok()` admits the log branch
+  only where `σ_b > 0` and the log track's slopes keep the band's total log
+  excursion bounded, and falls back to the plain linear tail otherwise. It never
+  fires on either real table or on the synthetic gas (min seam σ 1.64 / 0.80 /
+  37.2; largest excursion 1.03 against the bound of 40).
+- **L's slope-to-zero override is gone.** L is already a log-space field, so its
+  plain linear tail *is* the correct exponential family for ε; the override forced
+  `b_x = 0` and hence `q = 0 + 4/3` and `c_s² = 4/3` — the measured 1.35 —
+  everywhere, while its C1 curvature override (`L_xx_eff = 2L_x/h_x ≈ −36` at a
+  radiation seam) was the band's whole `c_s² ≤ 0` population. With both families
+  right, `q = −1 + 4/3 = 1/3` and `c_s² = 1/3`, and the old "ε becomes
+  ρ-independent" behaviour re-emerges by itself at cold seams, where the measured
+  `L_x` is 0.
+
+Measured: x_low `c_s² ≥ 1` **500,561 → 0** (LS220) and **688,076 → 0** (SRO);
+`c_s² ≤ 0` **79,634 → 683** and **107,006 → 25,681**, with the worst excess falling
+from 5.69 / 10.14 to **3.2e-4 / 1.5e-3**. The other three bands are unchanged
+number for number. **No causal slope clamp was added on this side** (the mirror of
+§3's `u_high_b_cap`): the measured asymptote is 1/3, and unlike the u-high clamp —
+which the synthetic ideal gas trips at every seam point, keeping it covered in CI —
+an x-low clamp would be dead code on every table available. Full numbers in CODE.md's
+M3i findings block.
+
 ## 6. Tests and acceptance
 
 - **Unit (exactness):** on the synthetic hot gas (radiation-dominated boundary),
@@ -170,7 +205,13 @@ there invalid outright. Full numbers in CODE.md's M3g findings block.
   sign-bisection) — worth having even with causal tails, but it must not mask
   this fix's acceptance numbers; if built, land it behind a flag or after M3g's
   measurements.
-- x-low band repair, pending the §5 map.
+- ~~x-low band repair, pending the §5 map.~~ — **done (M3i, 2026-08-28)**: log-σ
+  x-low tail plus the removal of L's slope-to-zero override take that band's
+  `c_s² ≥ 1` count to 0 on both tables and its far tail to the same 1/3 asymptote
+  the u-high side reaches — see §5 and CODE.md "M3i empirical findings". What is
+  left of the original M3 tail: one pathological LS220 state and one SRO state on
+  the **x-HIGH** (hard-invalid `flag_oob_rho_high`) band, per 44,000; the x-high
+  band itself stays report-only by design.
 
 ## 8. Open decisions
 

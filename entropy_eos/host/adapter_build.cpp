@@ -143,6 +143,17 @@ struct ScanResult {
 // keeps evaluating exactly what evaluate() would (the clamp is
 // kappa-independent -- it only involves eps_hat and dln(sigma)/du -- so it
 // is as safe to run before the kappa relabeling as the rest of this scan).
+// M3i changed what this scan sees in the x-LOW band: L's tail there is now
+// the plain generic (linear-in-L, i.e. power-law-in-rho) continuation rather
+// than the old slope-to-zero override, so eps_hat is no longer frozen at its
+// seam value below rho_min. It moves in the *safe* direction at a radiation
+// seam (L_x < 0, so eps grows as rho drops) and by <~ a few percent at a
+// matter seam (L_x ~ 0); this scan is what turns that into a measured
+// statement about the eps floor rather than an argument. It does move kappa
+// (by 2.6e-7 / 5.1e-8 relative on the two real tables, and not at all on the
+// synthetic one) -- the extended-box eps minimum sits at the x-low x u-low
+// corner, i.e. exactly where M3i works. See CODE.md's M3i findings, which
+// censuses that drift as the ONLY in-box change M3i produces.
 double scan_extended_eps_floor(const BsplineView3 &L_view, const BsplineView3 &sigma_view, double x0,
                                 double hx, int nx, double u0, double hu, int nu, double y0, double hy,
                                 int ny, int refine, int ext_cells, double slope_floor_sigma,
@@ -190,9 +201,10 @@ double scan_extended_eps_floor(const BsplineView3 &L_view, const BsplineView3 &s
                                    x_hi,
                                    u_lo,
                                    u_hi,
+                                   x_ext_lo,
                                    slope_floor_L,
-                                   /*x_low_slope_zero=*/true,
-                                   /*u_high_log=*/false, // sigma-only; this scan evaluates L
+                                   /*x_low_log=*/false,  // sigma-only (M3i); this scan evaluates L
+                                   /*u_high_log=*/false, // sigma-only (M3g); ditto
                                    b_cap,
                                    shift_hat,
                                    inv_c2};

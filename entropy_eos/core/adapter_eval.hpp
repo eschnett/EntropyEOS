@@ -59,20 +59,16 @@
 // the blend cell, not just at its endpoints. Clamping costs C2 (drops to
 // C1/C0 at the seam) only inside flagged territory.
 //
-// Slope-to-zero variant (used ONLY for L's primary track on the x-low
-// seam; design: eps becomes rho-independent, ideal-gas-like as rho -> 0):
-// overrides the curvature so f'(d) ramps from f'_b to *exactly* 0 at
-// d = -w (then phase 2 is the constant f'=0 continuation), instead of using
-// the raw sampled f''_b. From the generic tail's own low-side asymptotic
-// slope m = f'_b - f''_b*w/2, forcing m=0 gives f''_eff = 2*f'_b/w (see
-// detail::aeval_slope_zero_track()). C1 (not C2) at the seam unless f''_b
-// already happened to equal 2*f'_b/w -- acceptable, flagged territory only.
-// sigma's x-low tail and both fields' x-high tail use the plain generic
-// tail instead (x-high keeps the hard flag_oob_rho_high regardless -- a
-// converged state there is invalid per eos-adapter-F-to-U.md S7, the tail
-// only exists so the *iteration* stays finite and can converge to a
-// reportable point). Neither x-direction tail uses the monotonicity guard
-// (x is clamped, never iterated -- only u is solved for).
+// (M2d-2 also carried a "slope-to-zero" variant on L's x-low primary track,
+// forcing eps to become rho-independent as rho -> 0. M3i removed it -- see
+// the "M3i X-LOW CAUSAL TAILS" section below for why it was the measured
+// cause of c_s^2 = 4/3 across that whole band.) Both fields' x-high tail
+// uses the plain generic tail (x-high keeps the hard flag_oob_rho_high
+// regardless -- a converged state there is invalid per
+// eos-adapter-F-to-U.md S7, the tail only exists so the *iteration* stays
+// finite and can converge to a reportable point). No x-direction tail uses
+// the monotonicity guard (x is clamped, never iterated -- only u is solved
+// for).
 //
 // Mixed-derivative composition. BsplineEval3 carries 7 fields (f, fx, fu,
 // fy, fxx, fxu, fuu); a single-axis tail acts on them track-wise, each
@@ -163,6 +159,87 @@
 // 8-cell log tail reaches ~10^0.8 ~ 6x s_max where the linear tail reached
 // ~1.8x). The bracket scan is log-spaced and the T-solve is a safeguarded
 // Newton on a still strictly monotone sigma, so no solver mechanics change.
+//
+// === M3i X-LOW CAUSAL TAILS (eos-causal-tail.md S5/S7 follow-up) ==========
+//
+// The class E extension-band map M3g added then measured the *other* band
+// M3g did not touch: the x-LOW band was ~50-58% acausal at c_s^2 ~ 4/3,
+// nearly constant, at every depth past the first blend cell and every u with
+// T >~ 0.1 MeV -- and its whole c_s^2 <= 0 population sat in the first blend
+// cell. Same shape of defect as the u-high one, same cure.
+//
+// The diagnosis. At these densities radiation dominates for T >~ 0.05 MeV:
+// eps ~ T^4/rho and s ~ T^3/rho, so ln eps and ln sigma are linear in
+// x = log10(rho) with slopes -ln10 per decade -- EXPONENTIAL in x for the
+// values. Write a_x = dln(sigma)/dx, a_u = dln(sigma)/du, b_x =
+// dln(eps)/dx, b_u = dln(eps)/du; then at fixed s the far-tail energy slope
+// is q = dlnW/dx|_s ~ b_x + b_u*(-a_x/a_u), and c_s^2 = (q + q^2 + q')/(1+q)
+// (which is <= 1 exactly when q^2 + q' <= 1, the eos-causal-tail.md S2
+// condition). Both defects follow from the two x-low tails' *families*:
+//
+//   * L's slope-to-zero override forced b_x = 0 in phase 2, so all of the
+//     adiabatic heating was shoved into the u-motion: q = 0 + 4*(1/3) = 4/3
+//     and c_s^2 = 4/3 -- the measured 1.35, at every depth, on both tables.
+//   * That same override is C1, not C2, and it gets there by *overriding the
+//     curvature* to f''_eff = 2 f'_b/w. At a radiation seam f'_b = L_x ~ -1
+//     and w = hx ~ 0.056, i.e. L_xx_eff ~ -36 inside the blend cell -- which
+//     is exactly the band's c_s^2 <= 0 population, all of it in that one cell.
+//
+// With the correct (log-linear) families on both fields, q = -1 + 4/3 = 1/3,
+// c_s^2 -> 1/3: causal, physically right, and p > 0 still (q > 0). Two
+// changes, x-LOW side only:
+//
+// 1. **Log-sigma x-low tail** (sigma only, ExtSpec::x_low_log). Exactly the
+//    M3g construction on the other axis: log-sample the (possibly already
+//    u-tailed) boundary sample with aeval_log_sample(), run the *unchanged*
+//    curvature-ramp machinery on g = ln sigma -- primary track (g, g_x,
+//    g_xx), secondary (g_u, g_xu, 0), frozen g_uu/g_y -- and map back with
+//    aeval_exp_sample(). The corner composition order is untouched: the
+//    u-tail still runs first, and the log transform lives entirely inside
+//    the x-low tail operator.
+//    **The u-LOW corner guard.** Unlike the u_hi seam, sigma at the x_lo
+//    seam is NOT positive by construction: sigma's u-low tail runs linearly
+//    to -infinity by design (so every s < s_min maps to a finite T -- the
+//    escape hatch stands), so a deep-cold column can hand the x-tail a
+//    sigma_b <= 0, where ln is undefined, or a sigma_b so small that the
+//    relative slope g_x = sigma_x/sigma_b explodes and e^{g_x d} overflows
+//    across the band. aeval_xlow_log_ok() therefore admits the log tail only
+//    when sigma_b > 0 AND the log track's own slopes keep the band's total
+//    log excursion under kXLowLogExcursionMax; otherwise the plain linear
+//    generic tail is used, exactly as before M3i. The switch is continuous
+//    AT the seam (both constructions reproduce the boundary sample exactly at
+//    d = 0 -- the log transforms are exact inverses) and differs only at
+//    O(d^2) into the band, so it is a curvature-level, not a value-level,
+//    discontinuity; it lives in deep-cold escape-hatch territory that is
+//    flagged and explicitly not a claim of physical validity
+//    (eos-adapter-F-to-U.md S7). Measured: it never fires on either real
+//    table or on the synthetic gas -- min sigma_b at the x_lo seam over the
+//    whole extended u range is 1.64 (LS220), 0.80 (SRO), 37.2 (synthetic),
+//    and the largest band excursion is 1.03 against the bound of 40.
+//
+// 2. **L's x-low tail drops the slope-to-zero override** and uses the plain
+//    generic tail. L is already a log-space field, so a linear-in-x L tail
+//    IS the correct exponential family for eps: the seam slope is L_x ~ -1
+//    at radiation seams (giving b_x = -ln10 and the 1/3 asymptote) and
+//    L_x ~ 0 at matter seams -- so the override's old "eps becomes
+//    rho-independent, ideal-gas-like" behaviour now *emerges* exactly where
+//    it was physical, instead of being imposed everywhere. (Measured at the
+//    x_lo seam: L_x = -1.0000 for T >~ 1 MeV on both real tables, and
+//    -0.0000 at the cold end -- and exactly 0.0000 at every u on the
+//    synthetic ideal gas.)
+//
+// No causal slope clamp is added on this side (the mirror of M3g's
+// u_high_b_cap): with both families corrected the measured band asymptote is
+// 1/3, and unlike the u-high clamp -- which the synthetic ideal gas trips at
+// every seam point and so keeps covered in CI -- an x-low clamp would be
+// dead code on every table available. See CODE.md's "M3i empirical
+// findings".
+//
+// Unchanged by M3i: both u-tails (including all of M3g), both fields'
+// x-HIGH tails, the monotonicity guards' semantics, srange()/flags/the
+// composition order, and every in-box evaluation (aeval_extended() still
+// falls straight through -- asserted bit-for-bit in
+// tests/test_adapter_tail.cpp).
 
 #pragma once
 
@@ -377,28 +454,39 @@ EEOS_HOST_DEVICE inline real aeval_L_slope_cap(real L_b, real b_cap, real shift_
   return b_cap * eps / (kLn10 * E);
 }
 
-// Slope-to-zero variant (module header; L's x-low primary track only):
-// overrides the curvature to f2_eff = 2*f1/w, which forces the low-side
-// asymptotic slope m = f1 - f2_eff*w/2 to exactly 0, then evaluates
-// aeval_ramp_track(). Only ever called with d<0 (the x-low seam).
-EEOS_HOST_DEVICE inline Track1D aeval_slope_zero_track(Track1D t, real d, real w) {
-  t.f2 = real(2) * t.f1 / w;
-  return aeval_ramp_track(t, d, w);
+// M3i: the largest log-space excursion |ln sigma - ln sigma_b| the x-LOW log
+// tail is allowed to manufacture across the whole band (module header point
+// 1). Its job is finiteness, not fidelity: e^40 ~ 2.4e17 leaves ~270 decades
+// of headroom above any physical seam entropy, while a sigma_b heading for
+// zero -- the u-low escape hatch's doing -- sends the log slope to -infinity
+// and would otherwise overflow. Real tables measure 0.03-1.03 here.
+constexpr real kXLowLogExcursionMax = real(40);
+
+// M3i: may a log-space x-low tail be built from this seam sample? `g` is the
+// sample's aeval_log_sample() image (so the caller pays for the transform
+// once), `w` the x grid cell, `depth` = x_lo - x_ext_lo the band's full
+// depth. False for a non-finite or exploding log slope, which sends
+// aeval_extended() back to the plain linear generic tail; the phase-1
+// curvature term needs no separate bound, since bounding both |g_x| and the
+// phase-2 slope bounds |g_xx| w^2 by O(w/depth) as well.
+EEOS_HOST_DEVICE inline bool aeval_xlow_log_ok(const BsplineEval3 &g, real w, real depth) {
+  const real m = aeval_phase2_slope(Track1D{g.f, g.fx, g.fxx}, real(-1), w);
+  const real a_gx = g.fx < real(0) ? -g.fx : g.fx;
+  const real a_m = m < real(0) ? -m : m;
+  const real span = (a_gx > a_m ? a_gx : a_m) * depth;
+  return span <= kXLowLogExcursionMax; // false for NaN, which is the point
 }
 
 enum class TailAxis { x, u };
 
 // One axis's tail parameters for aeval_apply_tail(): w = that axis's grid
 // cell (BsplineView3::hx or hu), m_floor = the primary track's slope floor
-// (<=0 to skip the guard -- every tail except a u-direction one),
-// slope_zero = use aeval_slope_zero_track for the primary track instead of
-// the (possibly guarded) generic one (true only for L's x-low tail),
-// m_cap = the M3g causal cap on the primary track's phase-2 slope (<=0 to
-// skip it -- every tail except L's u-HIGH one).
+// (<=0 to skip the guard -- every tail except a u-direction one), m_cap =
+// the M3g causal cap on the primary track's phase-2 slope (<=0 to skip it --
+// every tail except L's u-HIGH one).
 struct TailSpec {
   real w;
   real m_floor;
-  bool slope_zero;
   real m_cap;
 };
 
@@ -412,12 +500,12 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
   BsplineEval3 out = b;
   if (axis == TailAxis::x) {
     const Track1D f_in{b.f, b.fx, b.fxx};
-    const Track1D f_out = spec.slope_zero ? aeval_slope_zero_track(f_in, d, spec.w)
-                                           : aeval_generic_track(f_in, d, spec.w, spec.m_floor);
+    const Track1D f_out = aeval_generic_track(f_in, d, spec.w, spec.m_floor);
     const Track1D fu_in{b.fu, b.fxu, real(0)};
     const Track1D fu_out = aeval_generic_track(fu_in, d, spec.w, real(0));
-    // (m_cap is not consulted on an x-tail: causality is a u-direction
-    // statement in this construction -- see the module header's M3g note.)
+    // (m_cap is not consulted on an x-tail: M3g's clamp is a u-direction
+    // statement, and M3i deliberately added no x-low counterpart -- see the
+    // module header's M3i note.)
     out.f = f_out.f0;
     out.fx = f_out.f1;
     out.fxx = f_out.f2;
@@ -449,10 +537,15 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
 // by host/adapter_build.cpp's extended eps-floor scan):
 //   x_lo..u_hi          the *physical* box (the extended box is the caller's
 //                       business -- see aeval_extended()'s doc comment)
+//   x_ext_lo            M3i: the extended box's x floor. The ONLY extended-box
+//                       coordinate this struct carries, and it is not used to
+//                       locate anything -- only to measure the x-low band's
+//                       depth for aeval_xlow_log_ok()'s finiteness guard, which
+//                       must be the same decision at every point of the band.
 //   u_m_floor           this field's u-direction monotonicity-guard floor
 //                       (ext_slope_floor_sigma or _L)
-//   x_low_slope_zero    slope-to-zero variant for the x-low primary track
-//                       (true only for L)
+//   x_low_log           M3i: build the x-LOW tail in log space (true only for
+//                       sigma)
 //   u_high_log          M3g: build the u-HIGH tail in log space (true only
 //                       for sigma)
 //   u_high_b_cap        M3g: cap on b = dln(eps_hat)/du at the u-high seam,
@@ -462,8 +555,9 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
 //                       cap on L's own slope (aeval_L_slope_cap())
 struct ExtSpec {
   real x_lo, x_hi, u_lo, u_hi;
+  real x_ext_lo;
   real u_m_floor;
-  bool x_low_slope_zero;
+  bool x_low_log;
   bool u_high_log;
   real u_high_b_cap;
   real shift_hat, inv_c2;
@@ -481,8 +575,12 @@ struct ExtSpec {
 // Corner composition order (module header): the raw spline sample is
 // always taken at the seam clamped to the *physical* box in both
 // directions, the u-tail is applied first, then the x-tail is applied to
-// the (possibly already u-tailed) result. M3g's log-space u-high tail sits
-// entirely inside the u-tail step, so that order is unchanged.
+// the (possibly already u-tailed) result. M3g's log-space u-high tail and
+// M3i's log-space x-low tail each sit entirely inside their own tail step,
+// so that order is unchanged (a u-high x-low corner query maps back out of
+// log space after the u-tail and into it again for the x-tail; the extra
+// exp/log pair costs one round-off there and keeps the two operators
+// independent).
 EEOS_HOST_DEVICE inline BsplineEval3 aeval_extended(const BsplineView3 &field, real x, real u, real y,
                                                       const ExtSpec &spec) {
   const bool u_below = u < spec.u_lo;
@@ -503,7 +601,7 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_extended(const BsplineView3 &field, r
       // monotonicity floor transfers as m_floor/sigma_b (module header).
       const real m_floor_g = spec.u_m_floor > real(0) ? spec.u_m_floor / b.f : real(0);
       const BsplineEval3 g = aeval_apply_tail(aeval_log_sample(b), d, TailAxis::u,
-                                               TailSpec{field.hu, m_floor_g, false, real(0)});
+                                               TailSpec{field.hu, m_floor_g, real(0)});
       b = aeval_exp_sample(g);
     } else {
       // M3g causal clamp (L's u-high tail only; 0 everywhere else, which
@@ -511,13 +609,26 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_extended(const BsplineView3 &field, r
       const real m_cap = (u_above && spec.u_high_b_cap > real(0))
                              ? aeval_L_slope_cap(b.f, spec.u_high_b_cap, spec.shift_hat, spec.inv_c2)
                              : real(0);
-      b = aeval_apply_tail(b, d, TailAxis::u, TailSpec{field.hu, spec.u_m_floor, false, m_cap});
+      b = aeval_apply_tail(b, d, TailAxis::u, TailSpec{field.hu, spec.u_m_floor, m_cap});
     }
   }
   if (x_below || x_above) {
     const real seam = x_below ? spec.x_lo : spec.x_hi;
-    b = aeval_apply_tail(b, x - seam, TailAxis::x,
-                          TailSpec{field.hx, real(0), x_below && spec.x_low_slope_zero, real(0)});
+    const real d = x - seam;
+    const TailSpec xspec{field.hx, real(0), real(0)};
+    bool done = false;
+    if (x_below && spec.x_low_log && b.f > real(0)) {
+      // M3i log-sigma x-low tail: the same machinery on g = ln(sigma), taken
+      // only where the log slope stays bounded across the band (the u-LOW
+      // corner guard -- module header point 1). No monotonicity floor: x is
+      // clamped, never iterated.
+      const BsplineEval3 g = aeval_log_sample(b);
+      if (aeval_xlow_log_ok(g, field.hx, spec.x_lo - spec.x_ext_lo)) {
+        b = aeval_exp_sample(aeval_apply_tail(g, d, TailAxis::x, xspec));
+        done = true;
+      }
+    }
+    if (!done) b = aeval_apply_tail(b, d, TailAxis::x, xspec);
   }
   return b;
 }
@@ -602,8 +713,9 @@ struct EntropyEOSView {
                            x_hi,
                            u_lo,
                            u_hi,
+                           x_ext_lo,
                            ext_slope_floor_sigma,
-                           /*x_low_slope_zero=*/false,
+                           /*x_low_log=*/true,
                            /*u_high_log=*/true,
                            /*u_high_b_cap=*/real(0),
                            shift_hat,
@@ -614,8 +726,9 @@ struct EntropyEOSView {
                            x_hi,
                            u_lo,
                            u_hi,
+                           x_ext_lo,
                            ext_slope_floor_L,
-                           /*x_low_slope_zero=*/true,
+                           /*x_low_log=*/false,
                            /*u_high_log=*/false,
                            b_cap,
                            shift_hat,
