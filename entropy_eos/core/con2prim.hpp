@@ -23,7 +23,9 @@
 //   4. Damped 2x2 Newton (S7-8): solve, limit the step (|dw| <= 1,
 //      |ds| <= 0.25*extended-span), clamp w >= 0 -- see con2prim(), including
 //      why an initial backtracking-on-non-decrease scheme was measured to be
-//      net harmful and replaced by unconditional clamped steps.
+//      net harmful and replaced by unconditional clamped steps. The loop also
+//      remembers its best-so-far iterate (M3h item 7) and hands THAT, not its
+//      last, to step 5.
 //   5. S9 nested fallback when Newton fails to converge within
 //      max_iter_newton (including a non-finite/singular step): a bracketed
 //      safeguarded 1D Newton/bisection inner solve of f1(w;s)=0 (S9's
@@ -35,6 +37,16 @@
 //      failed_no_bracket when the scan below finds no sign change anywhere
 //      (S11: the caller's invalid-state policy); failed_max_iter when the
 //      outer solve exhausts its budget without meeting both tolerances.
+//
+//      TOLERANCE SEMANTICS (M3h; see item 7 and Con2PrimOptions::tol).
+//      "Both tolerances", here and at every convergence test in this file,
+//      means the two NORMALIZED residuals:
+//        |f1|/cosh(w) = |tanh(w) - V| <= tol     and     |f2| <= tol.
+//      f2 is normalized already (by max(tau, tau_floor_rel*D)); f1 is
+//      O(cosh w) by construction, so it is the comparison -- never f1 itself,
+//      and never the Jacobian rows -- that carries the 1/cosh(w). The Newton
+//      and secant steps are invariant under row scaling, so nothing else in
+//      the algorithm changes.
 //
 //      M3c bracket scan (measured on real tables -- LS220/SRO, --states
 //      4000: warm n_failed_no_bracket ~0.5%, but the seed-independent COLD
@@ -107,6 +119,37 @@
 //      remaining states are the hot-edge/acausal-corner tail that BOTH
 //      passes share (open item (ii)), not a seed deficiency. Pre-M3d the
 //      same ratio was ~200x.
+//
+//   7. M3h CLASS-B SOLVER HARDENING (CODE.md "M3h empirical findings"), three
+//      changes that between them take the residual failure tail from
+//      31 warm + 8 cold (LS220) and 82 + 15 (SRO) per 40k warm / 4k cold
+//      audit states to 1 + 0 and 0 + 1:
+//        (a) RELATIVE f1 CONVERGENCE TESTS -- detail::c2p_f1_converged(),
+//            used by c2p_inner_solve_w()'s loop, con2prim()'s Newton test and
+//            its final acceptance; detail::c2p_scaled_norm() for the
+//            precision polish's improvement test and the best-iterate
+//            tracking. This is the one that moves the numbers: the dominant
+//            failure class was states with |f2| ~ 1e-14 and |f1| ~ 2e-12 at
+//            w ~ 6, i.e. |tanh w - V| ~ 1e-14 -- converged, and rejected only
+//            by a mis-scaled comparison. See c2p_f1_converged()'s own
+//            comment.
+//        (b) GEOMETRIC RELATIVE LOCAL SCAN WINDOW -- c2p_bracket_scan()'s
+//            LOCAL half is now a ladder of relative offsets from the anchor
+//            rather than a linear window sized to a physical srange span that
+//            can be 5e4 times the anchor itself. MEASURED NEUTRAL on both
+//            real tables once (a) and (c) are in place (the states that
+//            depended on the scan are gone), and measurably better on the
+//            geometry that motivated it (tests/test_con2prim.cpp test 10).
+//        (c) BEST-ITERATE HANDOFF -- con2prim()'s Newton loop tracks its
+//            minimum scaled-norm iterate and uses it as the fallback's scan
+//            anchor and warm start, and every failure exit reports a state no
+//            worse than it. Exit-state bookkeeping only: one Residuals copy,
+//            no extra EOS evaluations, the unconditional-clamped-step design
+//            of item 4 untouched.
+//      What did NOT change: the defaults (tol 1e-12, max_iter_newton 30,
+//      max_iter_1d 60, bracket_scan 17), the M3d cold seed, the residuals,
+//      the Jacobian, and the steps. Warm Newton solves whose trajectory never
+//      touches a changed comparison are bit-identical.
 
 #pragma once
 
@@ -123,6 +166,22 @@ struct Con2PrimIn {
 };
 
 struct Con2PrimOptions {
+  // Convergence tolerance on the NORMALIZED residual pair (M3h):
+  //   |tanh(w) - V| = |f1|/cosh(w) <= tol   and   |f2| <= tol
+  // (f2 is already normalized, by max(tau, tau_floor_rel*D), and is
+  // unchanged from M3a). The f1 normalization is what makes tol mean the
+  // same thing at every rapidity: the raw momentum residual
+  // f1 = sinh(w) - cosh(w)*V is O(cosh w), so an absolute bound on it would
+  // demand cosh(w) times more accuracy at w = 6 than at w = 0 and more than
+  // double precision can deliver at all past w ~ 9 -- see
+  // detail::c2p_f1_converged() for the measurement that motivated this.
+  //
+  // 1e-12 is where the failure tail is empty and the bulk is comfortable, and
+  // the two trade against each other here (measured, LS220 40k warm + 4k
+  // cold): at 1e-13 the recovered primitives are ~30x tighter (prim_rho p99
+  // 2.3e-9 -> 7.2e-11) but 46 states fail instead of 1, and at 1e-14, 1204 --
+  // past ~1e-13 the request outruns what the EOS-derived residuals can
+  // deliver. Tighten it only with that trade in view.
   real tol = real(1e-12);
   int max_iter_newton = 30;
   int max_iter_1d = 60;
@@ -196,14 +255,55 @@ constexpr real kC2PTinyW = real(1e-10);
 
 // One residual/Jacobian evaluation at a trial (s,w), echoing the inputs
 // (r.s, r.w) for callers that thread the result through warm starts.
+// `coshw` is cached (M3h) purely so the residual SCALES are available to the
+// convergence tests below without a second std::cosh() call -- f1 is
+// O(cosh w) by construction (see c2p_f1_converged()).
 struct Residuals {
   real s, w;
   real rho;
+  real coshw;
   EOSPoint pt;
   real z, v_par, v_perp, V;
   real f1, f2;
   real df1_ds, df1_dw, df2_ds, df2_dw;
 };
+
+// M3h: the momentum residual's convergence test, in the NORMALIZED residual
+// f1/cosh(w) = tanh(w) - V rather than in f1 itself.
+//
+// f1 = sinh(w) - cosh(w)*V is a difference of two O(cosh w) quantities, so
+// an ABSOLUTE |f1| <= tol test is a test on tanh(w) - V scaled by cosh(w) --
+// i.e. it silently demands cosh(w) times more accuracy at high rapidity than
+// at low. That is not merely strict, it is unattainable: V is derived from
+// the EOS (V = |S|-projections / z, z = D*h*cosh w), so its relative error is
+// a few ulp and |f1| has a double-precision floor of order eps*cosh(w) times
+// the EOS chain's own error amplification. MEASURED on the two real tables
+// (40k warm + 4k cold audit states, post-M3g): the dominant residual failure
+// class returned |f1| = 1.2e-12 ... 4.2e-12 with |f2| = 1e-14 ... 1e-15 at
+// w = 5.5 ... 6.0, where cosh w ~ 180-200 -- i.e. |tanh w - V| ~ 1e-14, fully
+// converged, rejected only by the mis-scaled test. At trial w >~ 9 (which
+// inner solves reach while bracketing) eps*cosh(w) EXCEEDS tol = 1e-12
+// outright, so the old test could never be satisfied there and the inner
+// solve burned its whole budget at every such scan point.
+//
+// Written as |f1| <= tol*cosh(w) rather than |f1|/cosh(w) <= tol so the hot
+// path does one multiply instead of one divide; cosh(w) >= 1 always, so this
+// is never tighter than the old test and never divides by zero.
+EEOS_HOST_DEVICE inline bool c2p_f1_converged(const Residuals &r, real tol) {
+  return std::fabs(r.f1) <= tol * r.coshw;
+}
+
+// M3h: the residual pair's norm with f1 normalized to f2's O(1) scale
+// (max-norm of the two normalized residuals). Used wherever the two
+// residuals are COMPARED or minimized together -- the precision polish's
+// improvement test and the Newton loop's best-iterate tracking -- where a
+// plain ||f||_2 would be dominated by the O(cosh w) component and would
+// happily trade a real f2 improvement for a cosmetic f1 one.
+EEOS_HOST_DEVICE inline real c2p_scaled_norm(const Residuals &r) {
+  const real n1 = std::fabs(r.f1) / r.coshw;
+  const real n2 = std::fabs(r.f2);
+  return n1 > n2 ? n1 : n2;
+}
 
 // Evaluates (f1, f2) and their Jacobian at one trial (s, w) (design doc
 // SS6-8). D, tau, ye, S_par, S_perp, B2 are the fixed conservative data;
@@ -220,6 +320,7 @@ EEOS_HOST_DEVICE inline Residuals c2p_eval(const EntropyEOSView &eos, real D, re
   const real tanhw = std::tanh(w);
   const real half_sinh = std::sinh(real(0.5) * w);
 
+  r.coshw = coshw;
   r.rho = D / coshw;
   r.pt = eos.evaluate(r.rho, s, ye, u_prev);
 
@@ -307,6 +408,14 @@ EEOS_HOST_DEVICE inline Residuals c2p_eval(const EntropyEOSView &eos, real D, re
 // safeguarded Newton/bisection -- same style as adapter_eval.hpp's T-solve.
 // Returns the converged (or best-effort, if max_iter_1d is exhausted)
 // Residuals; iters_out receives the iteration count.
+//
+// M3h: `tol` is a tolerance on the NORMALIZED residual tanh(w) - V (see
+// c2p_f1_converged()), not on f1 itself. This matters most here: the
+// bisection half of this solve walks w over the whole [0, w_max] bracket, so
+// it routinely evaluates f1 at trial w near w_max = 12, where cosh(w) ~ 8e4
+// puts f1's own double-precision floor an order of magnitude ABOVE the old
+// absolute tol -- every such solve ran its full max_iter_1d budget without
+// ever being able to pass.
 EEOS_HOST_DEVICE inline Residuals c2p_inner_solve_w(const EntropyEOSView &eos, real D, real tau, real ye,
                                                      real S_par, real S_perp, real B2, real s, real w_max,
                                                      real tau_floor_rel, real w_start, real u_prev,
@@ -316,7 +425,7 @@ EEOS_HOST_DEVICE inline Residuals c2p_inner_solve_w(const EntropyEOSView &eos, r
   Residuals r = c2p_eval(eos, D, tau, ye, S_par, S_perp, B2, s, w, u_prev, tau_floor_rel);
 
   int iters = 0;
-  while (std::fabs(r.f1) > tol && iters < max_iter_1d) {
+  while (!c2p_f1_converged(r, tol) && iters < max_iter_1d) {
     ++iters;
     // f1 increasing in w: f1<0 means the root is further right (raise lo);
     // f1>0 means it is further left (lower hi).
@@ -351,6 +460,26 @@ EEOS_HOST_DEVICE inline Residuals c2p_inner_solve_w(const EntropyEOSView &eos, r
 // per this file's device-ready discipline) -- Con2PrimOptions::bracket_scan
 // is clamped into [4, kC2PBracketScanMax] before use.
 constexpr int kC2PBracketScanMax = 33;
+
+// M3h: the LOCAL half of the bracket scan places its points at
+// s_in*(1 +- delta), delta log-spaced over [kC2PScanDeltaMin,
+// kC2PScanDeltaMax] -- see c2p_bracket_scan()'s LOCAL-half comment for the
+// measurement that replaced the pre-M3h srange-width-sized linear window.
+//
+// The two ends are set by what the anchor can be trusted to mean, not tuned
+// to a particular table. UPPER (0.6): the pre-M3h window's own coefficient,
+// reused -- past +-60% of the anchor, "local" stops saying anything the
+// GLOBAL half does not already cover. LOWER (1e-5): just below the tightest
+// stalled-Newton anchor measured on the M3g failure set (relative distances
+// to the root of 3e-5 ... 1e-2). Anything closer to the anchor than this is
+// caught anyway by the innermost PAIR, which straddles s_in, so a smaller
+// value would only help against MULTIPLE roots inside +-1e-5 -- and it would
+// spend a rung out of the six the default n_scan = 17 leaves for this half.
+// Measured (LS220/SRO, 40k states, plus a forced-fallback stress at
+// max_iter_newton = 0): 1e-5, 1e-4 and 1e-3 are indistinguishable on both
+// real tables, so this is a reasoned choice, not a fitted one.
+constexpr real kC2PScanDeltaMin = real(1e-5);
+constexpr real kC2PScanDeltaMax = real(0.6);
 
 // Ascending insertion sort of up to kC2PBracketScanMax (s,g) pairs by s,
 // keeping g paired with its s. O(n^2) worst case, but n <= 33 here -- and
@@ -388,8 +517,10 @@ struct BracketScanResult {
 //   - the two EXTENDED srange endpoints (rho=D, rho=D/cosh(w_max)),
 //   - the two PHYSICAL srange endpoints (same two rho's),
 //   - n_scan-4 interior points, HALF uniform in s across the physical
-//     range [s_phys_lo, s_phys_hi] and HALF a dense window centered on
-//     `s_in` spanning its own local physical srange width at `w_in` --
+//     range [s_phys_lo, s_phys_hi] and HALF a geometric ladder of RELATIVE
+//     offsets from `s_in` (M3h; through M3g this half was a linear window
+//     of +-0.6 of s_in's own local physical srange width -- see the local
+//     half's own comment for the measurement that replaced it) --
 // -- evaluates g=f2 at each with a FULL-precision inner w-solve (see the
 // evaluation loop's own comment below for why a loosened scan-only
 // tolerance was tried and reverted), sorts the (s,g) pairs by s (the
@@ -437,13 +568,6 @@ EEOS_HOST_DEVICE inline BracketScanResult c2p_bracket_scan(const EntropyEOSView 
   const real s_phys_lo = phys_a.s_min < phys_b.s_min ? phys_a.s_min : phys_b.s_min;
   const real s_phys_hi = phys_a.s_max > phys_b.s_max ? phys_a.s_max : phys_b.s_max;
 
-  // Incoming iterate's local physical srange (design comment above): used
-  // to build the LOCAL half of the interior scan below.
-  const real w_in_c = aeval_clamp(w_in, real(0), w_max);
-  const real rho_in = D / std::cosh(w_in_c);
-  const SRange sr_in = eos.srange(rho_in, ye);
-  const real span_in = sr_in.s_max - sr_in.s_min;
-
   real s_cand[kC2PBracketScanMax];
   int nc = 0;
   s_cand[nc++] = s_ext_lo;
@@ -461,19 +585,75 @@ EEOS_HOST_DEVICE inline BracketScanResult c2p_bracket_scan(const EntropyEOSView 
     s_cand[nc++] = s_phys_lo + frac * (s_phys_hi - s_phys_lo);
   }
 
-  // LOCAL half: dense window centered on s_in, spanning +-0.6 of s_in's own
-  // local physical srange width (generous enough to catch a narrow real-
-  // table feature near a good s_in without being as wide as the global
-  // range), clamped into the extended bracket for safety.
+  // LOCAL half (M3h): a GEOMETRIC ladder of RELATIVE offsets from s_in --
+  // points at s_in*(1 +- delta_i), delta_i log-spaced over [kC2PScanDeltaMin,
+  // kC2PScanDeltaMax] with the sides ALTERNATING, clamped into the extended
+  // bracket.
+  //
+  // Through M3g this half was linear and sized to s_in's own local PHYSICAL
+  // srange width (+-0.6 of it). MEASURED failure of that sizing (LS220/SRO,
+  // 40k warm + 4k cold audit states): at the radiation-dominated low-density
+  // states where the residual failed_no_bracket class lived, the physical
+  // srange spans 13-14.5 decades -- a span of ~5e13 around an s_in of ~1e9 --
+  // so consecutive LOCAL points sat ~5e12 apart while g(s)'s sign-changing
+  // window around the true root was 1e-7 ... 1e-3 RELATIVE to s_in. The
+  // "local" window was thus five orders of magnitude coarser than the feature
+  // it existed to resolve, and its points were, in relative terms, no more
+  // local than the global half's. A relative ladder is the natural sizing:
+  // s_in is a good anchor exactly when Newton stalled near the root, and
+  // "near" is a relative statement (measured on the M3g failure set: the
+  // stalled iterates sat 3e-5 ... 1e-2 relative to their root).
+  //
+  // The ladder is emitted in PAIRS (+delta, -delta), so BOTH sides span the
+  // full [kC2PScanDeltaMin, kC2PScanDeltaMax] and the innermost pair
+  // straddles s_in. A one-sided ladder with alternating signs (which halves
+  // the ladder step, at the price of halving each side's REACH) was tried
+  // first and measured worse: SRO audit state k = 17457 has its root at
+  // +0.157 relative to the anchor, inside the pair ladder's outermost gap but
+  // beyond the alternating ladder's positive reach of 0.066, and only the
+  // pair form recovers it. Coverage beats resolution here because the outer
+  // Illinois solve resolves a wide bracket cheaply, whereas a missed root is
+  // a failed_no_bracket outright.
+  //
+  // s_in <= 0 or non-finite falls back to the old span-based window: s can
+  // legitimately be at or below 0 (cold states on tables whose entropy axis
+  // reaches 0), where a multiplicative offset degenerates.
   {
-    const real half_width = real(0.6) * span_in;
-    real lo = s_in - half_width;
-    real hi = s_in + half_width;
-    lo = aeval_clamp(lo, s_ext_lo, s_ext_hi);
-    hi = aeval_clamp(hi, s_ext_lo, s_ext_hi);
-    for (int i = 0; i < n_local; ++i) {
-      const real frac = n_local > 1 ? static_cast<real>(i) / static_cast<real>(n_local - 1) : real(0.5);
-      s_cand[nc++] = lo + frac * (hi - lo);
+    const bool relative_ok = s_in > real(0) && c2p_is_finite(s_in);
+    if (relative_ok) {
+      const int n_pair = (n_local + 1) / 2; // distinct |delta| values
+      // One std::pow for the ladder ratio, then a running multiply -- this is
+      // the fallback path (it already pays n_scan full inner w-solves), but
+      // there is no reason to spend a transcendental per point.
+      const real ratio = n_pair > 1 ? std::pow(kC2PScanDeltaMax / kC2PScanDeltaMin,
+                                                real(1) / static_cast<real>(n_pair - 1))
+                                    : real(1);
+      real delta = kC2PScanDeltaMin;
+      for (int i = 0, emitted = 0; i < n_pair && emitted < n_local; ++i) {
+        s_cand[nc++] = aeval_clamp(s_in * (real(1) + delta), s_ext_lo, s_ext_hi);
+        ++emitted;
+        if (emitted < n_local) { // odd n_local spends its last point on the + side
+          s_cand[nc++] = aeval_clamp(s_in * (real(1) - delta), s_ext_lo, s_ext_hi);
+          ++emitted;
+        }
+        delta *= ratio;
+      }
+    } else {
+      // Pre-M3h sizing, kept verbatim for the degenerate anchor: a dense
+      // window centered on s_in, spanning +-0.6 of s_in's own local physical
+      // srange width at w_in, clamped into the extended bracket.
+      const real w_in_c = aeval_clamp(w_in, real(0), w_max);
+      const real rho_in = D / std::cosh(w_in_c);
+      const SRange sr_in = eos.srange(rho_in, ye);
+      const real half_width = real(0.6) * (sr_in.s_max - sr_in.s_min);
+      real lo = s_in - half_width;
+      real hi = s_in + half_width;
+      lo = aeval_clamp(lo, s_ext_lo, s_ext_hi);
+      hi = aeval_clamp(hi, s_ext_lo, s_ext_hi);
+      for (int i = 0; i < n_local; ++i) {
+        const real frac = n_local > 1 ? static_cast<real>(i) / static_cast<real>(n_local - 1) : real(0.5);
+        s_cand[nc++] = lo + frac * (hi - lo);
+      }
     }
   }
 
@@ -922,10 +1102,28 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   // unconditionally; the SS9 fallback (guaranteed globally convergent) is
   // the safety net for the states that still do not converge within
   // max_iter_newton, exactly as the design doc intends.
+  //
+  // M3h adds exit-state bookkeeping only (no extra EOS evaluation, no change
+  // to the step): the loop remembers the iterate with the smallest SCALED
+  // residual norm max(|f1|/cosh w, |f2|) it ever visited, and hands THAT to
+  // the S9 fallback below instead of the last one. Unconditional clamped
+  // steps are exactly what makes this necessary -- an iterate oscillating at
+  // the precision floor (or one that crossed an ill-conditioned region and
+  // is mid-excursion when the budget runs out) leaves `r` far from the best
+  // position the trajectory reached, and that stale position was then used
+  // both to anchor the bracket scan and as the reported failure state
+  // (measured pre-M3g on LS220 k=36066: f2 = 1.1e-3 at return, against
+  // <= 1e-10 along the trajectory).
   Residuals r = detail::c2p_eval(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, s, w, u_start,
                                   opts.tau_floor_rel);
   int iters = 0;
-  bool converged = std::fabs(r.f1) <= opts.tol && std::fabs(r.f2) <= opts.tol;
+  bool converged = detail::c2p_f1_converged(r, opts.tol) && std::fabs(r.f2) <= opts.tol;
+
+  // best_norm may start out NaN (a non-finite first residual); the update
+  // below is written as !(n >= best_norm) precisely so that case is replaced
+  // by the first finite iterate rather than latched forever.
+  Residuals r_best = r;
+  real best_norm = detail::c2p_scaled_norm(r);
 
   while (!converged && iters < opts.max_iter_newton) {
     ++iters;
@@ -956,7 +1154,13 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
     s = s_next;
     w = w_next;
     r = r_next;
-    converged = std::fabs(r.f1) <= opts.tol && std::fabs(r.f2) <= opts.tol;
+    converged = detail::c2p_f1_converged(r, opts.tol) && std::fabs(r.f2) <= opts.tol;
+
+    const real n_now = detail::c2p_scaled_norm(r);
+    if (detail::c2p_is_finite(n_now) && !(n_now >= best_norm)) {
+      r_best = r;
+      best_norm = n_now;
+    }
   }
 
   if (converged) {
@@ -967,11 +1171,18 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
 
   // --- S9 nested 1D fallback -------------------------------------------------
   // M3c bracket scan (see this function's fallback-section doc comment
-  // above for the measured diagnosis and design): `s`/`w` here are the
-  // incoming iterate -- Newton's last (possibly failed) position, or the
-  // untouched seed if max_iter_newton==0 -- used both to anchor the scan's
-  // interior points and to break ties among multiple sign-changing
-  // intervals.
+  // above for the measured diagnosis and design): the anchor below is the
+  // incoming iterate -- Newton's BEST visited position (M3h; the last one
+  // through M3g), or the untouched seed if max_iter_newton==0 -- used both
+  // to anchor the scan's interior points and to break ties among multiple
+  // sign-changing intervals.
+  //
+  // M3h: `r_best` is bit-identical to `r` whenever the Newton trajectory
+  // improved monotonically in the scaled norm (the common case), so for
+  // those states this whole section is unchanged; it differs exactly for the
+  // oscillating/excursion trajectories the fallback exists to rescue, where
+  // the last iterate is a poor anchor for a scan whose local half is now
+  // sized RELATIVE to it (see c2p_bracket_scan()).
   //
   // M3d asked whether a COLD call should instead anchor the scan's LOCAL
   // half on the seed itself, on the theory that a cold Newton which ran out
@@ -985,19 +1196,30 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   // where it started, so "Newton's last iterate" and "the seed" are the
   // same neighbourhood -- and for max_iter_newton == 0 they are literally
   // the same value.
+  const real s_anchor = r_best.s;
+  const real w_anchor = r_best.w;
+  const real u_anchor = r_best.pt.u_solved;
+
   const detail::BracketScanResult scan =
       detail::c2p_bracket_scan(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, opts.w_max,
-                                opts.tau_floor_rel, opts.bracket_scan, s, w, w, r.pt.u_solved,
-                                opts.max_iter_1d, opts.tol);
+                                opts.tau_floor_rel, opts.bracket_scan, s_anchor, w_anchor, w_anchor,
+                                u_anchor, opts.max_iter_1d, opts.tol);
 
   if (!scan.bracketed) {
     int best_it = 0;
     const Residuals best = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2,
-                                                       scan.s_best, opts.w_max, opts.tau_floor_rel, w,
-                                                       r.pt.u_solved, opts.max_iter_1d, opts.tol, best_it);
+                                                       scan.s_best, opts.w_max, opts.tau_floor_rel, w_anchor,
+                                                       u_anchor, opts.max_iter_1d, opts.tol, best_it);
     (void)best_it;
     out.result = C2PResult::failed_no_bracket;
-    detail::c2p_fill(out, best, iters, 0);
+    // M3h: report whichever of the scan's best point and the Newton's best
+    // iterate sits closer to a root in the scaled norm. The scan point is a
+    // converged f1 root by construction but can sit far from the true s,
+    // while a Newton that stalled near the root is often the better answer
+    // for a caller that inspects the failed state (and for the M3e policy
+    // layer, which repairs from it).
+    const Residuals &rep = detail::c2p_scaled_norm(r_best) < detail::c2p_scaled_norm(best) ? r_best : best;
+    detail::c2p_fill(out, rep, iters, 0);
     return out;
   }
 
@@ -1013,7 +1235,7 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   // unchanged below.
   int ia = 0, ib = 0;
   Residuals r_lo = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2,
-                                              scan.s_lo, opts.w_max, opts.tau_floor_rel, w, r.pt.u_solved,
+                                              scan.s_lo, opts.w_max, opts.tau_floor_rel, w_anchor, u_anchor,
                                               opts.max_iter_1d, opts.tol, ia);
   Residuals r_hi = detail::c2p_inner_solve_w(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2,
                                               scan.s_hi, opts.w_max, opts.tau_floor_rel, r_lo.w,
@@ -1027,11 +1249,15 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
   if (!bracketed) {
     // Extremely rare (both solves are full precision, so this would mean
     // the fresh warm start above landed on a genuinely different g(s) --
-    // not observed, but guarded defensively): same best-of-two-endpoints
-    // report as the ordinary no-bracket path.
+    // not observed with the default budgets, but reachable with a crippled
+    // max_iter_1d, and guarded defensively): same best-of-two-endpoints
+    // report as the ordinary no-bracket path, and (M3h) the same
+    // best-Newton-iterate comparison, so EVERY failure exit reports a state
+    // at least as good as the trajectory's best.
     out.result = C2PResult::failed_no_bracket;
     const Residuals &best = std::fabs(glo) <= std::fabs(ghi) ? r_lo : r_hi;
-    detail::c2p_fill(out, best, iters, 0);
+    const Residuals &rep = detail::c2p_scaled_norm(r_best) < detail::c2p_scaled_norm(best) ? r_best : best;
+    detail::c2p_fill(out, rep, iters, 0);
     return out;
   }
 
@@ -1156,14 +1382,36 @@ EEOS_HOST_DEVICE inline Con2PrimOut con2prim(const EntropyEOSView &eos, const Co
     const real w_try = w_raw < real(0) ? detail::kC2PTinyW : detail::aeval_clamp(w_raw, real(0), opts.w_max);
     const Residuals r_try = detail::c2p_eval(eos, in.D, in.tau, out.ye, in.S_par, in.S_perp, in.B2, s_try,
                                               w_try, r_cur.pt.u_solved, opts.tau_floor_rel);
-    const real n_cur = std::sqrt(r_cur.f1 * r_cur.f1 + r_cur.f2 * r_cur.f2);
-    const real n_try = std::sqrt(r_try.f1 * r_try.f1 + r_try.f2 * r_try.f2);
+    // M3h: the improvement test is the SCALED norm max(|f1|/cosh w, |f2|).
+    // The old plain ||f||_2 mixed f1 (O(cosh w)) with f2 (O(1)), so at high
+    // rapidity it was effectively a test on f1 alone and would accept a step
+    // that shaved the mis-scaled momentum residual while degrading the
+    // energy residual -- or, worse, stop early because f1's floor dominated
+    // the norm and no step could lower it.
+    const real n_cur = detail::c2p_scaled_norm(r_cur);
+    const real n_try = detail::c2p_scaled_norm(r_try);
     if (!detail::c2p_is_finite(n_try) || !(n_try < n_cur)) break;
     r_cur = r_try;
   }
 
-  const bool f1_ok = std::fabs(r_cur.f1) <= opts.tol;
-  out.result = (outer_converged && f1_ok) ? C2PResult::converged_fallback : C2PResult::failed_max_iter;
+  // M3h: as on the no-bracket path above, a Newton iterate that got closer
+  // to a root than the fallback's own best point is the better thing to
+  // report -- but only when the fallback did NOT converge. Substituting into
+  // a converged fallback would risk swapping in a point near a DIFFERENT
+  // root of the same conservative state (the S9 outer solve's uniqueness is
+  // not proven), which is exactly the wrong-root class the audit tracks.
+  bool accepted = outer_converged && detail::c2p_f1_converged(r_cur, opts.tol);
+  if (!accepted && detail::c2p_scaled_norm(r_best) < detail::c2p_scaled_norm(r_cur)) {
+    r_cur = r_best;
+    // Acceptance is then judged on the substituted state's OWN residuals
+    // rather than on the outer solve's bookkeeping. A Newton iterate meeting
+    // both tolerances would already have exited the loop as
+    // converged_newton, so in practice this only re-reports a FAILURE with a
+    // better state; it is written out rather than assumed so the two stay
+    // consistent if the loop's exit conditions ever change.
+    accepted = detail::c2p_f1_converged(r_cur, opts.tol) && std::fabs(r_cur.f2) <= opts.tol;
+  }
+  out.result = accepted ? C2PResult::converged_fallback : C2PResult::failed_max_iter;
   detail::c2p_fill(out, r_cur, iters, outer_iters);
   return out;
 }

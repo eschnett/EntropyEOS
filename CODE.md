@@ -510,6 +510,119 @@ commit, same seeds, same states, so every pair below is apples to apples):
   i.e. a sub-2× tolerance miss at the corner's roundoff floor. Both are reported, flagged,
   and unrelated to causality.
 
+**M3h empirical findings — class-B solver hardening** (`entropy_eos/core/con2prim.hpp`,
+measured 2026-08-27 on the two local tables; "before" is the same binary built at the
+M3g commit, same seeds, same states, so every pair below is apples to apples).
+Three changes, all comparisons-only or exit-state bookkeeping: **(a)** the convergence
+tests on the momentum residual are taken on the *normalized* `f1/cosh(w) = tanh w − V`;
+**(b)** the S9 bracket scan's LOCAL half is a geometric ladder of *relative* offsets from
+its anchor; **(c)** the Newton loop hands its *best* iterate, not its last, to the S9
+fallback.
+
+- **The residual tail is essentially gone, and (a) is what does it.** `eos_test --level
+  con2prim --states 40000` (40,000 warm + 4,000 cold), before → after:
+
+  | metric | LS220 | SRO |
+  |---|---|---|
+  | warm failures (no_bracket + max_iter) | 31 (12+19) → **1 (0+1)** | 82 (23+59) → **0** |
+  | cold failures (of 4,000) | 8 (4+4) → **0** | 15 (5+10) → **1 (1+0)** |
+  | `c2p_roundtrip` count | 14 → **1** | 23 → **0** |
+  | silent wrong-root convergences | 0 → **0** | 0 → **0** |
+  | M3e policy interventions | 31 → **1** | 82 → **0** |
+  | warm states needing ≥ 5 iterations | 9,953 → **536** | 10,941 → **554** |
+  | warm throughput (solves/s) | 2.15e5 → **4.64e5** | 1.76e5 → **4.61e5** |
+
+  `policy_n_valid_touched` stays 0 and the policy battery still PASSes on both. The
+  wrong-root row is the scratch `c2p_tail` criterion (a converged warm state whose
+  recovered s or w is more than 10% from the truth it was built from) — M3g had already
+  taken it to 0, and M3h keeps it there. The throughput row is not noise this time: it is
+  the iteration row, one line up (the mis-scaled test was buying ~1 extra Newton
+  iteration on most warm solves and a full 60-iteration inner-solve budget on the ones
+  that reached the scan).
+- **The diagnosis, restated as the fix.** `f1 = sinh w − cosh w·V` is a difference of two
+  O(cosh w) terms, so `|f1| ≤ tol` demanded `cosh w` times more accuracy at w = 6 than at
+  w = 0 — and *more than double precision can deliver*: V comes from the EOS, so `|f1|`
+  has a floor of order `ε·cosh w` times the chain's own amplification. Measured on the
+  M3g failure set: the returned states carried `|f2| = 1e-14…1e-15` (converged) against
+  `|f1| = 1.2…4.2e-12` at w = 5.5…6.0 where cosh w ≈ 180–200, i.e. `|tanh w − V| ≈ 1e-14`.
+  Those states were converged and were being rejected by the scaling alone. At trial
+  w ≳ 9, which the inner solve's bisection half reaches routinely, `ε·cosh w` exceeds
+  tol = 1e-12 outright, so those inner solves could never terminate and burned their full
+  60-iteration budget at every one of the 17 scan points (invisible in the iteration
+  histogram, which counts only Newton + *outer* iterations — it shows up in the
+  throughput). A directed check on the synthetic gas: of 150 states at w ∈ [8, 11.5],
+  **86 fail before, 0 after** (`tests/test_con2prim.cpp` test 9).
+- **`tol` now means what it says, and the bulk residuals rise to meet it — the one thing
+  this change makes worse.** The old test was, in the bulk, an accidental demand for
+  `tol/cosh w`, which bought roughly one extra Newton iteration per solve and with it
+  ~100× more accuracy than was asked for. With it gone the Newton stops at the requested
+  tolerance: LS220 `rt_tau` p50 1.07e-14 → 2.63e-14, p90 7.36e-14 → 4.00e-13, p99
+  5.98e-13 → 9.06e-13 (SRO p90 8.12e-14 → 4.01e-13), and the *prim*-space quantiles move
+  with them (LS220 `prim_rho` p99 3.4e-11 → 2.3e-9, `prim_w` p99 5.2e-12 → 3.7e-10) — the
+  coupled solve's condition number is ~1e3, so recovered primitives track ~1e3·tol either
+  way. Everything stays inside the contract (`rt_tau` p999 9.63e-13 → 9.95e-13, still
+  ≈ 1e-12, and the audit's own 1e-8 round-trip threshold is met by all but one state),
+  and the tails — which is what a failure metric sees — improve by orders of magnitude:
+  `rt_tau` max 9.68e-1 → 1.30e-4 (LS220) and 4.81e-1 → **1.30e-12** (SRO), `rt_S` max
+  9.72e-1 → 5.51e-6 and 2.28e-12 → 2.04e-12.
+- **The bulk and the tail trade against each other through `tol`, and 1e-12 is the right
+  side of it.** Measured on LS220 at 40k warm + 4k cold, varying only
+  `Con2PrimOptions::tol`: at **1e-13** the bulk comes back *better than the M3g baseline*
+  (`rt_tau` p90 5.57e-14, p99 9.80e-14; `prim_rho` p99 7.2e-11; `prim_w` p99 1.2e-11) but
+  **44 warm + 2 cold** states fail; at **1e-14**, **1,115 + 89**. That is the same
+  double-precision floor seen from the other side: past ~1e-13 the request outruns what
+  the EOS-derived residuals can deliver, and states start failing again. So the recovered
+  primitives' ~1e-9 (p99) accuracy at the default is not a bug to be tuned away — it is
+  the price of an empty failure tail, and a caller who needs the tighter bulk can buy it
+  at 1e-13 with 46 failures per 44,000 states, eyes open.
+- **(b) is measurement-neutral on today's tables, and kept on its merits.** With (a) and
+  (c) in place, *no* state on either table depends on the scan any more: the pre-M3h
+  linear window, the new ladder, and ladders with δ_min ∈ {1e-5, 1e-4, 1e-3} all produce
+  **identical** failure, fallback and round-trip counts at 40k states, and a
+  forced-fallback stress (`max_iter_newton = 0`, so every state goes through the scan;
+  8,000 states) gives 2 / 0 `no_bracket` on LS220 / SRO for all four. Where it does show
+  is the geometry that motivated it — an anchor sitting at 1e-5…1e-4 of its own physical
+  srange span, which is the real tables' radiation band (s ≈ 1e9 inside a span of 5e13).
+  On a synthetic table reproducing that (span/s ≈ 41), with the root 1e-4 away from the
+  anchor, the ladder returns a bracket **2.4e-3 of s** while the span-sized window cannot
+  get below its own point spacing of **1.19 of s** — a factor 500 (`test_con2prim` test
+  10). One measured trap along the way: a *one-sided* ladder with alternating signs (the
+  first thing tried) halves each side's REACH, and SRO audit state k = 17457, whose root
+  sits at +0.157 of the anchor, then fails where the pre-M3h window succeeded. Emitting
+  the ladder in ± PAIRS, so both sides span the full [1e-5, 0.6], recovers it. Coverage
+  beats resolution here: the outer Illinois solve resolves a wide bracket cheaply, while
+  a missed root is a `failed_no_bracket` outright.
+- **(c) is bookkeeping, and its value is visible on the exhaustion path.** With
+  `max_iter_newton = 3` on 200 synthetic states, **74 trajectories end more than 2×
+  worse than their best** (worst 3,960×) — the unconditional-clamped-step design cutting
+  off mid-excursion — and on every one of them the state a deliberately crippled solve
+  reports is now the best iterate rather than that stale position (`test_con2prim` test
+  11). It also makes the two remaining real-table failures report far better states:
+  LS220 k = 29472 returns `f2 = −1.3e-4` where M3g returned 2.7e-3.
+- **What the two survivors are — exactly the two classes scoped as out of reach.**
+  (i) LS220 k = 29472 (warm, `max_iter`): a fully causal path (`c_s²` max 0.361,
+  `z_w > 0` everywhere), healthy truth state, and **no** retry recovers it — 200 Newton
+  iterations, a 65-point scan and tol = 1e-10 all fail, exactly as they did before M3h.
+  This is the "pathological" residue of the M3g findings block. (ii) SRO k = 14800 (cold,
+  `no_bracket`): ρ = 2.3e15 at the top of the ρ axis, path `c_s²` max 1.083 with
+  `z_w min = −2.4e18` and `flag_oob_rho_high` — the **x-tail** class, and it converges on
+  any of the three retries. Both were failures before M3h too; M3h introduces no new
+  failure on either table.
+- **Bit-identity, censused rather than argued.** The residuals, the Jacobian and the step
+  are untouched, and the relative test is strictly weaker than the absolute one, so a
+  solve changes only if its trajectory reaches an iterate satisfying
+  `|f2| ≤ tol < |f1| ≤ tol·cosh w` before it would have converged — or if it enters the
+  S9 fallback, whose inner-solve stopping test, local scan window and anchor all moved.
+  Comparing the recovered (s, w, T) **bit for bit** between the M3g binary and this one
+  over the same 40,000 warm + 4,000 cold states: **27,232 / 40,000 warm and 2,620 / 4,000
+  cold are bit-identical on LS220** (26,348 and 2,541 on SRO), i.e. ~2/3. Of the states
+  that do move, essentially all move because they converged one Newton iteration earlier
+  (12,679 of the 12,768 differing LS220 warm states changed their iteration count), by
+  `|Δs|/s` p50 6.0e-12, p99 3.5e-9, max 4.0e-8 and `|Δw|` p50 1.1e-11, max 4.7e-8 across
+  every state that converged in both builds — the same root, one step less deep. The
+  result *enum* changes for 395 (LS220) / 466 (SRO) warm states, almost all of them
+  fallback → Newton.
+
 ## Milestones
 
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,
@@ -537,12 +650,15 @@ commit, same seeds, same states, so every pair below is apples to apples):
   of warm, sharing only the acausal-corner tail; warm path bit-identical; cold
   throughput ×9; no tuned constants (seed_passes = 3; s-bisection cap 16, 8 suffices
   for a GPU fixed-trip count). Known open items: (i) ~~the shared ~0.2–0.8% failure
-  tail~~ — **root-caused 2026-08-27** (see "M3 failure-tail root cause" above): ~95%
-  is the acausal u-high extension breaking the inner solve's monotonicity proof
-  (**fixed by M3g** below — that class is gone, the wrong-root class with it), ~5% is
-  bracket-scan coarseness plus an f2 precision floor at radiation-dominated low-ρ states
-  (solver-side follow-ups, still open, and now the whole of the residual);
-  (ii) the RePrimAnd benchmark (external library build — decide separately).
+  tail~~ — **root-caused 2026-08-27** (see "M3 failure-tail root cause" above) and now
+  **closed**: ~95% was the acausal u-high extension breaking the inner solve's
+  monotonicity proof (fixed by **M3g** below — that class is gone, the wrong-root class
+  with it), the remaining ~5% was a mis-scaled momentum-residual tolerance plus
+  bracket-scan coarseness (fixed by **M3h** below). What remains is **2 states in 88,000**
+  across both tables, and neither is class B: one pathological LS220 state that no retry
+  ladder recovers, and one SRO state on the acausal **x-tail** — i.e. the residual is now
+  (ii) the x-low/x-high band follow-up of `eos-causal-tail.md` §7, and (iii) the RePrimAnd
+  benchmark (external library build — decide separately).
 - **M3f:** ✅ complete — the causal-cap repair stage of `eos-causality-repair.md`
   (`RepairOptions::causal_cap`, on by default; `eos_repair --no-causal-cap` / `--cs2-cap
   X`), which makes the *data* causal before the fit rather than clamping `c_s²` at run
@@ -558,6 +674,23 @@ commit, same seeds, same states, so every pair below is apples to apples):
   **extension-band map** over all four bands. `eos-adapter-F-to-U.md` §7's guiding
   principle gained the word *causal*. Measured outcome above; the x-low band's acausality
   and the class-B solver work are the tracked follow-ups (`eos-causal-tail.md` §7).
+- **M3h:** ✅ complete — the class-B solver work of `eos-causal-tail.md` §7, entirely
+  inside `core/con2prim.hpp` and entirely in the *comparisons*: the convergence tests on
+  the momentum residual are taken on the normalized `f1/cosh(w) = tanh w − V` (so
+  `Con2PrimOptions::tol` means the same thing at every rapidity, instead of demanding
+  `cosh w` times more accuracy than double precision can supply above w ≈ 9); the S9
+  bracket scan's LOCAL half is a geometric ladder of *relative* offsets from its anchor
+  rather than a linear window sized to a physical srange span that can be 5×10⁴ times the
+  anchor; and the Newton loop hands its *best* iterate, not its last, to the fallback as
+  scan anchor and warm start, with every failure exit reporting a state no worse than it.
+  No new tunables, no budget changes, no change to the residuals, the Jacobian, the step,
+  or the M3d seed. Measured outcome above: warm+cold failures 39 → 1 (LS220) and 97 → 1
+  (SRO) per 44,000 states, `c2p_roundtrip` 14 → 1 and 23 → 0, warm throughput ×2.1–2.6,
+  and the two survivors are the pathological and x-tail states scoped as out of reach.
+  The cost, documented in the findings block: bulk round-trip residuals rise to the
+  requested `tol` (`rt_tau` p90 7e-14 → 4e-13) because the old test was over-strict by
+  `cosh w`; the `tol` sweep there shows that buying the old bulk back (1e-13) costs 46
+  failures per 44,000 states, so the default stays 1e-12.
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
   fixed-iteration evaluate/con2prim variants.
 

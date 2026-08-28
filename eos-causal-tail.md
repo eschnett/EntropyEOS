@@ -159,8 +159,13 @@ there invalid outright. Full numbers in CODE.md's M3g findings block.
 
 ## 7. Out of scope (tracked follow-ups)
 
-- Class B solver work: relative-width local scan window; Newton-path f2
-  precision-floor acceptance (mirror of the outer bisection's polish).
+- ~~Class B solver work: relative-width local scan window; Newton-path f2
+  precision-floor acceptance (mirror of the outer bisection's polish).~~ — **done
+  (M3h, 2026-08-27)**: the local scan window is now a geometric relative ladder, and the
+  precision-floor acceptance turned out to be needed on *f1*, not f2 (an absolute
+  tolerance on a residual that is O(cosh w)); with the Newton's best-iterate handoff
+  these take the residual failure tail to 1 state per table in 44,000 — see CODE.md
+  "M3h empirical findings".
 - Inner-solve robustness to non-monotone f1 as defense in depth (bracketed
   sign-bisection) — worth having even with causal tails, but it must not mask
   this fix's acceptance numbers; if built, land it behind a flag or after M3g's
