@@ -11,11 +11,14 @@
 // convergence comparisons) grid resolutions, while every code path, every
 // branch, and every numerical TOLERANCE/threshold assertion stays exactly
 // as strict as in a plain build. The sole additional exception (not a
-// tolerance weakening, a whole-variant skip) is the SRO real table (839 MB):
-// it is skipped entirely under sanitizers via eeos_skip_big_table() below,
-// while the LS220 real table keeps running (at a reduced sample count, like
-// everything else) so its reader/build/solve code paths stay sanitizer-
-// covered on real data.
+// tolerance weakening, a whole-variant skip) is the three large real tables
+// -- SRO (839 MB), DD2 (444 MB) and SFHo (421 MB): they are skipped entirely
+// under sanitizers via eeos_skip_big_table() below, while the LS220 real
+// table keeps running (at a reduced sample count, like everything else) so
+// its reader/build/solve code paths stay sanitizer-covered on real data.
+// LS220 is the one that keeps running because it is both the smallest
+// (241 MB) and the only one with a cropped SAN fixture (see
+// eeos_san_table() below).
 //
 // A plain (non-sanitized) build is bit-for-bit unaffected by this header:
 // eeos_sanitized is false, eeos_n(full, sanitized) always returns `full`,
@@ -62,9 +65,10 @@ constexpr bool eeos_sanitized = EEOS_SANITIZED_BUILD != 0;
 // Never use it to scale a tolerance, threshold, or other pass/fail bound.
 constexpr size_t eeos_n(size_t full, size_t sanitized) { return eeos_sanitized ? sanitized : full; }
 
-// Guards the SRO real-table variants (the 839 MB
-// tables/LS220_3335_rho391_temp163_ye66.h5 file) -- the one variant this
-// project skips outright under sanitizers rather than merely shrinking.
+// Guards the large real-table variants -- SRO (the 839 MB
+// tables/LS220_3335_rho391_temp163_ye66.h5 file), DD2 (444 MB) and SFHo
+// (421 MB) -- the variants this project skips outright under sanitizers
+// rather than merely shrinking.
 // Under a sanitized build, prints a "skipped" note naming `name` and
 // returns true so the caller can bail out immediately (before even
 // checking whether the file exists on disk, since the point is to avoid

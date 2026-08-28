@@ -670,6 +670,8 @@ namespace {
 
 const std::string kLS220Path = "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5";
 const std::string kSROPath = "tables/LS220_3335_rho391_temp163_ye66.h5";
+const std::string kDD2Path = "tables/Hempel_DD2EOS_rho234_temp180_ye60_version_1.1_20120817.h5";
+const std::string kSFHoPath = "tables/Hempel_SFHoEOS_rho222_temp180_ye60_version_1.1_20120817.h5";
 
 bool table_exists(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
@@ -763,6 +765,20 @@ TEST_CASE("build_entropy_eos + evaluate: LS220 real table (guarded)") {
 TEST_CASE("build_entropy_eos + evaluate: SRO real table (guarded)") {
   if (eeos_skip_big_table("test_adapter 8 (SRO): real table")) return;
   run_real_table_adapter_test(kSROPath, "SRO", 0x5502001u);
+}
+
+// DD2 and SFHo (the Hempel-Schaffner-Bielich tabulations, tables/README.md).
+// Both are amu tables -- measured the same way SRO's neutron mass was, see
+// tests/integration.sh's Part B comment -- so the default m_B this helper
+// builds with is the right one for them, as it is for LS220.
+TEST_CASE("build_entropy_eos + evaluate: DD2 real table (guarded)") {
+  if (eeos_skip_big_table("test_adapter 8 (DD2): real table")) return;
+  run_real_table_adapter_test(kDD2Path, "DD2", 0xdd200001u);
+}
+
+TEST_CASE("build_entropy_eos + evaluate: SFHo real table (guarded)") {
+  if (eeos_skip_big_table("test_adapter 8 (SFHo): real table")) return;
+  run_real_table_adapter_test(kSFHoPath, "SFHo", 0x5f400001u);
 }
 
 // ==========================================================================

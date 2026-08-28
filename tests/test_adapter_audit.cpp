@@ -502,6 +502,8 @@ namespace {
 
 const std::string kLS220Path = "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5";
 const std::string kSROPath = "tables/LS220_3335_rho391_temp163_ye66.h5";
+const std::string kDD2Path = "tables/Hempel_DD2EOS_rho234_temp180_ye60_version_1.1_20120817.h5";
+const std::string kSFHoPath = "tables/Hempel_SFHoEOS_rho222_temp180_ye60_version_1.1_20120817.h5";
 
 bool table_exists(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
@@ -557,4 +559,14 @@ TEST_CASE("check_adapter: LS220 real table, soak_extended + extension_seam_jump 
 TEST_CASE("check_adapter: SRO real table, soak_extended + extension_seam_jump (guarded)") {
   if (eeos_skip_big_table("test_adapter_audit 7 (SRO): real table")) return;
   run_real_table_soak_extended(kSROPath, "SRO");
+}
+
+TEST_CASE("check_adapter: DD2 real table, soak_extended + extension_seam_jump (guarded)") {
+  if (eeos_skip_big_table("test_adapter_audit 7 (DD2): real table")) return;
+  run_real_table_soak_extended(kDD2Path, "DD2");
+}
+
+TEST_CASE("check_adapter: SFHo real table, soak_extended + extension_seam_jump (guarded)") {
+  if (eeos_skip_big_table("test_adapter_audit 7 (SFHo): real table")) return;
+  run_real_table_soak_extended(kSFHoPath, "SFHo");
 }

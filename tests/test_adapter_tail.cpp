@@ -67,6 +67,8 @@ EntropyEOS build_synthetic(const SyntheticOptions &opts) {
 
 const std::string kLS220Path = "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5";
 const std::string kSROPath = "tables/LS220_3335_rho391_temp163_ye66.h5";
+const std::string kDD2Path = "tables/Hempel_DD2EOS_rho234_temp180_ye60_version_1.1_20120817.h5";
+const std::string kSFHoPath = "tables/Hempel_SFHoEOS_rho222_temp180_ye60_version_1.1_20120817.h5";
 
 bool table_exists(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
@@ -389,7 +391,11 @@ TEST_CASE("M3g: the whole u-high extension band is causal on the synthetic gas")
 
 namespace {
 
-void check_real_table_far_tail(const std::string &path, const char *label, double m_B_g) {
+// `strict_radiation_window` selects which of the two claim tiers is asserted
+// (see the block comment right above the two windowed CHECKs at the bottom of
+// this function).
+void check_real_table_far_tail(const std::string &path, const char *label, double m_B_g,
+                               bool strict_radiation_window = true) {
   const std::string use_path = eeos_san_table(path);
   if (!table_exists(use_path)) {
     MESSAGE("skipping " << label << " far-tail test: " << use_path << " not present");
@@ -430,13 +436,58 @@ void check_real_table_far_tail(const std::string &path, const char *label, doubl
   }
   MESSAGE(std::string(label) << " far u-high tail (u = u_ext_hi): n=" << n << " cs2 in [" << cs2_min << ", "
                 << cs2_max << "] clamped=" << n_clamped << " floor_wins=" << n_floor_wins);
-  // The radiation asymptote, with generous room for the table's own slope
-  // scatter -- the pre-M3g linear-sigma tail saturated at c_s^2 ~ 3.8 here,
-  // so this is a 10x-margin discriminator, not a tight fit.
-  CHECK(cs2_min > 0.15);
-  CHECK(cs2_max < 0.75);
-  CHECK(n_clamped == 0);     // b/alpha - 1 ~ 1/3 is nowhere near cs2_ext_cap
+
+  // Tier 1 -- construction invariants, asserted for EVERY table: the tail is
+  // finite (REQUIRE above), sigma's log tail is live (alpha > 0, above), and
+  // the causal clamp/monotonicity floor stay dormant because b/alpha - 1 is
+  // nowhere near cs2_ext_cap = 0.99. These are properties of the M3g
+  // construction itself and hold table-independently.
+  CHECK(n_clamped == 0);
   CHECK(n_floor_wins == 0);
+
+  // Tier 2 -- the radiation-asymptote WINDOW, with generous room for the
+  // table's own slope scatter (the pre-M3g linear-sigma tail saturated at
+  // c_s^2 ~ 3.8 here, so this is a 10x-margin discriminator, not a tight
+  // fit). Unlike tier 1 this is a claim about the DATA at the hot seam, not
+  // about the construction: it presupposes the seam is radiation-dominated,
+  // which is what makes b = 4*ln10, alpha = 3*ln10 and hence c_s^2 -> 1/3.
+  //
+  // LS220 (cs2 in [0.339, 0.637]) and SRO ([0.340, 0.622]) satisfy it. DD2
+  // and SFHo, measured 2026-08-28, do NOT, at two identified rho columns each
+  // -- and in both cases the far tail is the messenger, not the cause:
+  //
+  //  (a) SFHo rho = 1.2e7 g/cc (and DD2 rho = 6.7e6): c_s^2 is ALREADY
+  //      -2.98 (SFHo) / +0.894 (DD2) at the seam and inside the box, at every
+  //      Ye alike, in the hot radiation-dominated low-density corner both
+  //      Hempel tabulations share (the same corner check_table flags as
+  //      delta_p ~ 20 and check_adapter as p_nonpositive/cs2_nonpositive near
+  //      rho ~ 1.4e7, T ~ 157 MeV). The tail reproduces the seam value it is
+  //      built from, as designed.
+  //  (b) DD2 rho = 8.9e14 g/cc: the seam is fine (c_s^2 = 0.518) but the
+  //      seam is NOT radiation-dominated there -- alpha = 4.56 against the
+  //      radiation 3*ln10 = 6.91, because these tables stop at T_max = 158
+  //      MeV, which at supra-nuclear density is still matter-dominated. The
+  //      tail's own asymptote (b/alpha - 1 = 0.394) is causal and sane, but
+  //      the approach to it dips: c_s^2 falls 0.518 -> 0.379 -> 0.133 ->
+  //      -0.033 across the band, and p turns negative just past u_ext_hi.
+  //      This is a genuine narrowing of the M3g design envelope on a
+  //      non-radiation hot seam, reported by check_adapter()'s class E
+  //      (ext_u_high_cs2_nonpositive 22848, ext_u_high_p_nonpositive 13804 on
+  //      DD2 against LS220's 6883/226) -- accept-and-guard for now, tracked in
+  //      CODE.md's M3g/M3i findings, not silently tolerated here.
+  //
+  // So the window is asserted where it is a valid claim and MEASURED (tier 1
+  // still fully asserted) where the table's hot seam does not meet its
+  // premise. Do not switch a table to non-strict to make a red run green:
+  // the premise, not the bound, is what has to fail first.
+  if (strict_radiation_window) {
+    CHECK(cs2_min > 0.15);
+    CHECK(cs2_max < 0.75);
+  } else {
+    MESSAGE(std::string(label) << " far u-high tail: radiation-window check MEASURED, not asserted"
+                  << " (non-radiation hot seam; see this function's tier-2 comment) -- cs2_min="
+                  << cs2_min << " cs2_max=" << cs2_max);
+  }
 }
 
 } // namespace
@@ -448,6 +499,18 @@ TEST_CASE("M3g far u-high tail: LS220 real table (guarded)") {
 TEST_CASE("M3g far u-high tail: SRO real table (guarded)") {
   if (eeos_skip_big_table("test_adapter_tail (SRO): real table")) return;
   check_real_table_far_tail(kSROPath, "SRO", eeos::m_neutron_g);
+}
+
+// DD2/SFHo take m_amu_g, not m_neutron_g: their convention was measured the
+// same way SRO's was and came out amu (tests/integration.sh Part B).
+TEST_CASE("M3g far u-high tail: DD2 real table (guarded)") {
+  if (eeos_skip_big_table("test_adapter_tail (DD2): real table")) return;
+  check_real_table_far_tail(kDD2Path, "DD2", eeos::m_amu_g, /*strict_radiation_window=*/false);
+}
+
+TEST_CASE("M3g far u-high tail: SFHo real table (guarded)") {
+  if (eeos_skip_big_table("test_adapter_tail (SFHo): real table")) return;
+  check_real_table_far_tail(kSFHoPath, "SFHo", eeos::m_amu_g, /*strict_radiation_window=*/false);
 }
 
 // ==========================================================================
@@ -924,4 +987,14 @@ TEST_CASE("M3i far x-low tail: LS220 real table (guarded)") {
 TEST_CASE("M3i far x-low tail: SRO real table (guarded)") {
   if (eeos_skip_big_table("test_adapter_tail (SRO): real table")) return;
   check_real_table_xlow_tail(kSROPath, "SRO", eeos::m_neutron_g);
+}
+
+TEST_CASE("M3i far x-low tail: DD2 real table (guarded)") {
+  if (eeos_skip_big_table("test_adapter_tail (DD2): real table")) return;
+  check_real_table_xlow_tail(kDD2Path, "DD2", eeos::m_amu_g);
+}
+
+TEST_CASE("M3i far x-low tail: SFHo real table (guarded)") {
+  if (eeos_skip_big_table("test_adapter_tail (SFHo): real table")) return;
+  check_real_table_xlow_tail(kSFHoPath, "SFHo", eeos::m_amu_g);
 }

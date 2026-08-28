@@ -102,9 +102,10 @@ Rules that keep the CUDA port honest:
 
 ## Table formats
 
-- **LS220 and SRO both ship in the stellarcollapse.org (O'Connor–Ott) HDF5 layout**
-  (SRO = Schneider–Roberts–Ott 2017; their code emits this format), so
-  `io_stellarcollapse` is the first and only M1 backend: log10-stored axes and
+- **All four local tables — LS220, SRO, DD2 and SFHo — ship in the
+  stellarcollapse.org (O'Connor–Ott) HDF5 layout** (SRO = Schneider–Roberts–Ott 2017,
+  DD2/SFHo = the Hempel–Schaffner-Bielich tabulations; all of these codes emit this
+  format), so `io_stellarcollapse` is the first and only M1 backend: log10-stored axes and
   energy/pressure, linear entropy, `energy_shift` attribute. Use the HDF5 C API (more
   portable than the C++ API, which many installs don't build).
 - CompOSE/MUSES (named in v0.1) differ in layout, units, and normalization
@@ -201,8 +202,9 @@ layers at every (T, Ye) (the M3f acausal corner), and planted Inf/NaN in auxilia
 fields (LS220's cs2/gamma) — so the full detect → repair → residual-classes-persist
 narrative runs in CI.
 
-**Real tables are local-only.** CI never downloads or stores the LS220/SRO files
-(~1 GB; Git LFS quotas and stellarcollapse.org bandwidth both rule it out);
+**Real tables are local-only.** CI never downloads or stores the
+LS220/SRO/DD2/SFHo files (~1.9 GB; Git LFS quotas and stellarcollapse.org bandwidth
+both rule it out);
 `tests/integration.sh` runs them when present under `tables/` (see
 `tables/README.md`) and skips them gracefully otherwise. Future options if per-PR
 real-data coverage is ever wanted: committed ~10 MB crops of the pathological regions
@@ -276,6 +278,80 @@ and OpenMP builds).
   everything else safely reverted to baseline; idempotence holds on both real tables
   (second run: zero changes). The adversarial synthetic wiggle defect does not reach a
   single-run fixed point and is documented as such in integration.sh.
+
+**DD2 / SFHo empirical findings** (the two Hempel–Schaffner-Bielich tabulations added
+2026-08-28; grids 234 × 180 × 60 and 222 × 180 × 60, `tables/README.md`). Same reader,
+same repair, same adapter, no code changes needed to ingest them — what they add is a
+third and fourth *independent* data point on which of the M2/M3 claims are about the
+construction and which are about a particular table's data:
+
+- **m_B convention measured: amu, i.e. the default** — opposite to SRO. The δ_T
+  discriminator that identified SRO's neutron mass works in reverse here: at amu the
+  quantiles sit at p50 = 4.4e-4 (DD2) / 4.0e-4 (SFHo), and forcing
+  `--m-B 1.67492749804e-24` pushes them *up* onto the same flat p50 = 8.67e-3 =
+  m_n/m_u − 1 plateau that condemned amu for SRO. So `eos_test`/`build_entropy_eos`
+  defaults are right for these two, and `tests/integration.sh` passes them no
+  `--m-B`.
+- **Raw structural health is better than LS220's.** DD2 is the first real table to
+  come back *clean* from `eos_test` (exit 0): zero non-monotone-T entropy or
+  logenergy, zero negative entropies, zero non-finite cs2/gamma (LS220 carries 62 +
+  444 + 3 + 3). SFHo has 28 non-monotone-T logenergy points (max 1.1e-4) and nothing
+  else.
+- **But their hot low-density corner is genuinely broken, and much worse than
+  LS220's.** After the full in-memory repair (causal cap included), `check_adapter`
+  reports in-box `cs2_acausal` 2193 with **max 4.88** (DD2) and 828 / max 4.10 (SFHo)
+  against LS220's 132 / max 2.3e-2, plus in-box `cs2_nonpositive` 5359 / 1547
+  (LS220: 4) and `p_nonpositive` 335 / 270 (LS220: 0). The defect localizes to
+  ρ ≈ 1.2–1.6e7 g/cc at T ≳ 130 MeV, is *identical at every Ye*, and shows up
+  independently in `check_table` as δ_p ≈ 20 at ρ = 1.4e7 — i.e. a ρ-column artifact
+  of the shared tabulation, not of one EOS's physics. It is inherited, not created,
+  by the adapter: c_s² is already −2.98 (SFHo) at the box's own hot seam there.
+- **con2prim round trips are clean on both, with one DD2 outlier.** Over 8000 states:
+  zero failures on either table (DD2 7970 Newton / 30 fallback, SFHo 7981 / 19, against
+  LS220's 7985 / 15), policy battery PASS and zero false positives on both. The one
+  metric where DD2 is worse than LS220 is the τ round-trip tail: p99 = 9.2e-13 as
+  everywhere, but max = 7.3e-5 (LS220: 1.0e-12) — a single state in the documented
+  residual multi-root pocket set, absorbed by one policy intervention.
+- **First real table on which repair is not a one-run fixed point: SFHo.** Its
+  causal-cap stage spends the whole default round budget (rounds_used = 7, 21,516
+  logenergy nodes capped, refined cs² violations 1,186,275 → 58,904) and leaves a
+  2212-node tail, so `eos_repair --check-only` on the repaired output is exit 1, not 0.
+  Chaining repairs by hand converges monotonically — "would repair" 2212 → 619 → 492 →
+  **0**, clean after four passes — so this is the bounded-effort behavior M2d-1 already
+  documents for the adversarial synthetic wiggle, now observed on real data, not a
+  stalled stage. LS220, SRO and DD2 all reach a fixed point in one run.
+  `tests/integration.sh` therefore asserts the invariant that separates the two cases
+  (one-run fixed point, *or* a residual strictly smaller than what the first pass
+  repaired) instead of demanding exit 0. Note the harness cannot chain the passes
+  itself: `eos_repair` refuses to append a second `/repair` provenance group to an
+  already-repaired file (exit 2, data still written). **Open item:** whether the
+  causal-cap round budget should be raised (or exposed as a CLI knob) so one run
+  suffices on tables like SFHo.
+- **DD2's acausality is entirely interior, so the causal cap correctly does nothing**
+  on it: cs2_violations 131,736 → 131,736 with `interior_untouched = 131,736`, rounds =
+  0, nodes capped = 0. DD2 is the first local table with *no* edge-anchored ρ_max
+  acausal corner at all — the structure that motivated M3f is simply absent, and the
+  stage's scoping rule correctly declines to edit the σ_T-pocket interior. (SFHo does
+  have the corner; see above.)
+- **The M3i x-low tail is table-independent; the M3g u-high tail is not.** The far
+  x-low tail hits the radiation asymptote on all four tables to three digits
+  (DD2 [0.3286, 0.3343], SFHo [0.3286, 0.3343], vs LS220 [0.3268, 0.3360]). The far
+  u-high tail does not: besides inheriting (a) above, DD2 at ρ = 8.9e14 has a hot seam
+  that is *not* radiation-dominated — α = 4.56 against the radiation 3·ln10 = 6.91,
+  because these tables stop at T_max = 158 MeV, still matter-dominated at supra-nuclear
+  density — and there c_s² slides 0.518 (seam) → 0.379 → 0.133 → −0.033 across the
+  extension band, with p turning negative just past `u_ext_hi`. The tail's own
+  asymptote (b/α − 1 = 0.394) is causal and sane; it is the *approach* to it that
+  dips. Class E counts the same thing at scale: `ext_u_high_cs2_nonpositive` 22848 and
+  `ext_u_high_p_nonpositive` 13804 on DD2, against LS220's 6883/226.
+  `tests/test_adapter_tail.cpp` therefore splits that test's claim into a tier-1
+  construction invariant (clamp and monotonicity floor dormant, α > 0, finite —
+  asserted on all four tables) and a tier-2 radiation *window* (asserted on LS220/SRO,
+  measured and reported on DD2/SFHo, with the premise failure documented at the
+  assertion). **Open item:** whether M3g should detect a non-radiation hot seam and
+  fall back (e.g. blend toward the fitted b/α − 1 monotonically instead of through the
+  dip), or whether the acausal/negative-p band is acceptable given it lies wholly
+  outside the table box. Not decided; nothing was loosened in the construction itself.
 
 **M3f empirical findings — causal-cap outcome** (`eos-causality-repair.md`, measured
 2026-08-27 on the two local tables; "nodes" are the fitted `c_s²` evaluated at table

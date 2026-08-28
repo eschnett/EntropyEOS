@@ -62,11 +62,13 @@ std::string scratch_path(const std::string &name) {
   return dir + name;
 }
 
-// The two real ground-truth files (see the task description); tests that
-// use them are guarded by table_exists() so CI (which has no tables/)
-// skips them cleanly.
+// The four real ground-truth files (see the task description and
+// tables/README.md); tests that use them are guarded by table_exists() so CI
+// (which has no tables/) skips them cleanly.
 const std::string kLS220Path = "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5";
 const std::string kSROPath = "tables/LS220_3335_rho391_temp163_ye66.h5";
+const std::string kDD2Path = "tables/Hempel_DD2EOS_rho234_temp180_ye60_version_1.1_20120817.h5";
+const std::string kSFHoPath = "tables/Hempel_SFHoEOS_rho222_temp180_ye60_version_1.1_20120817.h5";
 
 bool table_exists(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
@@ -714,6 +716,99 @@ TEST_CASE("write_stellarcollapse (with source): SRO opaque blob survives byte-id
   const std::vector<unsigned char> blob_b = read_raw_dataset_bytes(out, "NSE-partition.in");
   REQUIRE(blob_a.size() == blob_b.size());
   CHECK(blob_a == blob_b);
+}
+
+// The two Hempel-Schaffner-Bielich tabulations (DD2, SFHo). Same
+// stellarcollapse layout as LS220 -- what they add to this suite's reader
+// coverage is a *different field set* (the composition fields Xd/Xt/X3he/X4li
+// and Abar/Zbar that LS220 does not carry) over a third grid shape, i.e. the
+// generic "read every root dataset, pass the ones we do not interpret through
+// untouched" path on real data rather than on a synthetic fixture.
+//
+// read_real_table_shape() is the shared body: axes strictly increasing, the
+// four fields the pipeline actually interprets present, energy_shift readable.
+namespace {
+
+void read_real_table_shape(const std::string &path, const char *label, size_t nrho, size_t ntemp,
+                           size_t nye) {
+  if (!table_exists(path)) {
+    WARN_MESSAGE(false, label << " table not found at '" << path << "' -- skipped ('skipped')");
+    return;
+  }
+
+  RawTable t = eeos::read_stellarcollapse(path);
+
+  CHECK(t.nrho() == nrho);
+  CHECK(t.ntemp() == ntemp);
+  CHECK(t.nye() == nye);
+
+  for (size_t i = 1; i < t.nrho(); ++i) {
+    CHECK(t.logrho()[i] > t.logrho()[i - 1]);
+  }
+  for (size_t j = 1; j < t.ntemp(); ++j) {
+    CHECK(t.logtemp()[j] > t.logtemp()[j - 1]);
+  }
+  for (size_t k = 1; k < t.nye(); ++k) {
+    CHECK(t.ye()[k] > t.ye()[k - 1]);
+  }
+
+  CHECK(t.has_field("logenergy"));
+  CHECK(t.has_field("entropy"));
+  CHECK(t.has_field("logpress"));
+  CHECK(t.has_field("cs2"));
+
+  // Composition fields LS220 does not carry -- the passthrough set.
+  CHECK(t.has_field("Abar"));
+  CHECK(t.has_field("Zbar"));
+  CHECK(t.has_field("Xd"));
+  CHECK(t.has_field("Xt"));
+
+  REQUIRE(t.has_attribute("energy_shift"));
+  CHECK(t.energy_shift() > 0.0);
+}
+
+} // namespace
+
+TEST_CASE("read_stellarcollapse: DD2 real table") {
+  if (eeos_skip_big_table("test_io_stellarcollapse: DD2 real table")) return;
+  read_real_table_shape(kDD2Path, "DD2", 234, 180, 60);
+}
+
+TEST_CASE("read_stellarcollapse: SFHo real table") {
+  if (eeos_skip_big_table("test_io_stellarcollapse: SFHo real table")) return;
+  read_real_table_shape(kSFHoPath, "SFHo", 222, 180, 60);
+}
+
+TEST_CASE("write_stellarcollapse (with source): DD2 write-back round trip") {
+  if (eeos_skip_big_table("test_io_stellarcollapse: DD2 write-back round trip")) return;
+  if (!table_exists(kDD2Path)) {
+    WARN_MESSAGE(false, "DD2 table not found at '" << kDD2Path << "' -- skipped ('skipped')");
+    return;
+  }
+
+  RawTable a = eeos::read_stellarcollapse(kDD2Path);
+
+  const std::string out = scratch_path("dd2_roundtrip.h5");
+  eeos::write_stellarcollapse(out, a, kDD2Path);
+
+  RawTable b = eeos::read_stellarcollapse(out);
+
+  REQUIRE(a.nrho() == b.nrho());
+  REQUIRE(a.ntemp() == b.ntemp());
+  REQUIRE(a.nye() == b.nye());
+  CHECK(same_bits_vec(a.logrho(), b.logrho()));
+  CHECK(same_bits_vec(a.logtemp(), b.logtemp()));
+  CHECK(same_bits_vec(a.ye(), b.ye()));
+
+  REQUIRE(a.field_names().size() == b.field_names().size());
+  for (const std::string &name : a.field_names()) {
+    REQUIRE(b.has_field(name));
+    CHECK(same_bits_vec(a.field(name), b.field(name)));
+  }
+  REQUIRE(b.has_attribute("energy_shift"));
+  CHECK(a.energy_shift() == b.energy_shift());
+
+  CHECK(count_root_datasets(kDD2Path) == count_root_datasets(out));
 }
 
 // --- (6) error paths ---------------------------------------------------------

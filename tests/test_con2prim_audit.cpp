@@ -277,24 +277,27 @@ TEST_CASE("con2prim_needs_attention: failed_*/roundtrip drive it, c2p_failed's o
 }
 
 // ==========================================================================
-// 4. Guarded real-table smoke (LS220, default m_B, n_states=2000).
+// 4. Guarded real-table smoke (LS220/DD2/SFHo, default m_B, n_states=2000).
+//    All three are amu tables (SRO, the one table whose convention is the
+//    neutron mass, is not exercised in this file -- 839 MB), so the default
+//    m_B build below is the right one for each.
 // ==========================================================================
 
 namespace {
 
 const std::string kLS220Path = "tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5";
+const std::string kDD2Path = "tables/Hempel_DD2EOS_rho234_temp180_ye60_version_1.1_20120817.h5";
+const std::string kSFHoPath = "tables/Hempel_SFHoEOS_rho222_temp180_ye60_version_1.1_20120817.h5";
 
 bool table_exists(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
   return static_cast<bool>(f);
 }
 
-} // namespace
-
-TEST_CASE("check_con2prim: LS220 real table (guarded), default m_B, n=2000 -- runs to completion") {
-  const std::string path = eeos_san_table(kLS220Path);
+void run_real_table_con2prim(const std::string &full_path, const char *label) {
+  const std::string path = eeos_san_table(full_path);
   if (!table_exists(path)) {
-    WARN_MESSAGE(false, "LS220 table not found at '" << path << "' -- skipped ('skipped')");
+    WARN_MESSAGE(false, label << " table not found at '" << path << "' -- skipped ('skipped')");
     return;
   }
 
@@ -316,10 +319,11 @@ TEST_CASE("check_con2prim: LS220 real table (guarded), default m_B, n=2000 -- ru
 
   // Residual multi-root pockets in the spline-safe-repaired real tables are
   // documented (CODE.md "M2 empirical findings" / "Open decisions" #4:
-  // accept-and-guard) -- do not assert zero failures here, only report them.
+  // accept-and-guard) -- do not assert zero failures on ANY of the real
+  // tables here, only report them.
   const CheckClassResult &failed = find_class(report, "c2p_failed");
   const CheckClassResult &roundtrip = find_class(report, "c2p_roundtrip");
-  MESSAGE("test_con2prim_audit 4 (LS220): n_newton=" << report.n_newton
+  MESSAGE("test_con2prim_audit 4 (" << std::string(label) << "): n_newton=" << report.n_newton
           << " n_fallback=" << report.n_fallback << " n_failed_no_bracket=" << report.n_failed_no_bracket
           << " n_failed_max_iter=" << report.n_failed_max_iter << " cold_n_newton=" << report.cold_n_newton
           << " cold_n_fallback=" << report.cold_n_fallback
@@ -334,4 +338,20 @@ TEST_CASE("check_con2prim: LS220 real table (guarded), default m_B, n=2000 -- ru
   std::ostringstream oss;
   report.print(oss);
   CHECK_FALSE(oss.str().empty());
+}
+
+} // namespace
+
+TEST_CASE("check_con2prim: LS220 real table (guarded), default m_B, n=2000 -- runs to completion") {
+  run_real_table_con2prim(kLS220Path, "LS220");
+}
+
+TEST_CASE("check_con2prim: DD2 real table (guarded), default m_B, n=2000 -- runs to completion") {
+  if (eeos_skip_big_table("test_con2prim_audit 4 (DD2): real table")) return;
+  run_real_table_con2prim(kDD2Path, "DD2");
+}
+
+TEST_CASE("check_con2prim: SFHo real table (guarded), default m_B, n=2000 -- runs to completion") {
+  if (eeos_skip_big_table("test_con2prim_audit 4 (SFHo): real table")) return;
+  run_real_table_con2prim(kSFHoPath, "SFHo");
 }
