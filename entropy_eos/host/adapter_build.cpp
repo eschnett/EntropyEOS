@@ -322,6 +322,13 @@ EntropyEOSView EntropyEOS::view() const {
   return v;
 }
 
+EntropyEOSView EntropyEOS::view_with(const real *sigma_c, const real *L_c) const {
+  EntropyEOSView v = view();
+  v.sigma.c = sigma_c;
+  v.L.c = L_c;
+  return v;
+}
+
 EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
   // --- 1. Validate (does not repair) ---------------------------------------
   const std::size_t nrho = table.nrho();

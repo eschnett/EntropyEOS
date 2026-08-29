@@ -108,6 +108,19 @@ public:
 
   EntropyEOSView view() const;
 
+  // M4 device mirroring hooks (eos-device-interface.md S4a): the two
+  // coefficient blobs are the ONLY memory view() points at that outlives the
+  // call -- everything else in an EntropyEOSView is scalars copied by value.
+  // A consumer mirrors by uploading these two vectors with its own device
+  // allocator and rebinding a view onto the copies via view_with(); the
+  // entropy_eos/device/ RAII mirrors are thin wrappers over exactly this.
+  const std::vector<double> &sigma_coeffs() const { return sigma_.coeffs(); }
+  const std::vector<double> &L_coeffs() const { return L_.coeffs(); }
+
+  // view() with the two coefficient pointers replaced by caller-owned copies
+  // (device or host). view_with(view().sigma.c, view().L.c) == view().
+  EntropyEOSView view_with(const real *sigma_c, const real *L_c) const;
+
   double kappa() const { return kappa_; }
   double m_B_star_g() const { return m_B_star_g_; }
   double m_B_table_g() const { return m_B_table_g_; }

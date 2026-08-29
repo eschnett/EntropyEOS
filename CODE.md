@@ -1193,6 +1193,15 @@ axis, one axis over.
     to ≤ 2.3e-14 relative (most fields bit-identical, identical solver result and
     iteration counts). Harness compile time 6m47s (the whole solver device-inlines into
     4 kernels). CPU suite bit-identical (the host macro expansion is unchanged).
+  - **M4b:** ✅ the mirroring interface:
+    `EntropyEOS::sigma_coeffs()`/`L_coeffs()`/`view_with()` — the vendor-neutral
+    two-blob contract (design doc §4a: upload the two vectors with any allocator,
+    rebind, pass the view by value) — plus the opt-in RAII mirror
+    `entropy_eos/device/mirror_cuda.hpp` (`CudaEntropyEOS`, runtime-API-only: a plain
+    host compiler with `-lcudart` builds it). `tests/test_device_api.cpp` (runs in CI)
+    asserts that a view rebound onto host-side *copies* of the blobs is bit-identical
+    in use — 6,956/6,956 assertions over evaluate fields and cold con2prim
+    results/iterates/flags on the synthetic gas.
 
 ## Open decisions
 
