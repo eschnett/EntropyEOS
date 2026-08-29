@@ -119,6 +119,19 @@ tests/test_device_cuda: tests/test_device_cuda.cu $(DEVICE_TEST_HOST_SRCS)
 gpu-test: tests/test_device_cuda
 	./tests/test_device_cuda
 
+# Real-table variant: adds --table support (read + repair + build a
+# stellarcollapse file) behind -DEEOS_GPU_TEST_HDF5; needs the three I/O and
+# repair TUs plus HDF5 (same HDF5_INC/HDF5_LIB variables as the host build).
+# E.g. on symmetry (HDF5 in /usr, Ubuntu split paths):
+#   make tests/test_device_cuda_hdf5 NVCC=/usr/local/cuda/bin/nvcc \
+#     HDF5_INC=-I/usr/include/hdf5/serial \
+#     HDF5_LIB="-L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5"
+DEVICE_TEST_HDF5_SRCS = $(DEVICE_TEST_HOST_SRCS) entropy_eos/host/io_stellarcollapse.cpp \
+	entropy_eos/host/check.cpp entropy_eos/host/repair.cpp
+
+tests/test_device_cuda_hdf5: tests/test_device_cuda.cu $(DEVICE_TEST_HDF5_SRCS)
+	$(NVCC) $(NVCCFLAGS) -DEEOS_GPU_TEST_HDF5 -I. $(HDF5_INC) -o $@ $^ $(HDF5_LIB)
+
 install: lib
 	mkdir -p $(PREFIX)/lib $(PREFIX)/include/entropy_eos
 	(cd entropy_eos && find . -name '*.hpp' -print0 | tar --null -T - -cf -) | \

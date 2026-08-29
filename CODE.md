@@ -141,6 +141,12 @@ EntropyEOS/
       adapter_eval.hpp         #   EntropyEOSView, EOSPoint, evaluate(), srange()
       prim2con.hpp             #   rapidity-form prim2con                    (M3)
       con2prim.hpp             #   2×2 Newton + nested 1D fallback           (M3)
+    device/                    # opt-in vendor RAII mirrors (M4); header-only, never
+                               # included by the umbrella header or compiled into the lib
+      mirror_cuda.hpp          #   CudaEntropyEOS (tested on H200)
+      mirror_hip.hpp           #   HipEntropyEOS = mechanical cuda→hip rename, CI-checked
+      mirror_sycl.hpp          #   SyclEntropyEOS (queue-carrying ctor; core/ needs no
+                               #   SYCL support at all -- eos-device-interface.md §3)
     host/                      # host-only: owns memory, may use STL/exceptions
       table.hpp/.cpp           #   RawTable: axes + generic named 3D fields + attributes
       units.hpp/.cpp           #   constants, unit conversions, m_B conventions, κ
@@ -158,6 +164,8 @@ EntropyEOS/
   tests/
     doctest.h                  # vendored single-header framework (committed; nothing to install)
     test_*.cpp
+    test_device_cuda.cu        # M4 GPU harness (opt-in build; never part of `make test`)
+    check_mirror_parallel.sh   # M4 hip==rename(cuda) text check (runs in CI)
 ```
 
 Rules that keep the CUDA port honest:
@@ -1202,6 +1210,27 @@ axis, one axis over.
     asserts that a view rebound onto host-side *copies* of the blobs is bit-identical
     in use — 6,956/6,956 assertions over evaluate fields and cold con2prim
     results/iterates/flags on the synthetic gas.
+  - **M4c:** ✅ GPU validation + throughput (`tests/test_device_cuda.cu`, plain and
+    `-DEEOS_GPU_TEST_HDF5` builds; H200, 2²⁰ states per pass, real-table-scale synthetic
+    gas AND repaired LS220). The gates are *statistical*: the device claim is
+    "indistinguishable from the host solver", so the GPU is held to the CPU's own
+    failure rate (+5% + 10) and round-trip distribution (10× per metric) — never to
+    bitwise equality (device libm differs from glibc by ULPs) and never to absolute
+    solver quality (that is M3's ledger; this harness deliberately samples harder than
+    the M3 audits — w uniform in [0,6), B²/p up to 10 — so the CPU itself fails 0.34%
+    cold on LS220 here). Measured (LS220 / synthetic): **warm con2prim 529 / 261
+    M solves/s** (≈660× one EPYC core), evaluate 381 / 509 M/s, **cold con2prim 0.6 /
+    2.8 M/s** (27× / 90× — the warp-divergent fallback ladder; this split is the number
+    that motivates the deferred fixed-trip stage), `con2prim_safe` ≈ cold. Warm: zero
+    convergence losses on either table, round trips at machine precision (max 4.4e-16).
+    Cold: failure totals GPU 3608 vs CPU 3591 (LS220) and 9 vs 15 (synthetic), the
+    one-sided flips confined to the documented hard class at w ≈ 4–5.5; round-trip
+    distributions match to ~10% at p99 (LS220 2.97e-9 vs 2.70e-9) including the
+    converged-but-far extreme-sampling tail (max ≈ 1.3e1 on BOTH sides — same states,
+    same class); flags agree 100% (synthetic) / 99.95% (LS220), result codes 99.9% /
+    99.8%. Kernels: evaluate 168 registers; the con2prim kernels sit at the 255-register
+    cap with 2.5–4.4 KB stack/thread (the solver's locals + the two 33-slot scan
+    arrays) — occupancy is the consumer's `__launch_bounds__` knob; recorded, not tuned.
 
 ## Open decisions
 
