@@ -12,6 +12,7 @@
 tests/test_*
 !tests/test_*.cpp
 !tests/test_*.hpp
+!tests/test_*.cu
 tools/*
 !tools/*.cpp
 

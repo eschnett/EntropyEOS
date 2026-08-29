@@ -91,6 +91,34 @@ san-fixture: tools
 	./tools/eos_crop tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5 \
 		tables/LS220_san_crop.h5 --irho 60 120 --jt 0 135 --kye 10 25
 
+# --- M4 GPU device test (opt-in; `make`/`make test` never build or run this,
+# see eos-device-interface.md S6) ------------------------------------------
+# No autodetection: invoke explicitly, e.g. on a CUDA machine
+#   make tests/test_device_cuda NVCC=/usr/local/cuda/bin/nvcc GPU_ARCH=sm_90
+# and run under the scheduler (srun -p h200q --gpus=1 ./tests/test_device_cuda).
+# The documented manual compile line (no Makefile at all) must always work:
+#   nvcc -O2 -std=c++17 -arch=sm_90 --expt-relaxed-constexpr -I. \
+#     tests/test_device_cuda.cu entropy_eos/host/table.cpp \
+#     entropy_eos/host/synthetic.cpp entropy_eos/host/bspline_fit.cpp \
+#     entropy_eos/host/adapter_build.cpp -o tests/test_device_cuda
+NVCC ?= nvcc
+GPU_ARCH ?= sm_90
+NVCCFLAGS ?= -O2 -g -std=c++17 -arch=$(GPU_ARCH) --expt-relaxed-constexpr
+
+# The HDF5-free host closure the synthetic-table GPU test needs (synthetic
+# table -> built adapter), compiled directly so the target neither builds nor
+# links $(LIB) and its -lhdf5. (No OpenMP flags: the pragmas in these TUs are
+# _OPENMP-guarded, and the one-off serial fit costs seconds.)
+DEVICE_TEST_HOST_SRCS = entropy_eos/host/table.cpp entropy_eos/host/synthetic.cpp \
+	entropy_eos/host/bspline_fit.cpp entropy_eos/host/adapter_build.cpp
+
+tests/test_device_cuda: tests/test_device_cuda.cu $(DEVICE_TEST_HOST_SRCS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $^
+
+.PHONY: gpu-test
+gpu-test: tests/test_device_cuda
+	./tests/test_device_cuda
+
 install: lib
 	mkdir -p $(PREFIX)/lib $(PREFIX)/include/entropy_eos
 	(cd entropy_eos && find . -name '*.hpp' -print0 | tar --null -T - -cf -) | \
@@ -98,4 +126,4 @@ install: lib
 	cp $(LIB) $(PREFIX)/lib/
 
 clean:
-	rm -f $(HOST_OBJS) $(LIB) $(TEST_BINS) $(TOOL_BINS)
+	rm -f $(HOST_OBJS) $(LIB) $(TEST_BINS) $(TOOL_BINS) tests/test_device_cuda

@@ -1,9 +1,9 @@
 // entropy_eos/core/defs.hpp
 //
 // Core definitions shared by every header in entropy_eos/core/. This header is
-// part of the device-ready boundary (see CODE.md "Layout"): header-only, no
-// STL containers, no exceptions, no allocation, so it can be compiled by
-// nvcc unchanged once the CUDA port (M4) lands.
+// part of the device-ready boundary (see CODE.md "Layout" and
+// eos-device-interface.md): header-only, no STL containers, no exceptions, no
+// allocation, so it compiles unchanged under nvcc, hipcc, and icpx -fsycl (M4).
 
 #pragma once
 
@@ -16,9 +16,19 @@ using real = double;
 } // namespace eeos
 
 // EEOS_HOST_DEVICE marks every function in core/ so the same source compiles
-// for host and device once nvcc is in the loop (M4). Under a CUDA compiler it
-// expands to the usual dual-callable qualifiers; otherwise it is empty.
-#if defined(__CUDACC__)
+// for host and device (M4, eos-device-interface.md S3). CUDA compilers (nvcc,
+// clang -x cuda) define __CUDACC__ and HIP compilers (hipcc/amdclang) define
+// __HIPCC__; both take the same dual-callable qualifiers. SYCL (icpx -fsycl)
+// deliberately gets the EMPTY expansion: a header-inline function defined in
+// the kernel's own translation unit is compiled for device automatically, and
+// SYCL_EXTERNAL exists only for cross-TU calls, which core/ (header-only by
+// rule) never makes. Plain host compilers are unchanged.
+//
+// Fast-math is forbidden when compiling core/ for any target: the NaN and
+// finiteness probes (aeval_is_nan()'s `v != v`, c2p_is_finite()'s
+// `(v - v) == 0`) are constant-folded to the wrong answer under
+// -ffast-math / --use_fast_math / -ffinite-math-only.
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define EEOS_HOST_DEVICE __host__ __device__
 #else
 #define EEOS_HOST_DEVICE

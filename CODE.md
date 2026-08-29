@@ -164,9 +164,12 @@ Rules that keep the CUDA port honest:
 
 - `core/` is header-only: no STL containers, no exceptions, no virtual functions, no
   I/O, no allocation. Every function is marked `EEOS_HOST_DEVICE` (expands to
-  `__host__ __device__` under `__CUDACC__`, empty otherwise). It operates on POD *view*
+  `__host__ __device__` under `__CUDACC__` or `__HIPCC__`; deliberately empty for SYCL
+  and plain host builds — see `eos-device-interface.md` §3). It operates on POD *view*
   structs — raw pointers + extents into coefficient arrays — so the same evaluation code
-  runs on host or device once the arrays are mirrored.
+  runs on host or device once the arrays are mirrored. Fast-math is forbidden for any
+  target: `core/`'s hand-rolled NaN/finite probes (`v != v`, `(v - v) == 0`) are
+  constant-folded to the wrong answer under it.
 - `host/` owns all memory (owning `EntropyEOS` holds `std::vector`s and hands out an
   `EntropyEOSView`), does all fitting/repair/I-O, and is never needed on the device.
 
@@ -1174,8 +1177,22 @@ axis, one axis over.
   `/repair_2`, `/repair_3`, … beside the group its input carried, each with its own
   `input_fnv1a`. Measured outcome, patience justification and the DD2/SFHo defect map
   are in the "DD2 / SFHo empirical findings" block above.
-- **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
-  fixed-iteration evaluate/con2prim variants.
+- **M4 (device interface — CUDA, AMD/HIP, Intel/SYCL):** design in
+  `eos-device-interface.md`. Scope amended 2026-08-28: (i) the target set grew from
+  CUDA-only to nvcc + hipcc + icpx `-fsycl` (one source, no forks; only CUDA hardware
+  is testable — the untested backends are made trustworthy structurally, see the design
+  doc §5), and (ii) the fixed-iteration evaluate/con2prim variants are **deferred to a
+  later stage**: they need GPU profiling data to size, and the in-code seams are already
+  marked (the seed loops' "drop the two breaks" notes, `seed_s_iters` 8-vs-16).
+  - **M4a:** ✅ `EEOS_HOST_DEVICE` generalized (`__CUDACC__ || __HIPCC__`; SYCL
+    deliberately empty — header-inline core/ needs no annotation there); `core/`
+    compiled under nvcc 13.2 (V13.2.51, gcc 11.4 host) **unchanged on the first try** —
+    no std-math shims, the only flag beyond `-std=c++17 -arch=sm_90` being
+    `--expt-relaxed-constexpr` for `p2c_nan()`'s constexpr `quiet_NaN()`. H200 (sm_90):
+    a 1-state end-to-end evaluate/prim2con/con2prim/con2prim_safe run matches the CPU
+    to ≤ 2.3e-14 relative (most fields bit-identical, identical solver result and
+    iteration counts). Harness compile time 6m47s (the whole solver device-inlines into
+    4 kernels). CPU suite bit-identical (the host macro expansion is unchanged).
 
 ## Open decisions
 
