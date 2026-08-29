@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -459,7 +460,7 @@ RawTable read_stellarcollapse(const std::string &path) {
 
     Handle obj(H5Oopen(file.get(), name.c_str(), H5P_DEFAULT), H5Oclose);
     if (!obj.valid() || H5Iget_type(obj.get()) != H5I_DATASET) {
-      continue; // not a dataset (e.g. a "/repair" group) -- ignore
+      continue; // not a dataset (e.g. a "/repair"/"/repair_2" group) -- ignore
     }
     const hid_t dset = obj.get();
 
@@ -571,22 +572,36 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table) {
   }
 }
 
-void append_repair_group(const std::string &path, const RepairResult &result,
-                          const RepairOptions &options, const std::string &input_path,
-                          unsigned long long input_fnv1a, const std::string &tool_version) {
+std::string append_repair_group(const std::string &path, const RepairResult &result,
+                                 const RepairOptions &options, const std::string &input_path,
+                                 unsigned long long input_fnv1a, const std::string &tool_version) {
   SilenceHDF5Errors silence;
 
   Handle file(H5Fopen(path.c_str(), H5F_ACC_RDWR, H5P_DEFAULT), H5Fclose);
   if (!file.valid()) {
     throw std::runtime_error("append_repair_group: cannot open '" + path + "' for writing");
   }
-  if (H5Lexists(file.get(), "repair", H5P_DEFAULT) > 0) {
-    throw std::runtime_error("append_repair_group: '" + path + "' already has a '/repair' group");
+
+  // First free name in the chain "repair", "repair_2", "repair_3", ...
+  // (header comment): a re-repaired file inherits its input's groups through
+  // write_stellarcollapse()'s passthrough copy, and each run appends its own
+  // rather than colliding with or overwriting them. The ceiling is a
+  // runaway guard only: no measured table needs more than one group.
+  constexpr int kMaxRepairGroups = 1000;
+  std::string group_name = "repair";
+  for (int n = 2; H5Lexists(file.get(), group_name.c_str(), H5P_DEFAULT) > 0; ++n) {
+    if (n > kMaxRepairGroups) {
+      throw std::runtime_error("append_repair_group: '" + path + "' already has " +
+                                std::to_string(kMaxRepairGroups) + " repair groups");
+    }
+    group_name = "repair_" + std::to_string(n);
   }
 
-  Handle group(H5Gcreate(file.get(), "repair", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), H5Gclose);
+  Handle group(H5Gcreate(file.get(), group_name.c_str(), H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT),
+               H5Gclose);
   if (!group.valid()) {
-    throw std::runtime_error("append_repair_group: failed to create '/repair' group in '" + path + "'");
+    throw std::runtime_error("append_repair_group: failed to create '/" + group_name +
+                              "' group in '" + path + "'");
   }
 
   const size_t n = result.entries.size();
@@ -635,6 +650,8 @@ void append_repair_group(const std::string &path, const RepairResult &result,
   write_attr_string(group.get(), "input_path", input_path);
   write_attr_uint64(group.get(), "input_fnv1a", static_cast<std::uint64_t>(input_fnv1a));
   write_attr_uint64(group.get(), "n_modified", static_cast<std::uint64_t>(n));
+
+  return group_name;
 }
 
 unsigned long long fnv1a_file(const std::string &path) {

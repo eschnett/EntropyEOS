@@ -316,6 +316,45 @@ TEST_CASE("repair_table: causal-cap is idempotent on the stiffened-corner table"
   CHECK(table.field("logenergy") == after_first); // bitwise
 }
 
+TEST_CASE("repair_table: the causal-cap loop runs while it improves, not on a fixed budget") {
+  // M3j. The loop stops on a property of the DATA -- a clean audit, nothing
+  // left in scope, a round that writes nothing, or two consecutive rounds
+  // that fail to beat the best state seen -- and options.causal_rounds_max is
+  // only a runaway backstop above that. Two consequences, both checked here.
+  RawTable table = eeos::make_synthetic_table(stiff_corner_options());
+  const RepairResult r = eeos::repair_table(table);
+  REQUIRE(r.causal_cap.ran);
+  REQUIRE(r.causal_cap.violations_after == 0);
+
+  // (a) The loop stopped on its own, nowhere near the ceiling. The history
+  // holds one entry per main-loop audit plus the final (4,4,4) verification,
+  // so its length minus one is the number of main-loop rounds actually run.
+  const RepairOptions defaults;
+  CHECK(static_cast<int>(r.causal_cap.rounds_violation_history.size()) - 1 <
+        defaults.causal_rounds_max);
+
+  // (b) A ceiling that DOES cut the loop off discards the round it cut away:
+  // that round's projection is never audited, so the best state is the one
+  // before it. At the extreme -- a ceiling of 1 -- the whole stage becomes a
+  // silent no-op: it reports no change and leaves the corner exactly as
+  // acausal as it found it, while the same table under the default ceiling
+  // comes back repaired and clean. This is the pre-M3j failure mode in
+  // miniature: SFHo's loop was still descending when its 8-round budget
+  // expired, so a single eos_repair run left work behind that only a second
+  // run could pick up (CODE.md "DD2 / SFHo empirical findings").
+  RawTable truncated = eeos::make_synthetic_table(stiff_corner_options());
+  RepairOptions budget1;
+  budget1.causal_rounds_max = 1;
+  const RepairResult rt = eeos::repair_table(truncated, budget1);
+  CHECK(rt.causal_cap.ran);
+  CHECK_FALSE(rt.causal_cap.reverted);
+  CHECK(rt.causal_cap.rounds_used == 0);
+  CHECK(rt.causal_cap.nodes_capped == 0);
+  CHECK(rt.causal_cap.violations_after == rt.causal_cap.violations_before);
+  CHECK(rt.causal_cap.violations_after > r.causal_cap.violations_after);
+  CHECK(count_entries_for(rt, "logenergy") == 0);
+}
+
 TEST_CASE("repair_table: --no-causal-cap leaves the corner alone and never changes entropy") {
   RawTable with_cap = eeos::make_synthetic_table(stiff_corner_options());
   RawTable without_cap = eeos::make_synthetic_table(stiff_corner_options());

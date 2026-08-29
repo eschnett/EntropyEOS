@@ -1218,8 +1218,27 @@ void causal_cap_stage(const RawTable &table, const std::vector<double> &sigma_da
 
   const std::vector<double> pre_stage = logenergy_data;
 
-  // Step 9's main loop, with M2d-1's best-state tracking and patience rule.
-  constexpr int kPatience = 4;
+  // Step 9's main loop: M2d-1's best-state tracking, run *while the stage
+  // keeps improving* rather than for a fixed number of rounds (M3j).
+  //
+  // Why the patience is 2 here where spline_safe_3d_field() uses 4: the two
+  // loops have measurably different trajectories, and 4 buys that one
+  // something it does not buy this one. The 3D stage diffuses, which is a
+  // noisy operation -- see its own doc comment: some of its converging
+  // trajectories dip *up* for a few rounds before trending back down (SRO's
+  // "entropy" field walks ..., 1010, 976, 976, 995, 1039, 997), so a short
+  // patience there risks stopping before a recovery it would have found. The
+  // causal-cap loop instead re-solves the same envelope from progressively
+  // deeper anchors, and no measured trajectory ever turns back up while it is
+  // still descending: every one falls monotonically and then flattens (LS220
+  // 1035875, 2452, 2176, 2061, 2008, 1967, 1961, 1956, then a plateau; SFHo
+  // 333862, 113887, 60713, ..., 11446, then a plateau; SRO wobbles by a
+  // single sample, 6050 -> 6051, inside its own). Two non-improving rounds
+  // here therefore already ARE the plateau, and rounds 3 and 4 would each pay
+  // a full fit + audit + project to confirm it. Measured to settle it: 2 and
+  // 4 give bit-identical output on all four real tables and on both synthetic
+  // presets -- see CODE.md "DD2 / SFHo empirical findings".
+  constexpr int kPatience = 2;
   size_t best_violations = std::numeric_limits<size_t>::max();
   std::vector<double> best_data;
   size_t best_gave_up = 0;
@@ -1229,6 +1248,10 @@ void causal_cap_stage(const RawTable &table, const std::vector<double> &sigma_da
   size_t gave_up_total = 0;
   std::vector<int> node_start(static_cast<size_t>(ntemp) * static_cast<size_t>(nye), nrho);
 
+  // options.causal_rounds_max is the runaway backstop, not the working
+  // budget (repair.hpp): every exit below is a property of the data, so a
+  // loop that leaves through this `for`'s own condition is the one case
+  // where the stage can still have work left for a second run.
   for (int round = 0; round < options.causal_rounds_max; ++round) {
     const Bspline3 lfit =
         fit_bspline_3d(nrho, ntemp, nye, x0, hx, u0, hu, y0, hy, logenergy_data);
@@ -1246,7 +1269,7 @@ void causal_cap_stage(const RawTable &table, const std::vector<double> &sigma_da
       best_rounds = rounds_applied;
       patience = 0;
     } else if (++patience >= kPatience) {
-      break; // stuck or worsening: revert to the best state below
+      break; // plateaued or worsening: revert to the best state below
     }
     if (counts.violations == 0 || counts.treated_runs == 0) {
       // Clean, or nothing left in scope: every remaining violation sits in

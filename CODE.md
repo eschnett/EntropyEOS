@@ -207,6 +207,18 @@ kernels — the same reason `core/` forbids it. See [`RELATED.md`](RELATED.md).
   format), so `io_stellarcollapse` is the first and only M1 backend: log10-stored axes and
   energy/pressure, linear entropy, `energy_shift` attribute. Use the HDF5 C API (more
   portable than the C++ API, which many installs don't build).
+- **The two Hempel–Schaffner-Bielich tables (added 2026-08-28)** —
+  `Hempel_DD2EOS_rho234_temp180_ye60_version_1.1_20120817.h5` (grid 234 × 180 × 60)
+  and `Hempel_SFHoEOS_rho222_temp180_ye60_version_1.1_20120817.h5` (222 × 180 × 60) —
+  are that same layout with no reader changes at all: same axis names and ordering,
+  same `energy_shift` attribute, same auxiliary columns. Their **baryon mass is amu,
+  i.e. the library default** (measured through the δ_T discriminator; see the findings
+  block below), unlike SRO's m_n, so nothing needs a `--m-B` override. Axes: T from
+  0.01 to 158 MeV (10^2.2 — *lower* T_max than the LS220 family's 251 MeV, which is
+  what makes their hot seam matter- rather than radiation-dominated), ρ from
+  1.7 × 10² to 1.7 × 10¹⁶ (DD2) / 3.2 × 10¹⁵ (SFHo) g/cc, Ye from 0.01 to 0.60 — a
+  lower ρ floor and a wider Ye range than LS220's. `tables/README.md` has the download
+  commands and citations.
 - CompOSE/MUSES (named in v0.1) differ in layout, units, and normalization
   (per-baryon quantities, different energy zero). They sit behind the same
   `RawTable read_table(path, Format)` entry point and can be added without touching
@@ -245,6 +257,14 @@ Design points:
   M2d-1 harness verbatim (audit-driven rounds, per-column re-repair of touched columns,
   best-state tracking) plus a *lexicographic* backstop: the kept state's (4,4,4)
   monotonicity counts must not regress, else the whole stage reverts.
+- **The stage runs while it improves (M3j)**, not for a fixed number of rounds: it stops
+  after two consecutive rounds that fail to beat the best state seen, and
+  `causal_rounds_max` (default 64, was 8) is a runaway backstop rather than a working
+  budget. This is what makes *one* run a fixed point — the stopping rule is a property
+  of the data, so a second run replays the same non-improving tail and reverts to the
+  same state, where a round budget stops on how much work this call has already done and
+  a fresh call resets it. Measured need: ≤ 10 rounds (LS220/SRO/DD2), 30 (SFHo, which
+  used to need four chained runs).
 - Structural problems are *fatal*, not repaired — they indicate a broken file, not
   physics noise. Fatal means: non-monotone/non-finite axes, missing `energy_shift`, or
   a missing or non-finite **interpreted** field (`logenergy`, `entropy`). Non-finite
@@ -253,11 +273,22 @@ Design points:
   pass through the writer byte-identically and must not block repairing the fields we
   do interpret.
 - Guarantees: input never modified; deterministic; **idempotent** (a second run reports
-  zero changes — enforced by tests). Output = faithful copy of every untouched dataset,
-  the two repaired fields, plus a `/repair` provenance group (per-field indices /
-  old / new values, parameters, tool version, input checksum) and a human-readable log.
-- Exit codes: 0 = already clean, 1 = repaired (or would repair, under `--check-only`),
-  2 = fatal structural problem.
+  zero changes — enforced by tests, on all four real tables since M3j). Output = faithful
+  copy of every untouched dataset, the two repaired fields, plus a repair-provenance
+  group (per-field indices / old / new values, parameters, tool version, input checksum)
+  and a human-readable log.
+- **Re-repairing an output is a first-class operation (M3j).** `OUT.h5` inherits
+  `IN.h5`'s repair group through the writer's passthrough copy, so:
+  a run that **changes nothing** appends no group at all and exits 0 — which makes
+  `eos_repair repaired.h5 out.h5` the idempotence check; a run that **does change
+  something** appends `/repair_2`, `/repair_3`, … (first free index, identical schema)
+  beside the inherited one, so the chain stays auditable through each group's own
+  `input_fnv1a`. Before M3j the second run died with exit 2 ("already has a `/repair`
+  group") *after* writing the output, reporting a perfectly clean table as a fatal
+  structural problem.
+- Exit codes: 0 = already clean — **including the re-repair case**, where the input is
+  itself an `eos_repair` output and this run found nothing left to do;
+  1 = repaired (or would repair, under `--check-only`); 2 = fatal structural problem.
 
 ## Test harness — `tools/eos_test` (staged; M1 ships the first stage)
 
@@ -398,40 +429,107 @@ construction and which are about a particular table's data:
   else.
 - **But their hot low-density corner is genuinely broken, and much worse than
   LS220's.** After the full in-memory repair (causal cap included), `check_adapter`
-  reports in-box `cs2_acausal` 2193 with **max 4.88** (DD2) and 828 / max 4.10 (SFHo)
+  reports in-box `cs2_acausal` 2193 with **max 4.88** (DD2) and 785 / max 4.10 (SFHo)
   against LS220's 132 / max 2.3e-2, plus in-box `cs2_nonpositive` 5359 / 1547
   (LS220: 4) and `p_nonpositive` 335 / 270 (LS220: 0). The defect localizes to
   ρ ≈ 1.2–1.6e7 g/cc at T ≳ 130 MeV, is *identical at every Ye*, and shows up
   independently in `check_table` as δ_p ≈ 20 at ρ = 1.4e7 — i.e. a ρ-column artifact
   of the shared tabulation, not of one EOS's physics. It is inherited, not created,
   by the adapter: c_s² is already −2.98 (SFHo) at the box's own hot seam there.
+- **That band is interior in ρ, so the causal cap declines it — correctly.** Grouped
+  into runs along ρ, none of its violating samples reaches the ρ_max edge (the band
+  sits at ρ ~ 10⁷–10¹², T ≳ 120 MeV, with in-box c_s² up to ~5), so the M3f scoping
+  rule counts it as `interior_untouched` and never edits it. On **DD2 that is the
+  whole violation set**: cs2_violations 131,736 → 131,736 with
+  `interior_untouched = 131,736`, rounds = 0, nodes capped = 0 — the first local table
+  with *no* edge-anchored ρ_max acausal corner at all, i.e. the structure that
+  motivated M3f is simply absent. **SFHo has both**: the same interior band plus a
+  genuine ρ_max corner, and its 21,516 capped nodes are that corner. Leaving the band
+  alone is the right call on the measured evidence, not just the scoped one: it is what
+  con2prim actually meets there, and con2prim barely notices — see the 40,000-state
+  numbers below, where the handful of failures land inside this exact band and the
+  invalid-state policy absorbs them. Extending the cap to `u_hi`-edge-anchored runs is
+  recorded as a deferred option (open decision 6), not a defect.
+- **The interior `c_s²` spikes are enormous, and they are a σ_T artifact, not
+  stiffness.** The causal-cap audit's largest finite in-box sample is **2.94e8 (DD2)**
+  and **1.32e11 (SFHo)**, against 1.9e4 (LS220) and 1.8e9 (SRO). They sit in the
+  T ≈ 0.02–0.08 MeV, ρ ~ 10⁷–10⁹ pockets where σ_T is nearly flat — a corner these
+  tables tabulate (their T axis reaches down to 0.01 MeV) but far below where NSE is a
+  valid description of matter, so the tabulated numbers there carry no physics to
+  preserve. `c_s²` built from a fit whose σ_u is that small is dominated by fit noise,
+  and capping ε cannot repair a defect that lives in σ's flatness — the stage reports
+  and never edits them, exactly as scoped. The δ_T fidelity quantiles show the same
+  bulk/tail split from the other side: p50 = 4.4e-4 / 4.0e-4 (excellent, and the
+  measurement that fixed m_B above) against **p90 ≈ 0.9** — one audited sample in ten
+  carries an order-unity thermodynamic inconsistency.
 - **con2prim round trips are clean on both, with one DD2 outlier.** Over 8000 states:
   zero failures on either table (DD2 7970 Newton / 30 fallback, SFHo 7981 / 19, against
   LS220's 7985 / 15), policy battery PASS and zero false positives on both. The one
   metric where DD2 is worse than LS220 is the τ round-trip tail: p99 = 9.2e-13 as
   everywhere, but max = 7.3e-5 (LS220: 1.0e-12) — a single state in the documented
   residual multi-root pocket set, absorbed by one policy intervention.
-- **First real table on which repair is not a one-run fixed point: SFHo.** Its
-  causal-cap stage spends the whole default round budget (rounds_used = 7, 21,516
-  logenergy nodes capped, refined cs² violations 1,186,275 → 58,904) and leaves a
-  2212-node tail, so `eos_repair --check-only` on the repaired output is exit 1, not 0.
-  Chaining repairs by hand converges monotonically — "would repair" 2212 → 619 → 492 →
-  **0**, clean after four passes — so this is the bounded-effort behavior M2d-1 already
-  documents for the adversarial synthetic wiggle, now observed on real data, not a
-  stalled stage. LS220, SRO and DD2 all reach a fixed point in one run.
-  `tests/integration.sh` therefore asserts the invariant that separates the two cases
-  (one-run fixed point, *or* a residual strictly smaller than what the first pass
-  repaired) instead of demanding exit 0. Note the harness cannot chain the passes
-  itself: `eos_repair` refuses to append a second `/repair` provenance group to an
-  already-repaired file (exit 2, data still written). **Open item:** whether the
-  causal-cap round budget should be raised (or exposed as a CLI knob) so one run
-  suffices on tables like SFHo.
-- **DD2's acausality is entirely interior, so the causal cap correctly does nothing**
-  on it: cs2_violations 131,736 → 131,736 with `interior_untouched = 131,736`, rounds =
-  0, nodes capped = 0. DD2 is the first local table with *no* edge-anchored ρ_max
-  acausal corner at all — the structure that motivated M3f is simply absent, and the
-  stage's scoping rule correctly declines to edit the σ_T-pocket interior. (SFHo does
-  have the corner; see above.)
+- **At 40,000 states the picture holds, and the failures localize to the hot-edge
+  band.** DD2: warm 39,873 Newton / 125 fallback / **2 failed**, cold **3 failed**;
+  SFHo: warm 39,890 / 107 / **3 failed**, cold **2 failed**; `c2p_roundtrip` count 3 on
+  each, over largely the same states as the failures rather than a separate class
+  (SFHo: the same three; DD2: two of three);
+  `rt_tau` p999 ≈ 1.0e-12 on both, policy `n_valid_touched = 0` and battery PASS on
+  both. Every offending state the audit names sits at ρ = 1.0–1.6e7 with
+  T = 127–156 MeV — inside the interior band of the bullet above, which is the measured
+  basis for accept-and-guard there. The adapter's
+  ε-floor rescale is κ = 0.99859136 on both tables (LS220: 0.99014838).
+- **Repair reaches a fixed point in ONE run on all four tables (M3j).** Measured by
+  repeated in-memory `repair_table()` on the same table until a pass changes nothing:
+  LS220 (68,394 values changed, then 0), SRO (245,387, then 0), DD2 (9,250, then 0) and
+  — since M3j — SFHo (22,468, then 0). Before M3j, SFHo alone needed **four** passes
+  (22,468 → 2,212 → 619 → 492 → 0) for a single reason: its causal-cap loop was
+  descending monotonically (refined violations 333,862 → 22,157 over rounds 1–8) when
+  the fixed 8-round budget expired, and the discarded remainder was exactly what the
+  next run picked up. The other three tables were unaffected because their loops
+  plateau within 8 rounds (LS220 settles at 1,956 refined violations after 7 kept
+  rounds, SRO at 6,050, DD2's exits at round 1 with nothing in scope). **M3j** made
+  the loop run while it improves — stop after two consecutive non-improving rounds,
+  with `causal_rounds_max` demoted to a runaway backstop (default 8 → 64) — and one
+  SFHo run now keeps 27 rounds (30 main-loop audits, the last three of them a flat
+  plateau at 11,446) to reach (4,4,4) violations **1,186,275 → 36,866**. That is
+  *exactly* the state the old four-run chain converged to, checked bit for bit: both
+  end with `entropy` fingerprint `c01ca1ad…` and `logenergy` `6a8f615b…`. LS220, SRO and DD2 are unchanged value for
+  value and counter for counter; they only pay the two extra plateau-confirming rounds.
+  Cost on SFHo: `repair_table()` 33.7 s → 55.2 s serial (Apple clang, one thread; the
+  causal stage's own share is ~3.7× its old cost, 30 rounds against 8), against
+  4 × 33.7 s plus four read/write cycles of a 442 MB file for the chain it replaces.
+  LS220 pays 22.5 s → 23.8 s: two extra rounds to confirm a plateau it used to walk off
+  the end of. Nothing else moved: SFHo's `entropy` entries (666), `logenergy`
+  entries (21,802), (4,4,4) σ_u 8,355 / L_u 10,296, κ, and its 40,000-state con2prim
+  numbers are the same before and after, except `cs2_acausal` 828 → **785** and one
+  state shifting from fallback to Newton.
+  - The **patience is 2** here where the M2d-1 diffusion stage uses 4, and that is
+    measured, not assumed: every causal-loop trajectory falls monotonically and then
+    flattens (LS220 1035875, 2452, 2176, …, 1956, plateau; SFHo 333862, 113887, …,
+    11446, plateau; SRO wobbles by one sample, 6050 → 6051, inside its plateau), where
+    the diffusion stage's genuinely turns back up mid-descent (SRO `entropy`: 1537,
+    1273, 1177, 1010, 976, 976, 995, 1039, 997) and so wants the longer patience.
+    Patience 2 and patience 4 produce **bit-identical output on all four real tables
+    and both synthetic presets**; 4 only spends two more full fit/audit/project rounds
+    confirming the plateau.
+  - **Why a budget broke idempotence and an improvement rule does not**: the new
+    stopping condition is a property of the data, so a second run starts at the state
+    the first one kept, deterministically replays the same non-improving rounds, and
+    reverts to it again. A round budget stops on how much work *this call* has already
+    done, which a fresh call resets. `tests/test_causal_cap.cpp` pins the mechanism at
+    unit scale (a ceiling of 1 makes the stage discard its own single round and report
+    no change at all).
+- **`eos_repair` can now re-repair its own output (M3j).** The output inherits the
+  input's `/repair` group through the writer's passthrough copy, which used to make the
+  second run die with exit 2 ("already has a `/repair` group") *after* writing the
+  file — reporting a clean table as a fatal structural problem, and making the four-pass
+  SFHo chain above impossible to run through the tool at all. Now a run that changes
+  nothing appends no group (exit 0, byte-faithful copy — the idempotence check
+  `tests/integration.sh` uses on all four real tables), and a run that does change
+  something appends `/repair_2`, `/repair_3`, … beside the inherited group, each
+  carrying its own `input_fnv1a`. The CI-safe exercise of the numbered path is the
+  synthetic dirty preset, whose adversarial `entropy` wiggle is still deliberately
+  *not* a one-run fixed point (pass 2 changes 265 entropy values, pass 3 none).
 - **The M3i x-low tail is table-independent; the M3g u-high tail is not.** The far
   x-low tail hits the radiation asymptote on all four tables to three digits
   (DD2 [0.3286, 0.3343], SFHo [0.3286, 0.3343], vs LS220 [0.3268, 0.3360]). The far
@@ -1059,6 +1157,23 @@ axis, one axis over.
   −5.1e-8 relative shift in κ (the extended ε-floor scan legitimately sees the new tail);
   pin κ and all 6,000 in-box `evaluate()` points and all 44,000 con2prim solves are
   bit-identical.
+- **M3j:** ✅ complete — one `eos_repair` run is a fixed point on every real table, and
+  re-repairing an output is a supported operation. Two changes, both in the harness, no
+  physics touched. (1) The **causal-cap loop runs while it improves**: best-state
+  tracking as before, but it stops after two consecutive non-improving rounds and
+  `RepairOptions::causal_rounds_max` becomes a runaway backstop (8 → 64) instead of a
+  working budget. The old budget was cutting SFHo's still-descending loop off
+  mid-round-8, which is what made that table need four chained runs; one run now uses 27
+  kept rounds and lands on the chain's own converged state, bit for bit
+  (cs² 1,186,275 → **36,866** at (4,4,4)), while LS220/SRO/DD2 are unchanged value for
+  value. The stopping rule is a property of the data, which is what makes idempotence
+  provable rather than incidental. (2) The **`/repair` provenance collision** is gone:
+  a run that changes nothing appends no group and exits 0 (so `eos_repair repaired.h5
+  out.h5` *is* the idempotence check — it used to exit 2, "already has a `/repair`
+  group", after writing the file), and a run that changes something appends
+  `/repair_2`, `/repair_3`, … beside the group its input carried, each with its own
+  `input_fnv1a`. Measured outcome, patience justification and the DD2/SFHo defect map
+  are in the "DD2 / SFHo empirical findings" block above.
 - **M4:** CUDA: compile `core/` under nvcc, mirror coefficient arrays to device,
   fixed-iteration evaluate/con2prim variants.
 
@@ -1084,3 +1199,18 @@ axis, one axis over.
    with the residual and the `cs2_cap` sensitivity measured. Still open under it: whether
    the default `cs2_cap = 0.99` should move to 0.95, and whether the lexicographic
    backstop's "no monotonicity regression at all" rule wants a tolerance.
+   ~~Whether the causal-cap round budget should be raised so one run suffices on tables
+   like SFHo~~ — resolved by **M3j**: the loop runs while it improves and the budget is
+   now a runaway backstop, so one run is a fixed point on all four tables.
+6. **Whether the causal cap should also treat `u_hi`-edge-anchored runs** — the DD2/SFHo
+   hot-edge acausal band (ρ ~ 10⁷–10¹², T ≳ 120 MeV, in-box c_s² up to ~5) is interior
+   in ρ, so M3f's ρ_max-edge scoping reports it as `interior_untouched` and never edits
+   it — correctly under the rule as written, and the same rule is what keeps the stage
+   out of the σ_T pockets. A T-anchored variant (trace adiabats down in T from the hot
+   edge rather than down in ρ from ρ_max) is the natural extension that would reach it.
+   **Deferred, deliberately**: con2prim barely notices the band — 2–3 failures per
+   40,000 states on either table, all inside it, with the invalid-state policy absorbing
+   them and zero false positives — so this is accept-and-guard territory (the same
+   verdict as decision 4), and the band would be paid for with a second scoping rule,
+   a second anchor search and a second class of physics edit. Revisit only if a
+   consumer's states concentrate there.

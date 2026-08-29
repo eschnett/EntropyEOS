@@ -385,6 +385,10 @@ same bytes. And repair is **idempotent** in the case that matters: a second run 
 repaired table reports zero changes and exits clean, which holds on the real tables as
 well as in the unit tests. That guarantee is conditional, because a
 stage that leaves residual violations may explore further from wherever the data are now.
+Re-running the tool on its own output is the way to check it — `eos_repair repaired.h5
+out.h5` exits 0 and writes a byte-faithful copy when there is nothing left to do, and
+otherwise records itself in a numbered `/repair_2`, `/repair_3`, … group beside the one
+its input already carried, so a chain of repairs stays auditable.
 
 With a valid table in hand, `build_entropy_eos()` performs the $F \to U$ conversion once:
 convert units, fit $C^2$ tensor-product cubic B-splines to entropy and

@@ -155,11 +155,18 @@ Requires both fields; edits only `logenergy`.
 4. **Restore monotonicity**: re-run the per-column pipeline (PAVA + strictify +
    1D spline-safe) on every column the projection touched, exactly as the 3D
    stage's step (d) does.
-5. **Loop**: re-audit; rounds continue while the violation count improves, up to
-   `causal_rounds_max`. Residual seam ringing (the spline smooths the anchor kink;
-   cap vs. threshold hysteresis absorbs most of it) is handled by later rounds
-   re-tracing with anchors that land deeper. Best-state tracking and the
-   revert-after-non-improving rounds rule are carried over from M2d-1 verbatim.
+5. **Loop**: re-audit; rounds continue **while the violation count improves**,
+   and stop after two consecutive rounds that fail to beat the best state seen,
+   reverting to that best state. Residual seam ringing (the spline smooths the
+   anchor kink; cap vs. threshold hysteresis absorbs most of it) is handled by
+   later rounds re-tracing with anchors that land deeper. Best-state tracking is
+   carried over from M2d-1 verbatim; the patience is 2 rather than M2d-1's 4
+   because this loop's measured trajectory is monotone non-increasing where the
+   diffusion stage's is noisy (CODE.md "DD2 / SFHo empirical findings").
+   `causal_rounds_max` is an absolute ceiling on the round count — a runaway
+   backstop, *not* the working budget (**M3j**; it was a hard budget of 8
+   through M3i, which cut SFHo's still-converging loop off mid-descent and left
+   work only a second `eos_repair` run could finish).
 6. **Verification + lexicographic backstop**: final audit at (4,4,4) of **both**
    c_s² and the σ_u/L_u monotonicity counts. The kept state must satisfy, in
    order: (a) monotonicity violation counts no worse than the pre-stage state,
@@ -169,8 +176,12 @@ Requires both fields; edits only `logenergy`.
 
 Write-back, provenance, determinism, and `--check-only` semantics are unchanged:
 every changed value becomes a `RepairEntry` (field `"logenergy"`, old/new vs. the
-original input), `/repair` gains the stage's parameters, exit codes keep their
-meaning.
+original input), the repair-provenance group gains the stage's parameters, exit
+codes keep their meaning. (**M3j**, once one run reliably converges: re-repairing
+an output is a supported operation. A run that changes nothing appends no group
+at all and exits 0 — the idempotence check; a run that does change something
+appends `/repair_2`, `/repair_3`, … next to the group its input carried, so the
+chain stays auditable through each group's own `input_fnv1a`.)
 
 ## 5. Options (RepairOptions additions) and defaults
 
@@ -179,7 +190,7 @@ meaning.
 | `causal_cap` | on (decided) | run the stage at all |
 | `cs2_max` | 1.0 | audit threshold: a sample with c_s² ≥ this is a violation |
 | `cs2_cap` | 0.99 (decided) | target slope c̄ of the projection (hysteresis vs. cs2_max absorbs refit ringing; `1−cs2` conditioning headroom for the Newton) |
-| `causal_rounds_max` | 8 | round budget (round 1 does the bulk; later rounds chase seam ringing) |
+| `causal_rounds_max` | 64 (M3j; was 8) | absolute ceiling on the round count — a runaway backstop, not a working budget: the loop stops on its own once two consecutive rounds fail to improve. Measured need: ≤ 10 rounds (LS220/SRO/DD2), 30 (SFHo) |
 | `trace_depth_max` | 64 | cells the anchor search may descend before giving up on a node (report, don't edit) — measured depth: ≤ 11 (LS220), ≤ 18 (SRO) |
 | `anchor_pad` | 2 | consecutive causal refined steps required before anchoring (hysteresis) |
 

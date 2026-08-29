@@ -185,9 +185,20 @@ struct RepairOptions {
   // gap the loop has no mechanism to converge.
   double cs2_cap = 0.99;
 
-  // Round budget for the stage's audit/project/re-repair loop. Round 1 does
-  // the bulk; later rounds chase refit ringing near the anchor seams.
-  int causal_rounds_max = 8;
+  // Absolute ceiling on the stage's audit/project/re-repair loop -- a pure
+  // runaway backstop, NOT the working budget (M3j semantic change; it was a
+  // hard budget of 8 through M3i). The loop normally ends on its own: the
+  // audit comes back clean, nothing is left in scope, a round writes no
+  // node, or -- the usual case on a real table -- two consecutive rounds
+  // fail to improve on the best state seen (see repair_table()'s doc
+  // comment, causal-cap step 9). This bound exists only so a pathological
+  // table cannot spin forever, so it is set well above any measured need:
+  // SFHo, the deepest real table measured, converges in ~30 rounds
+  // (CODE.md "DD2 / SFHo empirical findings"); LS220/SRO/DD2 use <= 10.
+  // Lowering it below the natural stopping point re-introduces exactly the
+  // M3i behavior it replaced -- a converging loop cut off mid-descent,
+  // whose remaining work only a second eos_repair run could finish.
+  int causal_rounds_max = 64;
 
   // How many rho *cells* a node's adiabat trace may descend looking for a
   // causal anchor before the node is given up on (reported via
@@ -560,10 +571,16 @@ struct RepairResult {
 //   8. Restore monotonicity: re-run the per-column pipeline (steps 0-1) on
 //      every (irho, kYe) column the projection touched, exactly as step 2d
 //      does for the 3D stage.
-//   9. Loop: re-audit and repeat, up to options.causal_rounds_max rounds,
-//      tracking the best (lowest c_s^2 violation count) state seen and
-//      giving up early -- reverting to that best state -- after 4
-//      consecutive rounds fail to beat it, exactly as step 2 does.
+//   9. Loop: re-audit and repeat *while the stage keeps improving*, tracking
+//      the best (lowest c_s^2 violation count) state seen and giving up --
+//      reverting to that best state -- after 2 consecutive rounds fail to
+//      beat it, the same rule step 2 uses with a shorter patience (M3j; the
+//      2-vs-4 choice is measured, see repair.cpp's causal_cap_stage()).
+//      options.causal_rounds_max caps the round count as a pure runaway
+//      backstop, not as the working budget: a table that hits it was still
+//      converging, and its remaining work is exactly what a second
+//      repair_table() call would pick up (this is what M3j fixed -- see
+//      CODE.md "DD2 / SFHo empirical findings").
 //  10. Verification + lexicographic backstop: one final (4,4,4) audit of
 //      c_s^2, plus (4,4,4) fu-monotonicity counts of both fields. The kept
 //      state must satisfy, in order, (a) monotonicity counts no worse than
@@ -626,6 +643,27 @@ struct RepairResult {
 // whose traced stretch is already causal is left bit-identical: the deficit
 // formulation of step 7c makes the projection an exact no-op there rather
 // than a roundoff-level rewrite.
+//
+// Since M3j this stage is idempotent in the *general* case too -- a residual
+// it leaves behind does not make a second run find more work in it (the
+// stages before it still carry their own conditions, above) -- and the
+// argument is worth spelling out, because it is exactly what the old fixed
+// round budget broke. Every round's projection is a deterministic function
+// of the current data alone, so the loop's trajectory from a given state is
+// fixed.
+// Step 9 stops on a property OF THE DATA (clean, nothing in scope, nothing
+// written, or two consecutive rounds that fail to beat the best state seen)
+// and returns the best state; a second run therefore starts at that best
+// state, replays the very same rounds that followed it the first time --
+// each of which was, by construction, no better -- and reverts to it again,
+// bit for bit, reporting zero entries. A *budget* cutoff has no such
+// property: it stops on how many rounds this call has already spent, which
+// a fresh call resets, so a run cut off mid-descent leaves work a second run
+// picks up (measured on SFHo before M3j: four eos_repair runs to converge,
+// CODE.md "DD2 / SFHo empirical findings"). The one case where that can
+// still happen is a run that hits options.causal_rounds_max, which is why
+// that bound is set as a runaway backstop far above any measured need
+// rather than as a working budget.
 //
 // Throws std::runtime_error if a listed field is missing from `table` or
 // contains a non-finite value (checked for every listed field before any

@@ -58,6 +58,43 @@ expect_exit 1 "$REPAIR" "$T/seeded.h5" "$T/repaired.h5" --log "$T/repair.log"
 expect_exit 0 "$TEST" "$T/repaired.h5"                     # clean after repair
 expect_exit 0 "$REPAIR" --check-only "$T/repaired.h5"      # idempotent through files
 
+# 6b (M3j): the same idempotence check through the WRITE path -- the one that
+# used to break. Re-repairing an eos_repair output finds nothing to change, so
+# it writes a byte-faithful copy (which inherits the input's own "/repair"
+# group through write_stellarcollapse()'s passthrough) and appends no group of
+# its own: exit 0. Before M3j this run died with exit 2 ("already has a
+# '/repair' group") *after* writing the output, i.e. it reported a perfectly
+# clean table as a fatal structural problem.
+set +e
+"$REPAIR" "$T/repaired.h5" "$T/rerepaired.h5" >"$T/rerepair.out"
+rerepair_exit=$?
+set -e
+if [ "$rerepair_exit" -eq 0 ] && grep -q "no new provenance group" "$T/rerepair.out"; then
+  echo "PASS: re-repairing a repaired table exits 0 and appends no provenance group"
+else
+  echo "FAIL: re-repair of a repaired table exited $rerepair_exit (expected 0), output:"
+  cat "$T/rerepair.out"
+  exit 1
+fi
+
+# 6c (M3j): the group layout that goes with it -- exactly one repair group,
+# the inherited one. Best-effort: h5ls ships with HDF5 but is not guaranteed
+# to be installed (CI's libhdf5-dev may omit the tools package), and the
+# invariant itself is unit-tested in tests/test_io_stellarcollapse.cpp; this
+# is the end-to-end confirmation when the tool happens to be there.
+if command -v h5ls >/dev/null 2>&1; then
+  n_groups=$(h5ls "$T/rerepaired.h5" | grep -cE '^repair(_[0-9]+)?[[:space:]]+Group' || true)
+  if [ "$n_groups" -eq 1 ]; then
+    echo "PASS: re-repaired output carries exactly one (inherited) repair group"
+  else
+    echo "FAIL: re-repaired output has $n_groups repair groups (expected 1):"
+    h5ls "$T/rerepaired.h5"
+    exit 1
+  fi
+else
+  echo "skipped: repair-group layout check (h5ls not installed)"
+fi
+
 # 7:
 if grep -q "logenergy" "$T/repair.log"; then
   echo "PASS: repair.log mentions a repaired field (logenergy)"
@@ -91,6 +128,34 @@ expect_exit 1 "$REPAIR" "$T/dirty.h5" "$T/dirty_rep.h5" --log "$T/dirty_repair.l
 # fixed point, is the correct behavior here, not a bug).
 expect_exit 1 "$REPAIR" --check-only "$T/dirty_rep.h5"
 expect_exit 1 "$TEST" "$T/dirty_rep.h5" --csv "$T/dirty_rep"
+
+# 11a (M3j): and so this preset is also the CI-safe exercise of the *numbered*
+# provenance group. Chaining a second repair onto dirty_rep.h5 does change
+# something (see the comment above -- measured: 265 entropy values), and its
+# output already carries the first run's "/repair", so the second run records
+# itself as "/repair_2" rather than colliding with it. Each group keeps its
+# own input_fnv1a, so the chain stays auditable file by file.
+set +e
+"$REPAIR" "$T/dirty_rep.h5" "$T/dirty_rep2.h5" >"$T/dirty_rerepair.out"
+dirty_rerepair_exit=$?
+set -e
+if [ "$dirty_rerepair_exit" -eq 1 ] && grep -q "provenance group '/repair_2'" "$T/dirty_rerepair.out"; then
+  echo "PASS: chaining a repair onto an already-repaired table appends '/repair_2' (exit 1)"
+else
+  echo "FAIL: chained repair exited $dirty_rerepair_exit (expected 1) or did not write '/repair_2':"
+  cat "$T/dirty_rerepair.out"
+  exit 1
+fi
+if command -v h5ls >/dev/null 2>&1; then
+  n_groups=$(h5ls "$T/dirty_rep2.h5" | grep -cE '^repair(_[0-9]+)?[[:space:]]+Group' || true)
+  if [ "$n_groups" -eq 2 ]; then
+    echo "PASS: chained output carries two repair groups (inherited + appended)"
+  else
+    echo "FAIL: chained output has $n_groups repair groups (expected 2):"
+    h5ls "$T/dirty_rep2.h5"
+    exit 1
+  fi
+fi
 
 if [ -f "$T/dirty_rep_entropy_nonmonotone_T.csv" ] || [ -f "$T/dirty_rep_logenergy_nonmonotone_T.csv" ]; then
   echo "FAIL: repaired dirty table still shows entropy/logenergy nonmonotone-T violations"
@@ -239,8 +304,8 @@ echo "=== Part B: real tables (skipped gracefully if absent) ==="
 # entropy, broken axes -- is kept as a handled outcome for arbitrary tables a
 # user may drop in: it has no repaired output to exercise further, so the
 # rest of this function is skipped for it. Otherwise, what must hold after
-# repair is: (a)
-# the repaired output is itself clean under --check-only (idempotence), and
+# repair is: (a) re-repairing the repaired output is a no-op (idempotence,
+# checked through a full second run -- see below), and
 # (b) the two nonmonotone-T classes -- the ones repair_table() actually
 # targets -- are gone, checked here via --csv (a class's CSV is only written
 # when its count > 0, so the assertion is "the file must not exist"). Some
@@ -297,48 +362,56 @@ run_real_table() {
       ;;
   esac
 
-  # Idempotence. LS220, SRO and DD2 reach a fixed point in ONE eos_repair run
-  # (exit 0 here). SFHo does not, and that is bounded-effort behavior rather
-  # than a bug -- the same phenomenon integration.sh's step 11 documents for
-  # the synthetic wiggle defect, seen for the first time on a real table:
-  # SFHo's causal-cap stage spends its whole default round budget
-  # (rounds_used=7, 21516 nodes capped, cs2_violations 1186275 -> 58904) and
-  # what remains is a further 2212-node tail. Measured 2026-08-28 by chaining
-  # repairs by hand, the residual converges monotonically -- "would repair"
-  # 2212 -> 619 -> 492 -> 0, i.e. clean after four passes. (The harness cannot
-  # chain them itself: eos_repair refuses to append a second "/repair"
-  # provenance group to an already-repaired file, exit 2.)
+  # Idempotence, asserted through the WRITE path -- a full second eos_repair
+  # run on the first run's output, which is what a user chaining repairs
+  # actually does and the only way to exercise the provenance-group handling.
+  # All four real tables are one-run fixed points since M3j, so the required
+  # outcome is exit 0 plus "no changes; no new provenance group": the output
+  # is a byte-faithful copy carrying the first run's "/repair" group and
+  # nothing else.
   #
-  # So what is asserted for EVERY table is the invariant that distinguishes
-  # bounded effort from a broken stage: either a one-run fixed point, or a
-  # residual STRICTLY SMALLER than what the first run already repaired -- a
-  # stage that stalled or grew its own residual would fail here.
-  local check_out="$T/${name}_recheck.out"
-  local check_exit=0
+  # Both halves of that used to fail on SFHo (CODE.md "DD2 / SFHo empirical
+  # findings"). Its causal-cap stage was cut off mid-descent by a fixed
+  # 8-round budget and needed four chained runs to converge, and the chaining
+  # itself was impossible anyway -- eos_repair refused to append a second
+  # "/repair" group to an already-repaired file and exited 2, after writing
+  # the output, even when the run had found nothing to change. M3j made the
+  # stage run while it improves (so one run converges) and made a re-repair a
+  # first-class operation (a run that changes nothing records nothing; a run
+  # that changes something appends "/repair_2"). A regression in either shows
+  # up here as a nonzero exit.
+  local rerep="$T/${name}_rep2.h5"
+  local recheck_out="$T/${name}_recheck.out"
+  local recheck_exit=0
   set +e
-  "$REPAIR" --check-only "$rep" >"$check_out"
-  check_exit=$?
+  "$REPAIR" "$rep" "$rerep" >"$recheck_out"
+  recheck_exit=$?
   set -e
-  if [ "$check_exit" -eq 0 ]; then
-    echo "PASS: eos_repair --check-only $name is a one-run fixed point (exit 0)"
-  elif [ "$check_exit" -eq 1 ]; then
-    local residual first_pass
-    residual=$( (grep -oE 'would repair [0-9]+' "$check_out" || true) | grep -oE '[0-9]+' | head -1)
-    first_pass=$( (grep -oE '[0-9]+ value\(s\) changed' "$repair_out" || true) | grep -oE '^[0-9]+' |
-      sort -rn | head -1)
-    if [ -n "$residual" ] && [ -n "$first_pass" ] && [ "$residual" -lt "$first_pass" ]; then
-      echo "PASS: eos_repair $name is not a one-run fixed point, but its residual is shrinking" \
-        "($residual value(s) left against $first_pass repaired in the first pass -- see this" \
-        "function's idempotence comment)"
-    else
-      echo "FAIL: eos_repair $name left a residual that is not shrinking" \
-        "(residual=${residual:-?} first_pass=${first_pass:-?}); see $check_out"
-      exit 1
-    fi
+  if [ "$recheck_exit" -eq 0 ] && grep -q "no new provenance group" "$recheck_out"; then
+    echo "PASS: eos_repair $name is a one-run fixed point (re-repair: exit 0, no changes," \
+      "no new provenance group)"
   else
-    echo "FAIL: eos_repair --check-only $name exited $check_exit (expected 0 or 1)"
+    echo "FAIL: re-repairing $name exited $recheck_exit (expected 0, zero changes). A residual" \
+      "here means the causal-cap loop stopped before it had converged -- check whether it hit" \
+      "RepairOptions::causal_rounds_max (the runaway backstop, not a working budget: see the" \
+      "'causal-cap: round..._violations=' progress line in $recheck_out)."
+    cat "$recheck_out"
     exit 1
   fi
+  # The group layout that goes with it: the raw tables carry no repair group,
+  # so the first run writes "/repair" and the second must inherit that one and
+  # add none. Best-effort, as in Part A's step 6c.
+  if command -v h5ls >/dev/null 2>&1; then
+    local n_groups
+    n_groups=$(h5ls "$rerep" | grep -cE '^repair(_[0-9]+)?[[:space:]]+Group' || true)
+    if [ "$n_groups" -eq 1 ]; then
+      echo "PASS: re-repaired $name carries exactly one (inherited) repair group"
+    else
+      echo "FAIL: re-repaired $name has $n_groups repair groups (expected 1)"
+      exit 1
+    fi
+  fi
+  rm -f "$rerep" # a full-size copy of a multi-hundred-MB table; nothing below reads it
 
   local rep_report="$T/${name}_rep.report.txt"
   local rep_test_exit=0

@@ -552,7 +552,12 @@ TEST_CASE("append_repair_group: empty result writes n_modified=0 and no entry da
   CHECK(read_string_attr(group.get(), "input_path") == "clean_input.h5");
 }
 
-TEST_CASE("append_repair_group: a second call on the same file throws") {
+TEST_CASE("append_repair_group: further calls number the group instead of colliding") {
+  // M3j: repairing an already-repaired table is a supported operation, and
+  // its output inherits the input's provenance group through the writer's
+  // passthrough copy (see the next test), so the second run must be able to
+  // record itself. It does so under the first free "repair_N" name, leaving
+  // every earlier group exactly as written.
   SyntheticOptions opts;
   opts.nrho = 3;
   opts.ntemp = 3;
@@ -563,9 +568,81 @@ TEST_CASE("append_repair_group: a second call on the same file throws") {
 
   RepairResult empty_result;
   RepairOptions options;
-  eeos::append_repair_group(path, empty_result, options, "in.h5", 1ULL, "v1");
-  CHECK_THROWS_AS(eeos::append_repair_group(path, empty_result, options, "in.h5", 1ULL, "v1"),
-                  std::runtime_error);
+  CHECK(eeos::append_repair_group(path, empty_result, options, "in.h5", 1ULL, "v1") == "repair");
+  CHECK(eeos::append_repair_group(path, empty_result, options, "step2.h5", 2ULL, "v2") ==
+        "repair_2");
+  CHECK(eeos::append_repair_group(path, empty_result, options, "step3.h5", 3ULL, "v3") ==
+        "repair_3");
+
+  // Each group keeps its OWN run's fingerprint and input path: that is what
+  // makes the chain auditable rather than merely non-colliding.
+  H5Guard file(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
+  REQUIRE(file.valid());
+  const char *const names[3] = {"repair", "repair_2", "repair_3"};
+  const char *const inputs[3] = {"in.h5", "step2.h5", "step3.h5"};
+  for (int i = 0; i < 3; ++i) {
+    H5Guard group(H5Gopen(file.get(), names[i], H5P_DEFAULT), H5Gclose);
+    REQUIRE(group.valid());
+    CHECK(read_uint64_attr(group.get(), "input_fnv1a") ==
+          static_cast<std::uint64_t>(i) + 1ULL);
+    CHECK(read_string_attr(group.get(), "input_path") == inputs[i]);
+  }
+}
+
+TEST_CASE("write_stellarcollapse (with source): a repair group survives passthrough, and the "
+          "next append numbers itself") {
+  // The full re-repair chain at library level, which is exactly what
+  // `eos_repair repaired.h5 out.h5` does: repair #1 writes "repair" into
+  // step1.h5; the second run copies step1.h5 -> step2.h5 (the group rides
+  // along in the passthrough, since read_stellarcollapse() never surfaces it
+  // as a field) and appends its own group, which must therefore be
+  // "repair_2" and must record step1.h5's OWN checksum -- the intermediate
+  // file it consumed, not the original input's.
+  SyntheticOptions opts;
+  opts.nrho = 4;
+  opts.ntemp = 4;
+  opts.nye = 2;
+  RawTable t = eeos::make_synthetic_table(opts);
+
+  const std::string step1 = scratch_path("chain_step1.h5");
+  eeos::write_stellarcollapse(step1, t);
+  RepairResult first;
+  first.status = eeos::Status::repaired;
+  first.entries = {RepairEntry{"logenergy", 1, 1, 0, 18.0, 18.5}};
+  RepairOptions options;
+  CHECK(eeos::append_repair_group(step1, first, options, "raw.h5", 111ULL, "v1") == "repair");
+
+  RawTable reread = eeos::read_stellarcollapse(step1);
+  CHECK_FALSE(reread.has_field("repair"));
+
+  const std::string step2 = scratch_path("chain_step2.h5");
+  eeos::write_stellarcollapse(step2, reread, step1);
+
+  const unsigned long long step1_fnv1a = eeos::fnv1a_file(step1);
+  RepairResult second;
+  second.status = eeos::Status::repaired;
+  second.entries = {RepairEntry{"logenergy", 2, 2, 1, 18.25, 18.75}};
+  CHECK(eeos::append_repair_group(step2, second, options, step1, step1_fnv1a, "v2") == "repair_2");
+
+  H5Guard file(H5Fopen(step2.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
+  REQUIRE(file.valid());
+
+  // The inherited group came through intact: same input path, same checksum,
+  // same entry as run #1 wrote into step1.h5.
+  H5Guard inherited(H5Gopen(file.get(), "repair", H5P_DEFAULT), H5Gclose);
+  REQUIRE(inherited.valid());
+  CHECK(read_string_attr(inherited.get(), "input_path") == "raw.h5");
+  CHECK(read_uint64_attr(inherited.get(), "input_fnv1a") == 111ULL);
+  CHECK(read_uint64_attr(inherited.get(), "n_modified") == 1);
+  CHECK(read_1d_uint_dataset(inherited.get(), "irho") == std::vector<unsigned>{1});
+
+  // The new group records this run, against the intermediate file.
+  H5Guard appended(H5Gopen(file.get(), "repair_2", H5P_DEFAULT), H5Gclose);
+  REQUIRE(appended.valid());
+  CHECK(read_string_attr(appended.get(), "input_path") == step1);
+  CHECK(read_uint64_attr(appended.get(), "input_fnv1a") == step1_fnv1a);
+  CHECK(read_uint64_attr(appended.get(), "n_modified") == 1);
+  CHECK(read_1d_uint_dataset(appended.get(), "irho") == std::vector<unsigned>{2});
 }
 
 // --- (4) fnv1a_file: known-answer tests -------------------------------------

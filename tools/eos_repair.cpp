@@ -3,9 +3,16 @@
 // A thin main() over entropy_eos: reads a stellarcollapse-format table,
 // checks it (check_table), repairs it in memory (repair_table), and either
 // reports what would change (--check-only) or writes a repaired copy plus a
-// "/repair" provenance group and an optional human-readable log. No physics
+// repair-provenance group and an optional human-readable log. No physics
 // or table logic lives here -- see entropy_eos/host/{check,repair}.hpp for
 // that.
+//
+// Re-repairing an output of this tool is a supported, first-class operation
+// (M3j): OUT.h5 inherits IN.h5's repair group through the writer's
+// passthrough copy, so a second run appends "/repair_2" if it finds anything
+// to change and appends nothing at all -- exit 0 -- if it does not. Running
+//   eos_repair repaired.h5 out.h5
+// is therefore the idempotence check for a repaired table.
 //
 //   eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]
 //              [--no-spline-safe] [--no-spline-safe-3d]
@@ -15,7 +22,8 @@
 //              [--no-causal-cap] [--cs2-cap X]
 //   eos_repair --version
 //
-// Exit codes: 0 = already clean, 1 = repaired (or would repair, under
+// Exit codes: 0 = already clean (which includes re-repairing an
+// already-repaired table), 1 = repaired (or would repair, under
 // --check-only), 2 = fatal structural problem or other runtime error,
 // 64 = usage error.
 
@@ -88,7 +96,17 @@ void print_usage(std::ostream &os) {
         "positional arguments:\n"
         "  IN.h5               input table (stellarcollapse.org / O'Connor-Ott\n"
         "                      HDF5 layout); never modified\n"
-        "  OUT.h5              repaired output table; must differ from IN.h5\n"
+        "  OUT.h5              repaired output table; must differ from IN.h5.\n"
+        "                      Written as a faithful copy of IN.h5 with the\n"
+        "                      repaired fields replaced. A run that changed\n"
+        "                      something appends a repair-provenance group,\n"
+        "                      named \"/repair\" or -- when IN.h5 already carried\n"
+        "                      one, i.e. when re-repairing -- \"/repair_2\",\n"
+        "                      \"/repair_3\", ..., so the chain stays auditable\n"
+        "                      through each group's own input checksum. A run\n"
+        "                      that changed nothing appends no group: OUT.h5 is\n"
+        "                      then a byte-faithful copy carrying IN.h5's own\n"
+        "                      provenance, and the exit code is 0.\n"
         "\n"
         "options:\n"
         "  --check-only        report what would be repaired; write nothing\n"
@@ -118,7 +136,9 @@ void print_usage(std::ostream &os) {
         "  -h, --help          print this message\n"
         "\n"
         "exit codes:\n"
-        "  0   table already satisfied monotonicity (no changes needed/made)\n"
+        "  0   table already satisfied the requirements (no changes needed/made) --\n"
+        "      including the re-repair case, where IN.h5 is itself an eos_repair\n"
+        "      output and this run found nothing left to do\n"
         "  1   one or more values were repaired (or would be, under --check-only)\n"
         "  2   fatal structural problem in IN.h5, or another runtime error (see stderr)\n"
         "  64  usage error\n";
@@ -405,9 +425,26 @@ int main(int argc, char **argv) {
 
     eeos::write_stellarcollapse(out_path, table, in_path);
     const unsigned long long input_fnv1a = eeos::fnv1a_file(in_path);
-    eeos::append_repair_group(out_path, result, repair_opts, in_path, input_fnv1a, kToolVersion);
 
-    std::cout << "eos_repair: wrote '" << out_path << "'\n";
+    // A run that changed nothing records nothing (M3j). OUT.h5 is already a
+    // faithful copy of IN.h5 -- including whatever repair group IN.h5 itself
+    // carried, which write_stellarcollapse() passes straight through -- and
+    // an empty group would add a provenance entry saying only "somebody ran
+    // eos_repair and it did nothing". Skipping it is what makes
+    //   eos_repair repaired.h5 out.h5
+    // the natural idempotence check: exit 0, output byte-faithful, the
+    // original /repair group still the only one in the file. A run that DID
+    // change something appends its own group, numbered ("/repair_2",
+    // "/repair_3", ...) when the input already carried one, so a chain of
+    // repairs stays auditable through each group's own input_fnv1a.
+    if (result.entries.empty()) {
+      std::cout << "eos_repair: wrote '" << out_path << "' (no changes; no new provenance group)\n";
+    } else {
+      const std::string group_name = eeos::append_repair_group(out_path, result, repair_opts,
+                                                                in_path, input_fnv1a, kToolVersion);
+      std::cout << "eos_repair: wrote '" << out_path << "' (provenance group '/" << group_name
+                << "')\n";
+    }
     result.print(std::cout);
 
     if (pa.have_log) {

@@ -88,10 +88,25 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table,
 // path_out can't be created, or if any write fails.
 void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 
-// Appends a "/repair" group (must not already exist) to the existing file at
-// `path`, recording the outcome of a repair_table() run for provenance:
+// Appends a repair-provenance group to the existing file at `path`,
+// recording the outcome of a repair_table() run, and returns the name of the
+// group it created (without a leading '/').
+//
+// The group is "repair" on a file that has none, and otherwise "repair_N"
+// for the first free N >= 2 -- "repair_2", "repair_3", ... (M3j). A file can
+// legitimately arrive here already carrying one: write_stellarcollapse()'s
+// (path_out, table, path_in) overload passes every non-field object of
+// path_in straight through, an existing "/repair" group included, so
+// repairing an already-repaired table produces an output that inherits its
+// input's provenance. Numbering rather than overwriting or refusing keeps
+// the whole chain auditable -- each group's own "input_fnv1a" identifies the
+// exact file that group's run consumed, so the groups read in order as the
+// history of the table. Nothing is ever overwritten, and no group is ever
+// modified after it is written.
+//
+// Contents (identical for every group in the chain):
 //   - if result.entries is non-empty, five parallel datasets of that length
-//     under /repair: "irho"/"jT"/"kYe" (unsigned), "old_value"/"new_value"
+//     under the group: "irho"/"jT"/"kYe" (unsigned), "old_value"/"new_value"
 //     (double), plus "field" -- a fixed-length (32-byte, NUL-padded) string
 //     dataset naming the field of each entry (chosen over an index into a
 //     separate name-list dataset: with only ever "entropy"/"logenergy" in
@@ -101,7 +116,7 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //   - if result.entries is empty, none of the above five datasets are
 //     created at all -- just the group and its attributes, with
 //     n_modified == 0;
-//   - scalar attributes on the /repair group (always written): the two
+//   - scalar attributes on the group (always written): the two
 //     min-slope options used ("min_slope_entropy"/"min_slope_logenergy",
 //     double), the M3f causal-cap stage's parameters and headline outcome
 //     ("causal_cap" 0/1, "cs2_max"/"cs2_cap" double, "causal_rounds_max"/
@@ -111,11 +126,13 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //     (fixed-length string datasets -- sic, see the .cpp: HDF5 *attributes*
 //     here, not top-level datasets), "input_fnv1a" (uint64_t) and
 //     "n_modified" (uint64_t).
-// Throws std::runtime_error if `path` can't be opened for writing, already
-// has a "/repair" group, or any write fails.
-void append_repair_group(const std::string &path, const RepairResult &result,
-                          const RepairOptions &options, const std::string &input_path,
-                          unsigned long long input_fnv1a, const std::string &tool_version);
+// Throws std::runtime_error if `path` can't be opened for writing, if the
+// file already holds the full run of 1000 groups so there is no free name
+// left (a runaway guard; no real repair chain comes near it), or if any
+// write fails.
+std::string append_repair_group(const std::string &path, const RepairResult &result,
+                                 const RepairOptions &options, const std::string &input_path,
+                                 unsigned long long input_fnv1a, const std::string &tool_version);
 
 // Streaming 64-bit FNV-1a hash of a file's raw bytes: a dependency-free
 // provenance fingerprint recorded by append_repair_group() (via
