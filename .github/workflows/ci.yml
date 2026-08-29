@@ -10,6 +10,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # M4 (eos-device-interface.md S5): mirror_hip.hpp ships compile-untested
+      # (no AMD runner), so CI enforces the property its trustworthiness rests
+      # on -- it must be the mechanical s/cuda/hip/ rename of the CUDA mirror
+      # the H200 runs validate. Pure text; no GPU toolchain involved.
+      - name: Device mirror parallelism check
+        run: ./tests/check_mirror_parallel.sh
+
       - name: Install HDF5
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
 

@@ -508,6 +508,58 @@ write `#include <entropy_eos/entropy_eos.hpp>` either way. The build is delibera
 plain C++17 with no cmake or configure step. OpenMP is opt-in (`make OPENMP=-fopenmp`)
 and the code compiles and runs serially without it.
 
+## GPUs: CUDA, AMD (HIP), and Intel (SYCL)
+
+`entropy_eos/core/` compiles unchanged under `nvcc`, `hipcc`, and `icpx -fsycl` — it is
+header-only with no STL containers, exceptions, allocation, or virtual functions, and
+every function is host/device-annotated. The same `evaluate()` / `prim2con()` /
+`con2prim()` / `con2prim_safe()` calls shown above run inside a GPU kernel; the design
+and its measured validation live in [`eos-device-interface.md`](eos-device-interface.md).
+
+Everything the device needs is one `EntropyEOSView` — two coefficient arrays plus
+scalars. Mirror it with **any** framework's allocator (Kokkos, RAJA, AMReX, raw runtime):
+
+```c++
+double *sigma_d = my_device_upload(eos.sigma_coeffs());  // caller-owned device copies
+double *L_d     = my_device_upload(eos.L_coeffs());
+const eeos::EntropyEOSView dview = eos.view_with(sigma_d, L_d);
+// pass dview BY VALUE into kernels; call core/ functions on it as on the host
+```
+
+or use the opt-in RAII mirrors in `entropy_eos/device/` (header-only, never required):
+
+```c++
+#include <entropy_eos/device/mirror_cuda.hpp>   // or mirror_hip.hpp / mirror_sycl.hpp
+
+__global__ void solve(eeos::EntropyEOSView eos, const eeos::Con2PrimIn *in,
+                      eeos::Con2PrimOptions opts, eeos::Con2PrimOut *out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = eeos::con2prim(eos, in[i], opts);
+}
+
+const eeos::CudaEntropyEOS mirror(eos);          // uploads the two arrays (~30 MB)
+solve<<<grid, block>>>(mirror.view(), in_d, opts, out_d, n);
+```
+
+Build example (the `--expt-relaxed-constexpr` flag is required; **fast-math is
+forbidden** — `core/`'s NaN/finiteness probes are constant-folded to the wrong answer
+under `--use_fast_math`/`-ffast-math`):
+
+```bash
+make tests/test_device_cuda NVCC=/usr/local/cuda/bin/nvcc GPU_ARCH=sm_90
+./tests/test_device_cuda      # on a GPU node; --table LS220.h5 with the _hdf5 variant
+```
+
+Measured on an NVIDIA H200 (2²⁰ states, repaired LS220 / real-table-scale synthetic
+gas; details in `CODE.md` under M4c): warm-started `con2prim` at **529 / 261 M
+solves/s** (≈660× one CPU core), `evaluate` at 381 / 509 M/s, cold-start `con2prim` at
+0.6 / 2.8 M/s (the divergent fallback ladder — batch cold starts are for initial data,
+not per-step use), with warm round trips at machine precision and the cold failure rate
+statistically identical to the CPU's. CUDA is the tested backend; the HIP mirror is a
+CI-enforced mechanical rename of the CUDA one and the SYCL backend adds no device code
+at all (header-inline `core/` needs no annotations under SYCL), but neither has run on
+vendor hardware yet — reports welcome.
+
 ## Status and testing
 
 This is version **1.0.0**. The version is available to consumers as
@@ -522,9 +574,11 @@ archive against the headers it is being compiled against, and every tool answers
 what it means for computed numbers, which are pinned by table provenance rather than by
 the release number — is written up in [`CODE.md`](CODE.md) under "Versioning".
 
-The table layer, the adapter, and the solver with its invalid-state policies are
-complete and measured; the remaining milestone is the CUDA port, for which `core/` is
-already written but not yet compiled under `nvcc`. Correctness rests on three
+The table layer, the adapter, the solver with its invalid-state policies, and the
+device interface (M4: CUDA validated on an H200; HIP and SYCL provided,
+compile-untested until a first user report) are complete and measured; the deferred
+follow-ups — fixed-iteration solver variants, `float` evaluation, NQT logarithms — are
+listed with their seams in `eos-device-interface.md` §8. Correctness rests on three
 independent legs: unit tests against a manufactured analytic EOS with known closed-form
 answers, a deterministic "dirty" synthetic preset that reproduces the pathologies found
 in the real tables so the whole detect-repair-audit narrative runs in CI, and

@@ -268,5 +268,25 @@ The `.cu` extension keeps it invisible to the `tests/test_*.cpp` wildcard, so
 
 ## 9. Implemented — measured results
 
-*(appended per sub-stage as M4a–M4d land; see CODE.md "Milestones" for the
-running record)*
+**Implemented 2026-08-28/29 (M4a–M4d)** — the full numbers live in CODE.md's
+"Milestones" M4 entry; the abbreviated record:
+
+- **M4a:** `core/` compiled under nvcc 13.2 *unchanged on the first try* — no
+  std-math shims; `--expt-relaxed-constexpr` was indeed the one flag needed
+  (§3's prediction held). 1-state end-to-end on the H200 matches the CPU to
+  ≤ 2.3e-14 relative.
+- **M4b:** `view_with()` over host-side copies of the blobs is bit-identical
+  in use (6,956/6,956 assertions, in CI).
+- **M4c:** H200, 2²⁰ states, synthetic + repaired LS220, all gates PASS. Warm
+  con2prim 529 / 261 M solves/s (LS220 / synthetic; ≈660× one CPU core),
+  evaluate 381 / 509 M/s, cold con2prim 0.6 / 2.8 M/s — the warp-divergent
+  fallback ladder, quantifying §8's deferred fixed-trip stage. Warm round
+  trips at machine precision; cold failure totals statistically identical to
+  the CPU's (3608 vs 3591 per 2²⁰ under extreme sampling). One design change
+  against §6 as first written: the gates became *statistical* (GPU held to the
+  CPU's own failure rate and round-trip distribution) — boundary states of the
+  solver's failure tail flip in both directions under ULP-level libm
+  differences, so a per-state parity gate is wrong by construction.
+- **M4d:** the HIP rename check runs in CI; kernels sit at 168 (evaluate) and
+  255 + 2.5–4.4 KB stack (con2prim) registers per thread — recorded, not
+  tuned (§7).

@@ -1231,6 +1231,15 @@ axis, one axis over.
     99.8%. Kernels: evaluate 168 registers; the con2prim kernels sit at the 255-register
     cap with 2.5–4.4 KB stack/thread (the solver's locals + the two 33-slot scan
     arrays) — occupancy is the consumer's `__launch_bounds__` knob; recorded, not tuned.
+  - **M4d:** ✅ the untested-backend pair (design doc §5): `device/mirror_hip.hpp` — the
+    mechanical `s/cuda/hip/` rename of the H200-tested CUDA mirror, enforced by
+    `tests/check_mirror_parallel.sh` in CI (pure text: comments stripped, include path
+    mapped, rename applied, diff must be empty) — and `device/mirror_sycl.hpp`
+    (queue-carrying constructor; the *whole* SYCL backend, since header-inline `core/`
+    needs no annotations under SYCL). Both marked compile-untested in README until a
+    first user report. M4 complete; the fixed-iteration variants stay deferred with
+    their seams documented (design doc §8), now with the M4c cold/warm split as the
+    motivating measurement.
 
 ## Open decisions
 
