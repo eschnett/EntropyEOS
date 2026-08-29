@@ -124,8 +124,8 @@ meaningless. Instead:
    `Milestones` entry (with what the release contains), and README's
    "Status and testing".
 3. `make test && make integration` (the latter with the real tables present locally).
-   The Makefile tracks no header dependencies, so build from clean — a stale
-   `version.o` or tool binary otherwise reports the previous release.
+   (The Makefile tracks header dependencies coarsely — every binary depends on every
+   header — so the version bump itself forces the rebuild; no `make clean` needed.)
 4. Commit on `main`. No git tags — the branch history and `core/version.hpp` are the
    record.
 

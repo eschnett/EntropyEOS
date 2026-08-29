@@ -5,6 +5,15 @@
 # (bspline_fit, adapter_build, io_stellarcollapse, ...) need no edits here —
 # dropping a new entropy_eos/host/*.cpp or tests/test_*.cpp file is enough.
 #
+# Header dependencies are tracked manually and coarsely: every object and
+# binary depends on $(HDRS), i.e. on ALL headers (wildcard-gathered, so a new
+# header needs no edit here either). A header edit therefore rebuilds
+# everything — deliberate: a full build costs well under a minute, per-file
+# dependency lists rot silently, and generated .d files are more machinery
+# than this build wants. What this buys is that a stale binary can never
+# survive a header change (found the hard way: a version.hpp bump left
+# `eos_test --version` reporting the previous release until `make clean`).
+#
 # The documented manual compile line (no Makefile at all) must always work,
 # e.g.:
 #   c++ -O2 -std=c++17 -fopenmp -I. entropy_eos/host/*.cpp tools/eos_repair.cpp -lhdf5 -o eos_repair
@@ -49,6 +58,12 @@ TEST_BINS = $(TEST_SRCS:.cpp=)
 TOOL_SRCS = $(wildcard tools/*.cpp)
 TOOL_BINS = $(TOOL_SRCS:.cpp=)
 
+# Every header anything might include (see the module comment): the umbrella
+# header, core/, host/, the opt-in device/ mirrors, and the tests' own
+# headers (doctest.h, test_scale.hpp).
+HDRS = $(wildcard entropy_eos/*.hpp entropy_eos/core/*.hpp entropy_eos/host/*.hpp \
+	entropy_eos/device/*.hpp tests/*.hpp tests/*.h)
+
 .PHONY: all lib test tools integration install clean san-fixture
 
 all: lib
@@ -58,12 +73,12 @@ lib: $(LIB)
 $(LIB): $(HOST_OBJS)
 	$(AR) rcs $@ $^
 
-%.o: %.cpp
+%.o: %.cpp $(HDRS)
 	$(CXX) $(ALL_CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 # Each tests/test_*.cpp builds into its own self-contained binary (it defines
 # DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN) linked against the static lib.
-tests/test_%: tests/test_%.cpp $(LIB)
+tests/test_%: tests/test_%.cpp $(LIB) $(HDRS)
 	$(CXX) $(ALL_CXXFLAGS) $(CPPFLAGS) -o $@ $< $(LIB) $(LDFLAGS)
 
 test: $(TEST_BINS)
@@ -71,7 +86,7 @@ test: $(TEST_BINS)
 
 # Each tools/*.cpp is a thin main() over the static lib (CODE.md: "no physics
 # or table logic in the tools"), built the same way as a test binary.
-tools/%: tools/%.cpp $(LIB)
+tools/%: tools/%.cpp $(LIB) $(HDRS)
 	$(CXX) $(ALL_CXXFLAGS) $(CPPFLAGS) -o $@ $< $(LIB) $(LDFLAGS)
 
 tools: $(TOOL_BINS)
@@ -112,8 +127,10 @@ NVCCFLAGS ?= -O2 -g -std=c++17 -arch=$(GPU_ARCH) --expt-relaxed-constexpr
 DEVICE_TEST_HOST_SRCS = entropy_eos/host/table.cpp entropy_eos/host/synthetic.cpp \
 	entropy_eos/host/bspline_fit.cpp entropy_eos/host/adapter_build.cpp
 
-tests/test_device_cuda: tests/test_device_cuda.cu $(DEVICE_TEST_HOST_SRCS)
-	$(NVCC) $(NVCCFLAGS) -I. -o $@ $^
+# ($(HDRS) is a dependency, not an input: the recipe names its sources
+# explicitly rather than using $^, which would hand the headers to nvcc.)
+tests/test_device_cuda: tests/test_device_cuda.cu $(DEVICE_TEST_HOST_SRCS) $(HDRS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< $(DEVICE_TEST_HOST_SRCS)
 
 .PHONY: gpu-test
 gpu-test: tests/test_device_cuda
@@ -129,8 +146,9 @@ gpu-test: tests/test_device_cuda
 DEVICE_TEST_HDF5_SRCS = $(DEVICE_TEST_HOST_SRCS) entropy_eos/host/io_stellarcollapse.cpp \
 	entropy_eos/host/check.cpp entropy_eos/host/repair.cpp
 
-tests/test_device_cuda_hdf5: tests/test_device_cuda.cu $(DEVICE_TEST_HDF5_SRCS)
-	$(NVCC) $(NVCCFLAGS) -DEEOS_GPU_TEST_HDF5 -I. $(HDF5_INC) -o $@ $^ $(HDF5_LIB)
+tests/test_device_cuda_hdf5: tests/test_device_cuda.cu $(DEVICE_TEST_HDF5_SRCS) $(HDRS)
+	$(NVCC) $(NVCCFLAGS) -DEEOS_GPU_TEST_HDF5 -I. $(HDF5_INC) -o $@ $< \
+		$(DEVICE_TEST_HDF5_SRCS) $(HDF5_LIB)
 
 install: lib
 	mkdir -p $(PREFIX)/lib $(PREFIX)/include/entropy_eos
@@ -139,4 +157,5 @@ install: lib
 	cp $(LIB) $(PREFIX)/lib/
 
 clean:
-	rm -f $(HOST_OBJS) $(LIB) $(TEST_BINS) $(TOOL_BINS) tests/test_device_cuda
+	rm -f $(HOST_OBJS) $(LIB) $(TEST_BINS) $(TOOL_BINS) \
+		tests/test_device_cuda tests/test_device_cuda_hdf5
