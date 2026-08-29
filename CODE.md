@@ -37,9 +37,9 @@ its §10 audit list and §11 API are implemented here). Items marked **[decide]*
 
 ## Versioning
 
-Semantic versioning, recorded in the source and mirrored by a git tag. **1.0.0** is the
-first release: M1–M3 complete and measured (see "Milestones"), the API below stable
-under the contract in this section, M4 (CUDA) additive on top of it.
+Semantic versioning, recorded in the source; the `main` branch carries the history (no
+git tags). **1.0.0** is the first release: M1–M4 complete and measured (see
+"Milestones"), the API below stable under the contract in this section.
 
 ### Mechanism
 
@@ -82,8 +82,8 @@ Two things sit on top of it:
 
 Deliberately *not* done, consistent with "no cmake/configure/autodetection": nothing is
 generated at build time from git, and no `version.hpp.in` is templated by a configure
-step. The header is the truth and the tag mirrors it, not the reverse — which also keeps
-mode (a) honest, since a copied source tree has no git history of ours to interrogate.
+step. The header is the truth — which also keeps mode (a) honest, since a copied source
+tree has no git history of ours to interrogate.
 
 ### What a bump means
 
@@ -124,7 +124,10 @@ meaningless. Instead:
    `Milestones` entry (with what the release contains), and README's
    "Status and testing".
 3. `make test && make integration` (the latter with the real tables present locally).
-4. Commit, then `git tag -a v1.0.0 -m 'entropy_eos 1.0.0'`.
+   The Makefile tracks no header dependencies, so build from clean — a stale
+   `version.o` or tool binary otherwise reports the previous release.
+4. Commit on `main`. No git tags — the branch history and `core/version.hpp` are the
+   record.
 
 ## Layout
 
@@ -1075,8 +1078,8 @@ axis, one axis over.
 
 ## Milestones
 
-- **1.0.0** — tagged after M3i, August 28, 2026: M1–M3 complete and measured, the
-  API stable under the contract in "Versioning", M4 additive on top of it.
+- **1.0.0** — the first release, with M4, August 29, 2026: M1–M4 complete and
+  measured, the API stable under the contract in "Versioning".
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,
   `io_stellarcollapse`, `check`, `repair`; tools `eos_repair` and
   `eos_test --level table`; unit tests. Acceptance: clean runs and repair reports on
