@@ -38,8 +38,9 @@ its §10 audit list and §11 API are implemented here). Items marked **[decide]*
 ## Versioning
 
 Semantic versioning, recorded in the source; the `main` branch carries the history (no
-git tags). **1.0.0** is the first release: M1–M4 complete and measured (see
-"Milestones"), the API below stable under the contract in this section.
+git tags). **1.0.0** was the first release: M1–M4 complete and measured (see
+"Milestones"), the API below stable under the contract in this section. The current
+version is **1.1.0**.
 
 ### Mechanism
 
@@ -52,7 +53,7 @@ derived from them:
   `EEOS_VERSION_ENCODE(maj, min, pat)`, so a consumer can guard a feature with
   `#if EEOS_VERSION >= EEOS_VERSION_ENCODE(1, 1, 0)`. This is the piece a plain
   `#define EEOS_VERSION "1.0.0"` cannot give: string literals do not compare.
-- `EEOS_VERSION_STRING` — `"1.0.0"`, *stringified from the numbers*, not spelled out
+- `EEOS_VERSION_STRING` — e.g. `"1.1.0"`, *stringified from the numbers*, not spelled out
   again, so it cannot drift out of sync.
 - `eeos::version{,_major,_minor,_patch,_string}` — the same values as `constexpr`, for
   `static_assert`, templates, and device code that would rather not use the
@@ -70,7 +71,7 @@ Two things sit on top of it:
   (b) (`make install PREFIX=…`, see "Environment"), where headers and the archive are two
   separately installed artifacts and a stale archive under an updated include tree links
   silently. Mode (a) (copied source) cannot drift and pays nothing for the check. The
-  archive also carries an `@(#)entropy_eos-1.0.0` ident string, so
+  archive also carries an `@(#)entropy_eos-1.1.0` ident string, so
   `strings libentropy_eos.a | grep entropy_eos-` identifies a binary whose provenance is
   otherwise lost.
 - `--version` on every tool (`eos_repair`, `eos_test`, `eos_crop`), answered before
@@ -1078,6 +1079,25 @@ axis, one axis over.
 
 ## Milestones
 
+- **1.1.0** — October 21, 2026: the s-floor branch of `con2prim_safe()` reports its
+  own clamps. It clamped w into [0, w_cap] and rho into [rho_atm, rho_ceiling] without a
+  flag, because the projection that follows finds the clamped state in range; a caller
+  saw only `flag_pol_s_floored`. Found in TreeGRRMHD, which must put a point at rest
+  whenever a repair adds rest mass. The density flag is split as the entropy flag
+  already was: bit 13, which only the ceiling ever set, is now `flag_pol_rho_ceiled`;
+  the new `flag_pol_rho_floored` is bit 16 (8–15 were full, 6–7 stay reserved for solver
+  flags) and means rho·cosh(w) > D, i.e. rest mass and momentum were added; and
+  `flag_pol_rho_clamped` is now the mask of both, which is what its comment always said
+  it meant. `flag_pol_any` grows from 0xff00 to 0x1ff00; the branch also sets
+  `flag_pol_w_capped`. MINOR rather than MAJOR because bit 13's value and meaning are
+  unchanged and `flags & flag_pol_rho_clamped` keeps its documented meaning; code that
+  compares a flag word with `==` against `flag_pol_rho_clamped` must switch to
+  `flag_pol_rho_ceiled`. No numbers move: returned states are bitwise unchanged
+  (measured on 800 states through this branch in the Julia port, which received the
+  same change); only the flags differ. On those states 115/400 thin ones had rho raised,
+  79 had w capped, and 209/400 dense ones under a low ceiling had rho lowered. The
+  `eos_test` con2prim report's per-flag counts gain `rho_floored` (and print
+  `rho_ceiled` for bit 13). Putting such a point at rest is left to the caller.
 - **1.0.0** — the first release, with M4, August 29, 2026: M1–M4 complete and
   measured, the API stable under the contract in "Versioning".
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,

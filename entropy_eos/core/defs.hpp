@@ -52,11 +52,12 @@ constexpr unsigned flag_maxiter = 1u << 5;       // inner (T-)solve hit the iter
 // con2prim-entropy-rapidity.md S11). These describe what the POLICY LAYER did
 // to a state, never what the EOS evaluation found -- a caller can therefore
 // separate "the table extension was used" (bits 0-5 above) from "the state was
-// repaired/excised" (bits 8-15) by masking. All of them are set on
+// repaired/excised" (bits 8-16) by masking. All of them are set on
 // Con2PrimSafeOut::policy_flags, whose value 0 means "the input was already
 // policy-valid and the output conservatives are the input, bit-identically".
 //
-// Bits 8-15 (contiguous group, see flag_pol_any below):
+// Bits 8-16 (contiguous group, see flag_pol_any below; bit 16 was added in
+// 1.1.0, after 8-15 had filled up):
 constexpr unsigned flag_pol_atmosphere = 1u << 8;   // the whole state was replaced by the atmosphere
                                                     // (hydro excision: rho = rho_atm, s = s_atm, v = 0,
                                                     // Ye per policy, B^2 passed through)
@@ -69,18 +70,27 @@ constexpr unsigned flag_pol_s_floored = 1u << 10;   // s was raised to the PHYSI
                                                     // (also: tau below the coldest compatible value)
 constexpr unsigned flag_pol_s_ceiled = 1u << 11;    // s was lowered to the PHYSICAL srange(rho,Ye).s_max
 constexpr unsigned flag_pol_w_capped = 1u << 12;    // rapidity was clamped into [0, w_cap] (either end)
-constexpr unsigned flag_pol_rho_clamped = 1u << 13; // rho was clamped into [rho_atm, rho_ceiling] without
-                                                    // a full atmosphere reset (in practice: the ceiling
-                                                    // side; see core/state_policy.hpp)
+constexpr unsigned flag_pol_rho_ceiled = 1u << 13;  // rho was lowered to rho_ceiling without a full
+                                                    // atmosphere reset: rest mass was removed
 constexpr unsigned flag_pol_ye_clamped = 1u << 14;  // Ye was clamped into the table's [y_lo, y_hi]
 constexpr unsigned flag_pol_nonfinite = 1u << 15;   // a non-finite (or D <= 0) input was seen; the state
                                                     // was excised to atmosphere (flag_pol_atmosphere too)
+constexpr unsigned flag_pol_rho_floored = 1u << 16; // rho was raised to rho_atm without a full
+                                                    // atmosphere reset: rho*cosh(w) > D, so rest mass
+                                                    // (and momentum) was added. The s-floor branch of
+                                                    // con2prim_safe() is where this happens; a w cap
+                                                    // raises rho too but preserves D, and does not set it
+
+// Either density clamp. Two bits: test it with `flags & flag_pol_rho_clamped`,
+// never with `==`. (Before 1.1.0 this was bit 13 alone, which only the ceiling
+// ever set; that bit is now flag_pol_rho_ceiled.)
+constexpr unsigned flag_pol_rho_clamped = flag_pol_rho_floored | flag_pol_rho_ceiled;
 
 // Mask of every M3e policy bit -- `flags & flag_pol_any` answers "did the
 // policy layer touch this point?" without enumerating the bits.
 constexpr unsigned flag_pol_any = flag_pol_atmosphere | flag_pol_ceiling | flag_pol_s_floored |
-                                  flag_pol_s_ceiled | flag_pol_w_capped | flag_pol_rho_clamped |
-                                  flag_pol_ye_clamped | flag_pol_nonfinite;
+                                  flag_pol_s_ceiled | flag_pol_w_capped | flag_pol_rho_ceiled |
+                                  flag_pol_ye_clamped | flag_pol_nonfinite | flag_pol_rho_floored;
 
 // Coarse-grained outcome of an operation (evaluation, repair, ...). `ok` means
 // nothing notable happened; `repaired` means the result is usable but some

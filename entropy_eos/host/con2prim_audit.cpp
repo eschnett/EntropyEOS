@@ -761,7 +761,7 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
     // Pass B (untimed): classify.
     std::vector<size_t> loc_interv(nt, 0), loc_valid_touched(nt, 0), loc_mismatch(nt, 0),
         loc_invalid(nt, 0);
-    std::vector<std::vector<size_t>> loc_flags(nt, std::vector<size_t>(8, 0));
+    std::vector<std::vector<size_t>> loc_flags(nt, std::vector<size_t>(Con2PrimReport::n_policy_flags, 0));
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -789,8 +789,8 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
       }
 
       ++loc_interv[tid];
-      for (int b = 0; b < 8; ++b) {
-        if (so.policy_flags & (1u << (8 + b))) ++loc_flags[tid][static_cast<size_t>(b)];
+      for (size_t b = 0; b < Con2PrimReport::n_policy_flags; ++b) {
+        if (so.policy_flags & (1u << (8 + b))) ++loc_flags[tid][b];
       }
 
       // False positive? Only if the state was valid by construction AND the
@@ -812,7 +812,8 @@ Con2PrimReport check_con2prim(const EntropyEOS &adapter, const Con2PrimCheckOpti
       report.policy_n_valid_touched += loc_valid_touched[t];
       report.policy_n_cons_mismatch += loc_mismatch[t];
       report.policy_n_invalid_out += loc_invalid[t];
-      for (size_t b = 0; b < 8; ++b) report.policy_flag_counts[b] += loc_flags[t][b];
+      for (size_t b = 0; b < Con2PrimReport::n_policy_flags; ++b)
+        report.policy_flag_counts[b] += loc_flags[t][b];
     }
 
     // Pass C: the deterministic broken-state battery.
@@ -925,10 +926,11 @@ void Con2PrimReport::print(std::ostream &os) const {
           "must be 0)"
        << " n_invalid_out=" << policy_n_invalid_out
        << " (returned state not policy-valid/finite -- must be 0)\n";
-    static const char *const flag_names[8] = {"atmosphere", "ceiling",     "s_floored",  "s_ceiled",
-                                              "w_capped",   "rho_clamped", "ye_clamped", "nonfinite"};
+    static const char *const flag_names[n_policy_flags] = {
+        "atmosphere", "ceiling",    "s_floored", "s_ceiled",   "w_capped",
+        "rho_ceiled", "ye_clamped", "nonfinite", "rho_floored"};
     os << "policy flag counts:";
-    for (size_t i = 0; i < 8; ++i) os << " " << flag_names[i] << "=" << policy_flag_counts[i];
+    for (size_t i = 0; i < n_policy_flags; ++i) os << " " << flag_names[i] << "=" << policy_flag_counts[i];
     os << "\n";
     os << "policy battery: n=" << policy_battery_n << " n_invalid=" << policy_battery_n_invalid
        << " (must be 0) n_no_flag=" << policy_battery_n_no_flag << " (must be 0) n_cold_missed="

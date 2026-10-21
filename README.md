@@ -274,7 +274,11 @@ yet the real question, whether some $(s, w)$ in the box maps to these conservati
 answered only by attempting the solve. So either `con2prim_safe()` succeeds, producing a
 valid state that reproduces its input, or `con2prim_safe()` "fails" and chooses a new
 valid state by policy: an $s$-floor projection that keeps the inner solve's own $w$, a
-ceiling projection along the adiabat, a $w$-cap, or a full atmosphere reset.
+ceiling projection along the adiabat, a $w$-cap, or a full atmosphere reset. Every clamp
+reports itself in `policy_flags`; in particular `flag_pol_rho_floored` says that the
+repair raised $\rho$ to $\rho_{\rm atm}$ without resetting the state, so the returned
+conservatives carry more rest mass and momentum than the input. A caller that wants
+such a point at rest has to do that itself.
 
 What makes the second ("failure") branch usable is that it returns *both* the new primitives and the
 conserved state that `prim2con` generates from them. The caller adopts those
@@ -562,7 +566,7 @@ vendor hardware yet — reports welcome.
 
 ## Status and testing
 
-This is version **1.0.0**. The version is available to consumers as
+This is version **1.1.0**. The version is available to consumers as
 `EEOS_VERSION_MAJOR/_MINOR/_PATCH`, as an encoded integer `EEOS_VERSION` for
 `#if EEOS_VERSION >= EEOS_VERSION_ENCODE(1, 1, 0)` feature guards, as
 `EEOS_VERSION_STRING`, and as `constexpr eeos::version*` values, all from
