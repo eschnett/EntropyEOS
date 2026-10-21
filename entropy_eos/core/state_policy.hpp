@@ -360,7 +360,7 @@ EEOS_HOST_DEVICE inline unsigned pol_project_core(const EntropyEOSView &eos, con
 
   if (out.rho > rho_hi) {
     out.rho = rho_hi;
-    flags |= flag_pol_rho_clamped;
+    flags |= flag_pol_rho_ceiled;
   }
 
   // (3) Ye.
@@ -533,7 +533,8 @@ EEOS_HOST_DEVICE inline unsigned check_prim_state(const EntropyEOSView &eos, con
 // returns 0. Cost: one srange() call, no solves.
 //
 //   rho  -> [rho_atm, rho_ceiling], with rho < rho_atm replaced by the FULL
-//           atmosphere state (flag_pol_atmosphere)
+//           atmosphere state (flag_pol_atmosphere); above the ceiling
+//                                                    (flag_pol_rho_ceiled)
 //   Ye   -> the table's [y_lo, y_hi]                    (flag_pol_ye_clamped)
 //   s    -> the PHYSICAL srange(rho, Ye) at the already-clamped (rho, Ye)
 //                              (flag_pol_s_floored / flag_pol_s_ceiled)
@@ -682,7 +683,7 @@ EEOS_HOST_DEVICE inline unsigned check_con_state(const EntropyEOSView &eos, cons
 //     they win when they fire. Capping w RAISES rho by the factor
 //     cosh(w_solved)/cosh(w_cap), so a state that was already near the
 //     density ceiling can be pushed past it; the rho clamp then takes
-//     precedence over D preservation and reports flag_pol_rho_clamped
+//     precedence over D preservation and reports flag_pol_rho_ceiled
 //     alongside flag_pol_w_capped (measured on the synthetic gas: 5 of 100
 //     w = 5 states under a w_cap = acosh(10)).
 //     If nothing fired (project_prim_state() returned 0), `cons` is the INPUT
@@ -702,7 +703,15 @@ EEOS_HOST_DEVICE inline unsigned check_con_state(const EntropyEOSView &eos, cons
 //                     momentum stays consistent), set rho = D/cosh(w) and
 //                     s = srange(rho, Ye).s_min at THAT rho (so the result is
 //                     exactly on the floor, not merely near it), then
-//                     project + prim2con. flag_pol_s_floored.
+//                     project + prim2con. flag_pol_s_floored. The w and rho
+//                     clamps of this branch leave a state the projection
+//                     finds in range, so they report themselves:
+//                     flag_pol_w_capped if w left [0, w_cap], and
+//                     flag_pol_rho_floored / flag_pol_rho_ceiled if
+//                     D/cosh(w) left [rho_atm, rho_ceiling]. rho_floored
+//                     means the repair ADDED rest mass and momentum (a thin,
+//                     fast, cold state); putting such a point at rest is the
+//                     caller's choice.
 //       g(s_max) < 0: even the hottest state has less energy than tau -- tau
 //                     is above the hot ceiling. -> COLLAPSE branch, as in
 //                     step 1.
@@ -815,14 +824,27 @@ EEOS_HOST_DEVICE inline Con2PrimSafeOut con2prim_safe(const EntropyEOSView &eos,
 
   if (c2p_is_finite(r_lo.f2) && r_lo.f2 > real(0)) {
     // tau below the coldest compatible value -> s-floor projection.
+    unsigned pf = flag_pol_s_floored;
     const real w_cap = detail::pol_w_cap(pol);
-    const real w1 = c2p_is_finite(r_lo.w) ? detail::aeval_clamp(r_lo.w, real(0), w_cap) : real(0);
+    real w1 = real(0);
+    if (c2p_is_finite(r_lo.w)) {
+      w1 = detail::aeval_clamp(r_lo.w, real(0), w_cap);
+      if (w1 != r_lo.w) pf |= flag_pol_w_capped;
+    }
     const real rho1 = in.D / std::cosh(w1);
-    const real rho1c = detail::aeval_clamp(rho1, detail::pol_rho_atm(eos, pol),
-                                            detail::pol_rho_ceiling(eos, pol));
+    const real rho_lo = detail::pol_rho_atm(eos, pol);
+    const real rho_hi = detail::pol_rho_ceiling(eos, pol);
+    real rho1c = rho1;
+    if (rho1 < rho_lo) {
+      rho1c = rho_lo;
+      pf |= flag_pol_rho_floored;
+    } else if (rho1 > rho_hi) {
+      rho1c = rho_hi;
+      pf |= flag_pol_rho_ceiled;
+    }
     const SRange sr1 = eos.srange(rho1c, ye_c);
     PrimState ps{rho1c, sr1.s_min, ye_in, w1};
-    const unsigned pf = flag_pol_s_floored | project_prim_state(eos, ps, pol);
+    pf |= project_prim_state(eos, ps, pol);
     detail::pol_package(eos, ps, in.S_par, in.S_perp, B2, r_lo.pt.u_solved, out.base, out.cons);
     out.base.result = res;
     out.base.iters_newton = it_n;

@@ -1078,6 +1078,25 @@ axis, one axis over.
 
 ## Milestones
 
+- **1.1.0** — October 21, 2026: the s-floor branch of `con2prim_safe()` reports its
+  own clamps. It clamped w into [0, w_cap] and rho into [rho_atm, rho_ceiling] without a
+  flag, because the projection that follows finds the clamped state in range; a caller
+  saw only `flag_pol_s_floored`. Found in TreeGRRMHD, which must put a point at rest
+  whenever a repair adds rest mass. The density flag is split as the entropy flag
+  already was: bit 13, which only the ceiling ever set, is now `flag_pol_rho_ceiled`;
+  the new `flag_pol_rho_floored` is bit 16 (8–15 were full, 6–7 stay reserved for solver
+  flags) and means rho·cosh(w) > D, i.e. rest mass and momentum were added; and
+  `flag_pol_rho_clamped` is now the mask of both, which is what its comment always said
+  it meant. `flag_pol_any` grows from 0xff00 to 0x1ff00; the branch also sets
+  `flag_pol_w_capped`. MINOR rather than MAJOR because bit 13's value and meaning are
+  unchanged and `flags & flag_pol_rho_clamped` keeps its documented meaning; code that
+  compares a flag word with `==` against `flag_pol_rho_clamped` must switch to
+  `flag_pol_rho_ceiled`. No numbers move: returned states are bitwise unchanged
+  (measured on 800 states through this branch in the Julia port, which received the
+  same change); only the flags differ. On those states 115/400 thin ones had rho raised,
+  79 had w capped, and 209/400 dense ones under a low ceiling had rho lowered. The
+  `eos_test` con2prim report's per-flag counts gain `rho_floored` (and print
+  `rho_ceiled` for bit 13). Putting such a point at rest is left to the caller.
 - **1.0.0** — the first release, with M4, August 29, 2026: M1–M4 complete and
   measured, the API stable under the contract in "Versioning".
 - **M1 (initial deliverable):** `defs`, `table`, `units`, `synthetic`,

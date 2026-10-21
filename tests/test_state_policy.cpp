@@ -247,7 +247,7 @@ PolicyOptions test_policy(const EntropyEOSView &view) {
 // ==========================================================================
 struct NoFalsePositiveResult {
   int n = 0, n_interventions = 0, n_solver_failed = 0;
-  size_t flag_counts[8] = {};
+  size_t flag_counts[9] = {}; // index = bit - 8, policy bits 8-16
 };
 
 NoFalsePositiveResult run_no_false_positives(const EntropyEOSView &view, unsigned seed, int npts,
@@ -306,7 +306,7 @@ NoFalsePositiveResult run_no_false_positives(const EntropyEOSView &view, unsigne
 
     if (safe.policy_flags != 0u) {
       ++res.n_interventions;
-      for (int b = 0; b < 8; ++b) {
+      for (int b = 0; b < 9; ++b) {
         if (safe.policy_flags & (1u << (8 + b))) ++res.flag_counts[static_cast<size_t>(b)];
       }
     }
@@ -342,8 +342,8 @@ NoFalsePositiveResult run_no_false_positives(const EntropyEOSView &view, unsigne
 
 void report_nfp(const std::string &label, const NoFalsePositiveResult &res) {
   std::cout << label << ": n=" << res.n << " interventions=" << res.n_interventions
-            << " solver_failed=" << res.n_solver_failed << " flags[atm,ceil,s_lo,s_hi,wcap,rho,ye,nonfin]=[";
-  for (int b = 0; b < 8; ++b) std::cout << res.flag_counts[static_cast<size_t>(b)] << (b < 7 ? " " : "");
+            << " solver_failed=" << res.n_solver_failed << " flags[atm,ceil,s_lo,s_hi,wcap,rho_hi,ye,nonfin,rho_lo]=[";
+  for (int b = 0; b < 9; ++b) std::cout << res.flag_counts[static_cast<size_t>(b)] << (b < 8 ? " " : "");
   std::cout << "]\n";
 }
 
@@ -677,6 +677,8 @@ TEST_CASE("state_policy: tau shrunk 10x below the cold floor lands exactly on th
       max_s_err = std::max(max_s_err, s_err);
       CHECK(s_err <= 1e-12);
     }
+    // The floor flag is set exactly when the repair added rest mass.
+    CHECK(((so.policy_flags & eeos::flag_pol_rho_floored) != 0u) == (so.cons.D > cin.D * (1.0 + 1e-12)));
     check_policy_valid_output(view, pol, so, "tau/10");
     max_rt = std::max(max_rt, check_resolvable(view, copts, so, "tau/10").cold_err);
   }
@@ -695,6 +697,98 @@ TEST_CASE("state_policy: tau shrunk 10x below the cold floor lands exactly on th
   // 10 removes far more energy than the coldest adiabat at this (D, |S|) can
   // give up, so the cold-floor diagnosis is not a marginal call here.
   CHECK(n_floored == npts);
+}
+
+// ==========================================================================
+// 5b. The w and rho clamps of the s-floor branch report themselves.
+// ==========================================================================
+
+namespace {
+// A cold state at rapidity w whose tau is far below the coldest state this
+// (D, |S|) can support, so that con2prim_safe() takes the s-floor branch.
+Con2PrimIn cold_fast_state(const EntropyEOSView &view, double D, double w, double ye, double s_frac,
+                           double tau_scale) {
+  const double rho = D / std::cosh(w);
+  const SRange sr = view.srange(std::max(rho, std::pow(10.0, view.x_lo)), ye);
+  const double s = sr.s_min + s_frac * (sr.s_max - sr.s_min);
+  const Prim2ConOut c = eeos::prim2con(view, rho, s, ye, w, 0.0, 0.0, nan_guess());
+  return Con2PrimIn{D, c.tau * tau_scale, ye * D, c.S_par, c.S_perp, 0.0};
+}
+} // namespace
+
+TEST_CASE("state_policy: the s-floor branch reports raising rho (mass added), lowering it, and capping w") {
+  SyntheticOptions opts;
+  EntropyEOS adapter = build_synthetic(opts);
+  const EntropyEOSView view = adapter.view();
+  const Con2PrimOptions copts;
+  const PolicyOptions pol = test_policy(view);
+  const double rho_atm = eeos::detail::pol_rho_atm(view, pol);
+  const double ye = 0.5 * (view.y_lo + view.y_hi);
+
+  {
+    // Thin and fast: D only a little above the atmosphere trigger, so
+    // D/cosh(w) at the inner solve's own w falls below rho_atm. Before 1.1.0
+    // this came back as flag_pol_s_floored alone.
+    const Con2PrimIn cin = cold_fast_state(view, 1.5 * rho_atm, 2.0, ye, 0.0, 1e-3);
+    const Con2PrimSafeOut so = eeos::con2prim_safe(view, cin, copts, pol);
+    INFO("thin fast state, flags 0x" << std::hex << so.policy_flags);
+    CHECK((so.policy_flags & eeos::flag_pol_s_floored) != 0u);
+    CHECK((so.policy_flags & eeos::flag_pol_rho_clamped) == eeos::flag_pol_rho_floored);
+    CHECK((so.policy_flags & eeos::flag_pol_atmosphere) == 0u);
+    CHECK(so.base.rho == rho_atm);
+    CHECK(so.base.w > 0.0); // the velocity is kept: resetting it is the caller's choice
+    CHECK(so.cons.D > cin.D);
+    check_policy_valid_output(view, pol, so, "rho floored");
+    check_resolvable(view, copts, so, "rho floored");
+  }
+
+  {
+    // Dense and fast under a low ceiling, with the collapse bounds off (zero
+    // disables them) so that the state reaches the s-floor branch at all.
+    PolicyOptions polc;
+    polc.rho_atm = pol.rho_atm;
+    polc.rho_ceiling = std::pow(10.0, 0.5 * (view.x_lo + view.x_hi));
+    polc.w_cap = pol.w_cap;
+    const Con2PrimIn cin = cold_fast_state(view, 10.0 * polc.rho_ceiling, 2.0, ye, 0.0, 1e-3);
+    const Con2PrimSafeOut so = eeos::con2prim_safe(view, cin, copts, polc);
+    INFO("dense fast state, flags 0x" << std::hex << so.policy_flags);
+    CHECK((so.policy_flags & eeos::flag_pol_s_floored) != 0u);
+    CHECK((so.policy_flags & eeos::flag_pol_rho_clamped) == eeos::flag_pol_rho_ceiled);
+    CHECK(so.base.rho == polc.rho_ceiling);
+    CHECK(so.cons.D < cin.D);
+  }
+
+  {
+    // Faster than the cap: the branch clamps w and says so.
+    const Con2PrimIn cin = cold_fast_state(view, 1e3 * rho_atm, 1.2 * pol.w_cap, ye, 0.0, 1e-3);
+    const Con2PrimSafeOut so = eeos::con2prim_safe(view, cin, copts, pol);
+    INFO("over the cap, flags 0x" << std::hex << so.policy_flags);
+    CHECK((so.policy_flags & eeos::flag_pol_s_floored) != 0u);
+    CHECK((so.policy_flags & eeos::flag_pol_w_capped) != 0u);
+    CHECK(so.base.w == pol.w_cap);
+  }
+
+  // Over a batch: the floor flag is set exactly when D went up.
+  std::mt19937_64 rng(0x5F100D00u);
+  std::uniform_real_distribution<double> u01(0.0, 1.0);
+  const int npts = static_cast<int>(eeos_n(200, 50));
+  int n_floored = 0;
+  for (int k = 0; k < npts; ++k) {
+    const double w = 4.0 * u01(rng);
+    const double D = rho_atm * std::pow(10.0, 2.0 * u01(rng));
+    const double s_frac = u01(rng);
+    const double tau_scale = std::pow(10.0, -1.0 - 6.0 * u01(rng));
+    const Con2PrimIn cin = cold_fast_state(view, D, w, ye, s_frac, tau_scale);
+    const Con2PrimSafeOut so = eeos::con2prim_safe(view, cin, copts, pol);
+    INFO("batch state " << k << ", flags 0x" << std::hex << so.policy_flags);
+    const bool floored = (so.policy_flags & eeos::flag_pol_rho_floored) != 0u;
+    n_floored += floored ? 1 : 0;
+    CHECK(floored == (so.cons.D > cin.D * (1.0 + 1e-12)));
+    check_policy_valid_output(view, pol, so, "batch");
+  }
+  std::cout << "test_state_policy 5b: " << n_floored << "/" << npts << " batch states had rho floored\n";
+  CHECK(n_floored > 0);
+  CHECK(n_floored < npts);
 }
 
 // ==========================================================================
@@ -757,8 +851,10 @@ TEST_CASE("state_policy: a solved w above w_cap is capped, D is preserved, and t
     // The one exception is documented in state_policy.hpp: capping w RAISES
     // rho by cosh(w_solved)/cosh(w_cap), which can push it past the density
     // ceiling; the rho clamp then takes precedence over D preservation and
-    // says so with flag_pol_rho_clamped.
-    if (so.policy_flags & eeos::flag_pol_rho_clamped) {
+    // says so with flag_pol_rho_ceiled. Raising rho this way preserves D, so
+    // it is never flag_pol_rho_floored.
+    CHECK((so.policy_flags & eeos::flag_pol_rho_floored) == 0u);
+    if (so.policy_flags & eeos::flag_pol_rho_ceiled) {
       ++n_rho_clamped;
       CHECK(so.base.rho == pol.rho_ceiling);
       CHECK(so.cons.D < cin.D);
@@ -834,7 +930,7 @@ TEST_CASE("state_policy: project_prim_state flags each violation exactly and is 
       {"rho = 0", {0.0, s_mid, ye_mid, 1.0}, eeos::flag_pol_atmosphere},
       {"rho negative", {-1.0, s_mid, ye_mid, 1.0}, eeos::flag_pol_atmosphere},
       {"rho above the ceiling", {10.0 * pol.rho_ceiling, s_ceil_mid, ye_mid, 1.0},
-       eeos::flag_pol_rho_clamped},
+       eeos::flag_pol_rho_ceiled},
       {"s below the physical floor", {rho_mid, sr_mid.s_min - 5.0, ye_mid, 1.0},
        eeos::flag_pol_s_floored},
       {"s above the physical ceiling", {rho_mid, sr_mid.s_max + 5.0, ye_mid, 1.0},
@@ -846,7 +942,7 @@ TEST_CASE("state_policy: project_prim_state flags each violation exactly and is 
       {"w above the cap", {rho_mid, s_mid, ye_mid, 2.0 * pol.w_cap}, eeos::flag_pol_w_capped},
       {"w negative", {rho_mid, s_mid, ye_mid, -1.0}, eeos::flag_pol_w_capped},
       {"rho above ceiling AND w above cap", {10.0 * pol.rho_ceiling, s_ceil_mid, ye_mid, 2.0 * pol.w_cap},
-       eeos::flag_pol_rho_clamped | eeos::flag_pol_w_capped},
+       eeos::flag_pol_rho_ceiled | eeos::flag_pol_w_capped},
       {"s below floor AND Ye above range AND w above cap",
        {rho_mid, sr_yhi.s_min - 5.0, view.y_hi + 0.1, 2.0 * pol.w_cap},
        eeos::flag_pol_s_floored | eeos::flag_pol_ye_clamped | eeos::flag_pol_w_capped},

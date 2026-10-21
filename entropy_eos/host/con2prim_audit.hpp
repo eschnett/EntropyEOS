@@ -164,9 +164,10 @@ struct Con2PrimReport {
   size_t policy_n_interventions = 0; // states with policy_flags != 0 (for ANY reason)
 
   // Per-flag counts, index = bit - 8, i.e. in flag order
-  // {atmosphere, ceiling, s_floored, s_ceiled, w_capped, rho_clamped,
-  //  ye_clamped, nonfinite} (core/defs.hpp).
-  size_t policy_flag_counts[8] = {};
+  // {atmosphere, ceiling, s_floored, s_ceiled, w_capped, rho_ceiled,
+  //  ye_clamped, nonfinite, rho_floored} (core/defs.hpp).
+  static constexpr size_t n_policy_flags = 9;
+  size_t policy_flag_counts[n_policy_flags] = {};
 
   // THE false-positive counter, and the one that drives
   // con2prim_needs_attention(): an intervention on a state whose sampled
