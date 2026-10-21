@@ -566,7 +566,7 @@ vendor hardware yet — reports welcome.
 
 ## Status and testing
 
-This is version **1.0.0**. The version is available to consumers as
+This is version **1.1.0**. The version is available to consumers as
 `EEOS_VERSION_MAJOR/_MINOR/_PATCH`, as an encoded integer `EEOS_VERSION` for
 `#if EEOS_VERSION >= EEOS_VERSION_ENCODE(1, 1, 0)` feature guards, as
 `EEOS_VERSION_STRING`, and as `constexpr eeos::version*` values, all from
