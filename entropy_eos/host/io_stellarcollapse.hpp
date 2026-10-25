@@ -109,7 +109,8 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //     under the group: "irho"/"jT"/"kYe" (unsigned), "old_value"/"new_value"
 //     (double), plus "field" -- a fixed-length (32-byte, NUL-padded) string
 //     dataset naming the field of each entry (chosen over an index into a
-//     separate name-list dataset: with only ever "entropy"/"logenergy" in
+//     separate name-list dataset: with only ever "entropy"/"logenergy"
+//     (and, since 1.2.0, "logpress" from the seam-blend stage) in
 //     practice, a plain string column is simpler to inspect with h5ls/h5dump
 //     and to read back in tests, at a storage cost that's negligible next to
 //     the two double columns it sits beside);
@@ -122,7 +123,11 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //     ("causal_cap" 0/1, "cs2_max"/"cs2_cap" double, "causal_rounds_max"/
 //     "trace_depth_max"/"anchor_pad" uint64, plus "causal_nodes_capped",
 //     "causal_cs2_violations_before"/"_after" and "causal_reverted" 0/1 --
-//     see RepairResult::CausalCapSummary), "tool_version"/"input_path"
+//     see RepairResult::CausalCapSummary), the 1.2.0 seam-blend stage's
+//     ("seam_blend" 0/1, "seam_tol" double, "seam_halfwidth"/
+//     "seam_fit_cells" uint64, plus "seam_count"/"seam_unfaded" uint64 --
+//     see RepairResult::SeamBlendSummary), "trim_t_hi_rows" (uint64, the
+//     causal-cap stage's T_max trim), "tool_version"/"input_path"
 //     (fixed-length string datasets -- sic, see the .cpp: HDF5 *attributes*
 //     here, not top-level datasets), "input_fnv1a" (uint64_t) and
 //     "n_modified" (uint64_t).

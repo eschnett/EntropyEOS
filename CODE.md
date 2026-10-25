@@ -157,7 +157,7 @@ EntropyEOS/
       version.hpp/.cpp         #   compiled-library version, header/binary mismatch check
       synthetic.hpp/.cpp       #   manufactured analytic EOS → RawTable (ground truth)
       check.hpp/.cpp           #   table-level diagnostics, library-first (see test harness)
-      repair.hpp/.cpp          #   isotonic + spline-safe + causal-cap repair, change log
+      repair.hpp/.cpp          #   seam-blend + isotonic + spline-safe + causal-cap repair, change log
       bspline_fit.hpp/.cpp     #   B-spline coefficient fitting (banded solves)  (M2)
       adapter_build.hpp/.cpp   #   RawTable → EntropyEOS (fit, extend, κ, audits) (M2)
       io_stellarcollapse.hpp/.cpp  # the only files including hdf5.h
@@ -243,8 +243,8 @@ kernels — the same reason `core/` forbids it. See [`RELATED.md`](RELATED.md).
 
 ```
 eos_repair in.h5 out.h5 [--check-only] [--min-slope-s X] [--min-slope-loge X]
-           [--no-spline-safe] [--no-spline-safe-3d] [--no-causal-cap] [--cs2-cap X]
-           [--log FILE]
+           [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d] [--no-causal-cap]
+           [--cs2-cap X] [--trim-t-hi N] [--log FILE]
 ```
 
 Purpose: make a table satisfy the hard requirements of `eos-adapter-F-to-U.md` §8 —
@@ -252,6 +252,17 @@ above all strict monotonicity in T of entropy and energy at every (ρ, Ye), and 
 causality `0 < c_s² < 1` of the constructed potential — and leave an auditable trail.
 Design points:
 
+- **Seam blend (1.2.0, M3k)**: a first stage, on by default (`--no-seam-blend` opts
+  out), finds ρ-column *stitching seams* — a localized level step in `logpress` across
+  a few ρ cells (opposite-sign second differences along ρ on quiet ground), at the same
+  cells for every Ye — and replaces ±5 cells around each with a C² smoothstep blend of
+  quadratic least-squares fits to the two sides, in `entropy`, `logenergy` *and*
+  `logpress` (the one stage that edits `logpress`, so the written table stays
+  self-consistent). A seam that does not fade out at both ends of the T range where its
+  shape can be followed is reported and left alone, since blending part of it would
+  leave an edit edge the size of the step. DD2 and SFHo each have one (irho 81–83,
+  ρ ≈ 1.4e7 g/cc, T ≳ 70 MeV) and it is blended; LS220-2009 has one (irho 89–90,
+  ρ ≈ 1e8 g/cc, cold) that is reported, not blended; SRO has none.
 - **Repairs act on the stored variables** (`entropy`, `logenergy`) directly:
   monotonicity of `logenergy` in T is equivalent to monotonicity of ε (log is monotone,
   the shift constant), so no unit round-trip is needed and the output stays in-format.
@@ -271,7 +282,13 @@ Design points:
   σ_T pockets) and `c_s² ≤ 0` samples are reported, never edited. The stage carries the
   M2d-1 harness verbatim (audit-driven rounds, per-column re-repair of touched columns,
   best-state tracking) plus a *lexicographic* backstop: the kept state's (4,4,4)
-  monotonicity counts must not regress, else the whole stage reverts.
+  monotonicity counts must not regress, else the whole stage reverts. Since 1.2.0 it
+  works on exactly the box the adapter build fits — by default without the hottest T
+  row (`--trim-t-hi N`, `RepairOptions`/`BuildOptions::trim_t_hi_rows`, default 1, 0 =
+  full box) — and the trimmed rows' `logenergy` only follows the last kept row's change,
+  keeping their increments in T (left alone, a capped last row under an uncapped
+  trimmed one is a new T-kink the next run's per-column stage smooths back into the
+  box, breaking idempotence).
 - **The stage runs while it improves (M3j)**, not for a fixed number of rounds: it stops
   after two consecutive rounds that fail to beat the best state seen, and
   `causal_rounds_max` (default 64, was 8) is a runaway backstop rather than a working
@@ -289,7 +306,8 @@ Design points:
   do interpret.
 - Guarantees: input never modified; deterministic; **idempotent** (a second run reports
   zero changes — enforced by tests, on all four real tables since M3j). Output = faithful
-  copy of every untouched dataset, the two repaired fields, plus a repair-provenance
+  copy of every untouched dataset, the repaired fields (`entropy`, `logenergy`, and
+  `logpress` where a seam was blended), plus a repair-provenance
   group (per-field indices / old / new values, parameters, tool version, input checksum)
   and a human-readable log.
 - **Re-repairing an output is a first-class operation (M3j).** `OUT.h5` inherits
@@ -343,8 +361,9 @@ table and without con2prim. A deterministic **dirty preset**
 in the real tables — clustered non-monotone entropy across a T-window (LS220's nuclear
 transition), flat logenergy plateaus (SRO), a negative-entropy cold corner (SRO), a
 smooth `ρ²` energy excess making the constructed `U` superluminal over the top two ρ
-layers at every (T, Ye) (the M3f acausal corner), and planted Inf/NaN in auxiliary
-fields (LS220's cs2/gamma) — so the full detect → repair → residual-classes-persist
+layers at every (T, Ye) (the M3f acausal corner), a ρ-column stitching seam across
+irho 13–15 in the top four T rows (the DD2/SFHo seam, 1.2.0), and planted Inf/NaN in
+auxiliary fields (LS220's cs2/gamma) — so the full detect → repair → residual-classes-persist
 narrative runs in CI.
 
 **Real tables are local-only.** CI never downloads or stores the
@@ -463,8 +482,9 @@ construction and which are about a particular table's data:
   alone is the right call on the measured evidence, not just the scoped one: it is what
   con2prim actually meets there, and con2prim barely notices — see the 40,000-state
   numbers below, where the handful of failures land inside this exact band and the
-  invalid-state policy absorbs them. Extending the cap to `u_hi`-edge-anchored runs is
-  recorded as a deferred option (open decision 6), not a defect.
+  invalid-state policy absorbs them. The band later turned out to be two data defects —
+  a ρ-column stitching seam and the T_max row — rather than stiffness, which closes the
+  question of extending the cap to `u_hi`-edge-anchored runs (open decision 6).
 - **The interior `c_s²` spikes are enormous, and they are a σ_T artifact, not
   stiffness.** The causal-cap audit's largest finite in-box sample is **2.94e8 (DD2)**
   and **1.32e11 (SFHo)**, against 1.9e4 (LS220) and 1.8e9 (SRO). They sit in the
@@ -560,10 +580,81 @@ construction and which are about a particular table's data:
   construction invariant (clamp and monotonicity floor dormant, α > 0, finite —
   asserted on all four tables) and a tier-2 radiation *window* (asserted on LS220/SRO,
   measured and reported on DD2/SFHo, with the premise failure documented at the
-  assertion). **Open item:** whether M3g should detect a non-radiation hot seam and
-  fall back (e.g. blend toward the fitted b/α − 1 monotonically instead of through the
-  dip), or whether the acausal/negative-p band is acceptable given it lies wholly
-  outside the table box. Not decided; nothing was loosened in the construction itself.
+  assertion). ~~**Open item:** whether M3g should detect a non-radiation hot seam and
+  fall back~~ — resolved by **M3k** (1.2.0): the dip is a depth-linear drift,
+  `(L_xu − r·g_xu)·d`, wherever the slope ratio r varies with ρ; the u-high tail now
+  locks the ratio wherever the locked tail's own asymptote is causal, and keeps this
+  M3g tail (soft drift) where it is not — which is exactly this ρ ≈ 1e15 hot seam, so
+  the dip described here remains there. See `eos-causal-tail.md` §9 and "M3k empirical
+  findings".
+
+**M3k empirical findings — seam blend, T_max trim, ratio lock** (1.2.0, measured
+2026-10-25 on all four tables; adapter classes from `eos_test --level adapter
+--node-stride 4`, con2prim from `--level con2prim --states 40000`, both after the
+in-memory default repair; "1.1.0" is the `main` build, "seam only" is 1.2.0 with
+`--trim-t-hi 0`):
+
+  | class | table | 1.1.0 | seam only | 1.2.0 |
+  |---|---|---|---|---|
+  | in-box `cs2_acausal` | LS220 / SRO | 132 / 135 | 132 / 135 | 49 / 70 |
+  | | DD2 / SFHo | 2,193 / 785 | 1,344 / 23 | **0** / 17 |
+  | in-box `p_nonpositive` | DD2 / SFHo | 335 / 270 | 0 / 0 | **0 / 0** |
+  | in-box `cs2_nonpositive` | DD2 / SFHo | 5,359 / 1,547 | 4,273 / 191 | 1,915 / 437 |
+  | u-high `cs2_acausal` | LS220 / SRO | 237 / 262 | 237 / 262 | 135 / 147 |
+  | | DD2 / SFHo | 22,633 / 19,259 | 1,777 / 100 | **0** / 28 |
+  | u-high `p_nonpositive` | LS220 / SRO | 226 / 933 | 226 / 933 | 59 / 387 |
+  | | DD2 / SFHo | 13,804 / 13,090 | 0 / 0 | **0 / 0** |
+  | u-high `cs2_nonpositive` | LS220 / SRO | 6,883 / 16,573 | 6,883 / 16,537 | 5,448 / 13,300 |
+  | | DD2 / SFHo | 22,848 / 21,539 | 2,380 / 0 | 1,891 / **0** |
+  | con2prim failed, warm/cold | LS220 / SRO | 1/0 / 0/1 | 1/0 / 0/1 | 1/0 / 0/0 |
+  | | DD2 / SFHo | 2/3 / 3/2 | 0/0 / 0/0 | **0/0** / 1/0 |
+
+- **The seam stage fires where it should and nowhere else.** DD2 and SFHo: one seam at
+  irho 81–83, detected at the full `seam_tol` from jT 173 (T ≈ 109 MeV) and blended over
+  jT 164–179 (≈ 70 MeV up), 960 (T, Ye) rows, `logpress` max |Δ| 0.0079 / 0.0072
+  dex, step at the seam centre 0.021 / 0.020 dex. SRO: none. LS220: one seam at irho
+  89–90 (ρ ≈ 1e8 g/cc) — a genuine stitching step of 0.03 in log p and a few percent in
+  entropy, present at every Ye from T_min to ~1 MeV with a Ye-dependent sign — is
+  detected only in jT 8–17 (elsewhere one Ye or the quiet-ground test fails) and does
+  not fade at either end, so it is **reported and left alone**. With the trim off,
+  LS220's and SRO's repair logs list the same entries as 1.1.0's, index for index and
+  value for value (to the log's 10 digits; 68,394 / 245,387 values), and their adapter
+  classes are 1.1.0's except where the lock acts (SRO u-high `c_s² ≤ 0` 16,573 →
+  16,537; con2prim within a fallback or two). The blend leaves the
+  window smooth but not thermodynamically consistent — `entropy` and `logenergy` are
+  blended separately — so the in-box `cs2_nonpositive` that remains on DD2 (1,915, max
+  |c_s²| 0.18) sits mostly in the blend window at the box's hot edge; `check_table`'s
+  δ_p is essentially unchanged (DD2 117,739 → 118,099 above tolerance, max 22.66 both),
+  because its worst points are the *cold* end of the same seam column (irho 83,
+  T = 0.01 MeV, Ye ≈ 0.31), where the step exists at some Ye but not all and the stage
+  correctly does not fire.
+- **The T_max trim is the in-box fix; it needed the lock.** Dropping the hottest row
+  takes DD2's residual in-box `c_s² ≥ 1` (1,344 after the blend) to 0 and SFHo's 23 → 17,
+  and the hot tail's `c_s² ≥ 1` 1,777 → 0 / 100 → 28; on LS220/SRO it halves every
+  `c_s² ≥ 1` and `p ≤ 0` class (the go/no-go gate measured before anything was built:
+  causal residual 7,622 → 4,054 / 21,283 → 15,507, con2prim unchanged). But launched
+  from 152 MeV the DD2 hot tail first got *worse* below zero — u-high `p ≤ 0` 0 → 6,307,
+  `c_s² ≤ 0` 2,380 → 43,299, SFHo 0 → 30,940 — all of it the depth-linear drift
+  `eos-causal-tail.md` §9 derives, concentrated in the seam-blend window (whose slope
+  ratio varies by ±0.1 across it) and at the matter-dominated ρ ~ 1e15 seam.
+- **The gated lock removes the drift where it is safe.** With it: DD2 u-high `p ≤ 0`
+  6,307 → **0** and `c_s² ≤ 0` 43,299 → 1,891 (max |c_s²| 0.054); SFHo 30,940 → **0**.
+  The ungated lock was measured first and rejected: at the ρ ~ 1e15 hot seams of DD2 and
+  LS220 the locked tail's asymptote is 1.2–1.6 (predicted by the §9 formula, confirmed by
+  64-cell-deep evaluations), and no cap on the slope ratio can fix that because it comes
+  from the seam's own x-structure — c_inf at r = 0 is already > 1. The gate leaves the
+  M3g tail there, so those corners keep 1.1.0's soft drift (c_s² ≤ 0 by ~8 cells).
+- **Residuals.** DD2: 461 refined in-box `c_s² ≥ 1` samples (all σ_T pockets below
+  0.1 MeV, `interior_untouched`, max 2.9e8), the cold seam end above, the u-low tail
+  (286 / 6,656, unchanged). SFHo: the causal cap now leaves 7,873 refined samples
+  (36,866 in 1.1.0; 1,468 interior), 17 in-box / 28 hot-tail `c_s² ≥ 1` samples with
+  max 1.013 / 1.006, and one warm con2prim failure in 40,000 (three in 1.1.0).
+  Callers see every such point through `flag_cs2_out_of_range`.
+- **Repair cost and footprint.** DD2: 13,143 `entropy` / 21,067 `logenergy` / 12,480
+  `logpress` values changed (1.1.0: 663 / 8,587 / 0); SFHo 13,146 / 34,299 / 12,480
+  (causal cap 24 rounds, 21,430 nodes). The second `eos_repair` run exits 0 on all four
+  tables, and the dirty preset keeps its documented two-pass shape (pass 2 changes 265
+  entropy values, pass 3 none).
 
 **M3f empirical findings — causal-cap outcome** (`eos-causality-repair.md`, measured
 2026-08-27 on the two local tables; "nodes" are the fitted `c_s²` evaluated at table
@@ -1079,6 +1170,24 @@ axis, one axis over.
 
 ## Milestones
 
+- **1.2.0** — October 25, 2026: the in-box and hot-tail `c_s² ≥ 1` that DD2 and SFHo
+  still handed callers after repair are gone, and callers can now see the rest (M3k).
+  Four changes, each with an option to restore the 1.1.0 behaviour:
+  (1) a default-on **seam-blend repair stage** (`RepairOptions::seam_blend`,
+  `--no-seam-blend`) that blends the Hempel tables' ρ-column stitching seam at
+  ρ ≈ 1.4e7 g/cc in `entropy`, `logenergy` and `logpress` — the first stage ever to edit
+  `logpress`; (2) the adapter build **drops the hottest T row from the fit** by default
+  (`BuildOptions::trim_t_hi_rows = 1`, with the same `RepairOptions` default so the causal
+  audit keeps auditing exactly the built box; `--trim-t-hi`, 0 = full box) — this moves
+  every table's box top one row down; (3) the **u-high tail's ratio lock**
+  (`core/adapter_eval.hpp`), which stops the hot tail drifting through p ≤ 0 at seams
+  whose slope ratio varies with ρ, gated off where the locked tail would not be causal;
+  (4) two **point flags**, `flag_cs2_acausal` (bit 17) and `flag_cs2_nonpositive` (bit 18),
+  plus the mask `flag_cs2_out_of_range`, set by every evaluation whose returned `cs2` lies
+  outside (0, 1), and `signal_cs2()`, the clamped value for characteristic speeds only.
+  MINOR: new bits in previously unused positions, new options and fields, results moved
+  beyond round-off on all four tables with the old behaviour still selectable. Numbers in
+  "M3k empirical findings"; `cs2` itself is still never clamped.
 - **1.1.0** — October 21, 2026: the s-floor branch of `con2prim_safe()` reports its
   own clamps. It clamped w into [0, w_cap] and rho into [rho_atm, rho_ceiling] without a
   flag, because the projection that follows finds the clamped state in range; a caller
@@ -1208,6 +1317,14 @@ axis, one axis over.
   `/repair_2`, `/repair_3`, … beside the group its input carried, each with its own
   `input_fnv1a`. Measured outcome, patience justification and the DD2/SFHo defect map
   are in the "DD2 / SFHo empirical findings" block above.
+- **M3k:** ✅ complete (1.2.0) — closes open decision 6 and the M3g non-radiation-seam
+  open item: the seam-blend repair stage, the default T_max trim of the fit, the gated
+  u-high ratio lock, and the caller-facing `c_s²` flags with `signal_cs2()`. On DD2 the
+  in-box and hot-tail `c_s² ≥ 1` and `p ≤ 0` counts all go to **0** and con2prim's
+  40,000-state failures 2/3 → **0/0**; SFHo, LS220 and SRO improve or hold on every
+  class. Every table is still a one-run repair fixed point. Design: `eos-causal-tail.md`
+  §9 for the lock, `repair.hpp` for the seam stage; numbers and the remaining residuals
+  in "M3k empirical findings".
 - **M4 (device interface — CUDA, AMD/HIP, Intel/SYCL):** design in
   `eos-device-interface.md`. Scope amended 2026-08-28: (i) the target set grew from
   CUDA-only to nvcc + hipcc + icpx `-fsycl` (one source, no forks; only CUDA hardware
@@ -1289,15 +1406,40 @@ axis, one axis over.
    ~~Whether the causal-cap round budget should be raised so one run suffices on tables
    like SFHo~~ — resolved by **M3j**: the loop runs while it improves and the budget is
    now a runaway backstop, so one run is a fixed point on all four tables.
-6. **Whether the causal cap should also treat `u_hi`-edge-anchored runs** — the DD2/SFHo
-   hot-edge acausal band (ρ ~ 10⁷–10¹², T ≳ 120 MeV, in-box c_s² up to ~5) is interior
-   in ρ, so M3f's ρ_max-edge scoping reports it as `interior_untouched` and never edits
-   it — correctly under the rule as written, and the same rule is what keeps the stage
-   out of the σ_T pockets. A T-anchored variant (trace adiabats down in T from the hot
-   edge rather than down in ρ from ρ_max) is the natural extension that would reach it.
-   **Deferred, deliberately**: con2prim barely notices the band — 2–3 failures per
-   40,000 states on either table, all inside it, with the invalid-state policy absorbing
-   them and zero false positives — so this is accept-and-guard territory (the same
-   verdict as decision 4), and the band would be paid for with a second scoping rule,
-   a second anchor search and a second class of physics edit. Revisit only if a
-   consumer's states concentrate there.
+6. ~~Whether the causal cap should also treat `u_hi`-edge-anchored runs~~ — resolved
+   **by the seam and T_max fixes** (diagnosed 2026-10-25). The DD2/SFHo hot-edge band
+   (in-box c_s² up to ~5) is not stiffness but two data defects, and a cap is the wrong
+   tool for both. (a) A ρ-column **stitching seam** at irho 81–83 (ρ ≈ 1.2–1.6e7 g/cc),
+   the same cells on both tables and at every Ye: on either side `logpress` is
+   ρ-independent (radiation-dominated), with a level step between the two sides that is
+   absent below T ≈ 30 MeV and grows to Δlog₁₀ p = 0.012 at 142 MeV and 0.021 at T_max,
+   plus matching kinks in `logenergy` and `entropy` — the δ_p ≈ 20 of `check_table`, and
+   the site of every DD2 con2prim failure in the findings above. (b) The **T_max row**
+   (158 MeV), whose own stored `cs2` is garbage (relativistic value 0 at low ρ, ~30 at
+   ρ_max, against ~0.94 one row below), and on which the fit's last T cell turns the
+   row's noise into c_s² ≥ 1. Measured on DD2 with a scratch prototype — a C² quintic
+   blend between quadratic fits to the two smooth branches over ±5 cells around the
+   seam (applied for log₁₀ T ≥ 1.2; edits ≤ 0.043 in ln s and ≤ 0.0033 in log₁₀ ε,
+   ~1e-5 where the seam starts), plus dropping the T_max row: refined (4,4,4)
+   c_s² ≥ 1 samples at T ≥ 0.1 MeV 131,275 → 98,095 (seam blend alone) / 20,619 (row
+   dropped alone) → **0** (both; max 0.950); `check_adapter` (`--node-stride 4`)
+   in-box `cs2_acausal` 2,193 → **0**, `p_nonpositive` 335 → 0, `cs2_nonpositive`
+   5,359 → 1,915 (max |c_s²| 0.18), `ext_u_high_cs2_acausal` 22,633 → 0 (while
+   `ext_u_high_cs2_nonpositive` goes 22,848 → 43,299 at max |c_s²| 136 → 0.40, which
+   bears on the M3g non-radiation-seam open item); con2prim at 40,000 states, warm/cold
+   failures 2/3 → **0/0** and `c2p_roundtrip` 3 → 0 (over a box whose T_max is 152
+   rather than 158 MeV). Why the T-anchored cap would have been the wrong tool: it only
+   lowers ε, so it cannot touch the seam's c_s² ≤ 0 / p ≤ 0 half; `project_node()`
+   anchors at the first causal stretch below a node, so on an interior run it would
+   leave the nodes above the band unchanged and create a new ε step at the band's top
+   (the deficit would have to be carried along each adiabat to its exit through u_hi);
+   and lowering ε more at hotter nodes erodes L_u, which the §4 step 6 backstop guards
+   with zero tolerance. The two fixes landed as **M3k** (1.2.0; numbers above are the
+   scratch prototype's, the shipped ones are in "M3k empirical findings"), together with
+   the u-high ratio lock that the trim turned out to need; a hot-edge cap remains an
+   idea only for a table with genuine smooth stiffness near T_max, which none of the
+   four local tables shows. Measured alongside: cropping T < 0.1 MeV does remove the
+   in-box σ_T-pocket samples (461 refined, max 2.9e8), but the u_low tail relaunched
+   from 0.1 MeV is far worse (`ext_u_low_cs2_acausal` 286 → 8,863,
+   `ext_u_low_p_nonpositive` 6,656 → 228,088), so the pockets stay accept-and-guard
+   (decision 4).

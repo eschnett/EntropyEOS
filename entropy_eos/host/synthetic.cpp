@@ -168,7 +168,45 @@ void apply_stiffen(RawTable &table, const std::vector<StiffenDefect> &defects) {
   }
 }
 
-// Step 6 (last): outright sets, so a planted Inf/NaN cannot be perturbed by
+// Step 5: rho-column stitching seam (see SeamDefect): a level step across
+// cells irho_a .. irho_a+2 that grows with T above logT_onset.
+void apply_seam(RawTable &table, const std::vector<SeamDefect> &defects) {
+  const std::vector<double> &logtemp = table.logtemp();
+  const double logT_max = logtemp.back();
+  for (const SeamDefect &d : defects) {
+    if (d.irho_a + 2 >= table.nrho()) {
+      throw std::invalid_argument("SeamDefect: cells irho_a .. irho_a+2 (irho_a = " +
+                                   std::to_string(d.irho_a) + ") do not fit nrho = " +
+                                   std::to_string(table.nrho()));
+    }
+    if (!(d.logT_onset < logT_max)) {
+      throw std::invalid_argument("SeamDefect: logT_onset must lie below the grid's top "
+                                  "log10(T), got " +
+                                  std::to_string(d.logT_onset));
+    }
+    std::vector<double> &logpress = table.field("logpress");
+    std::vector<double> &logenergy = table.field("logenergy");
+    std::vector<double> &entropy = table.field("entropy");
+    for (size_t jT = 0; jT < table.ntemp(); ++jT) {
+      if (!(logtemp[jT] > d.logT_onset)) {
+        continue;
+      }
+      const double z = (logtemp[jT] - d.logT_onset) / (logT_max - d.logT_onset);
+      const double step = d.amplitude * z * z;
+      for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+        for (size_t irho = d.irho_a + 1; irho < table.nrho(); ++irho) {
+          const double shift = irho == d.irho_a + 1 ? 0.5 * step : step;
+          const size_t idx = table.index(irho, jT, kYe);
+          logpress[idx] += shift;
+          logenergy[idx] += 0.5 * shift;
+          entropy[idx] *= std::pow(10.0, shift);
+        }
+      }
+    }
+  }
+}
+
+// Step 7 (last): outright sets, so a planted Inf/NaN cannot be perturbed by
 // any earlier step (see SetValue).
 void apply_setvalue(RawTable &table, const std::vector<SetValue> &defects) {
   for (const SetValue &v : defects) {
@@ -259,12 +297,13 @@ RawTable make_synthetic_table(const SyntheticOptions &opts) {
   }
 
   // Defect pipeline, fixed order (see make_synthetic_table()'s doc comment):
-  // flatten, wiggle, offset, seed, setvalue (setvalue last so a planted
-  // Inf/NaN cannot be perturbed by anything after it).
+  // flatten, wiggle, offset, stiffen, seam, seed, setvalue (setvalue last so
+  // a planted Inf/NaN cannot be perturbed by anything after it).
   apply_flatten(table, opts.flatten);
   apply_wiggle(table, opts.wiggle);
   apply_offset(table, opts.offset);
   apply_stiffen(table, opts.stiffen);
+  apply_seam(table, opts.seam);
   for (const SeededViolation &v : opts.seed) {
     table.field(v.field)[table.index(v.irho, v.jT, v.kYe)] += v.delta;
   }
@@ -316,6 +355,16 @@ SyntheticOptions dirty_synthetic_options() {
   // on a rho-resolved grid, where the same stage does reach zero. See
   // tests/integration.sh for the narrative.
   opts.stiffen.push_back(StiffenDefect{"logenergy", 1e13, 2.0, 1.35e17});
+
+  // Mimics the Hempel DD2/SFHo rho-column stitching seam (CODE.md open
+  // decision 6): a level step across irho 13..15 (rho ~ 2e8..7e8 g/cc on the
+  // default grid) in the top four T rows (log10 T >= 1.35, i.e. jT 26..29,
+  // ~24-50 MeV), reaching 0.04 in log10(p) at T_max -- second differences of
+  // +-0.02, well above the seam-blend detection threshold in the top three
+  // rows and fading through jT 26. Placed between the flatten block (rows
+  // 3-12) and the stiffened corner (irho >= 31) so the seam-blend stage's fit
+  // window, irho 5..23, meets neither.
+  opts.seam.push_back(SeamDefect{13, 1.35, 0.04});
 
   // Mimics LS220's corruption: a few Inf/NaN points in cs2/gamma.
   opts.setvalue.push_back(SetValue{"cs2", 20, 15, 5, std::numeric_limits<double>::infinity()});

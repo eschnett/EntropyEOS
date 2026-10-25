@@ -450,3 +450,47 @@ TEST_CASE("repair_table: causal-cap reports, but never edits, the dirty preset's
   // stage reports and never edits.
   CHECK(second.causal_cap.interior_untouched > 0);
 }
+
+TEST_CASE("repair_table: with trim_t_hi_rows the causal cap skips the trimmed rows but keeps "
+          "their T increments (1.2.0)") {
+  RawTable table = eeos::make_synthetic_table(stiff_corner_options());
+  const RawTable before = table;
+  const RepairResult r = eeos::repair_table(table); // default trim_t_hi_rows = 1
+  REQUIRE(r.causal_cap.ran);
+  REQUIRE(r.causal_cap.nodes_capped > 0);
+
+  const size_t top = table.ntemp() - 1;
+  const std::vector<double> &now = table.field("logenergy");
+  const std::vector<double> &was = before.field("logenergy");
+  size_t shifted = 0;
+  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+    for (size_t irho = 0; irho < table.nrho(); ++irho) {
+      const size_t i_top = table.index(irho, top, kYe);
+      const size_t i_last = table.index(irho, top - 1, kYe);
+      // The increment between the last kept row and the trimmed one is the
+      // input's (up to the one rounding of the shift) ...
+      CHECK(now[i_top] - now[i_last] ==
+            doctest::Approx(was[i_top] - was[i_last]).epsilon(1e-12).scale(1.0));
+      // ... and an uncapped column's trimmed row is bit-identical.
+      if (now[i_last] == was[i_last]) {
+        CHECK(now[i_top] == was[i_top]);
+      } else {
+        ++shifted;
+      }
+    }
+  }
+  CHECK(shifted > 0);
+
+  // With the trim off, the stage audits the full box, as before 1.2.0.
+  RawTable full = eeos::make_synthetic_table(stiff_corner_options());
+  RepairOptions opts;
+  opts.trim_t_hi_rows = 0;
+  const RepairResult r0 = eeos::repair_table(full, opts);
+  CHECK(r0.causal_cap.ran);
+  CHECK(r0.causal_cap.violations_after == 0);
+
+  RepairOptions bad;
+  bad.trim_t_hi_rows = -1;
+  RawTable untouched = eeos::make_synthetic_table(stiff_corner_options());
+  CHECK_THROWS_AS(eeos::repair_table(untouched, bad), std::invalid_argument);
+}

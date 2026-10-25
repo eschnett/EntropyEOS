@@ -165,8 +165,10 @@ struct AdapterReport {
 //   A. Monotonicity (from the build's stored audit, not recomputed):
 //      sigma_u/L_u minima, violation counts, worst locations (converted to
 //      physical rho/T/Ye).
-//   B. Node round trip and fidelity, every node_stride-th table node,
-//      evaluate() called *cold* (u_guess = NaN, not warm-started at the
+//   B. Node round trip and fidelity, every node_stride-th table node inside
+//      the built box (1.2.0: rows the build trimmed off the hot end,
+//      BuildOptions::trim_t_hi_rows, are skipped -- they are not part of the
+//      fit), evaluate() called *cold* (u_guess = NaN, not warm-started at the
 //      node's own T -- see adapter_audit.cpp's audit_nodes() for why: a
 //      warm start at the exact answer made this class trivially green
 //      regardless of solver robustness):

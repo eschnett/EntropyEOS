@@ -490,6 +490,18 @@ TEST_CASE("append_repair_group: writes group contents and attributes correctly")
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_before") == 0);
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_after") == 0);
   CHECK(read_uint64_attr(group.get(), "causal_reverted") == 0);
+
+  // 1.2.0 seam-blend parameters and outcome.
+  CHECK(read_uint64_attr(group.get(), "seam_blend") == (options.seam_blend ? 1u : 0u));
+  CHECK(read_double_attr(group.get(), "seam_tol") == options.seam_tol);
+  CHECK(read_uint64_attr(group.get(), "seam_halfwidth") ==
+        static_cast<std::uint64_t>(options.seam_halfwidth));
+  CHECK(read_uint64_attr(group.get(), "seam_fit_cells") ==
+        static_cast<std::uint64_t>(options.seam_fit_cells));
+  CHECK(read_uint64_attr(group.get(), "seam_count") == 0);
+  CHECK(read_uint64_attr(group.get(), "seam_unfaded") == 0);
+  CHECK(read_uint64_attr(group.get(), "trim_t_hi_rows") ==
+        static_cast<std::uint64_t>(options.trim_t_hi_rows));
 }
 
 TEST_CASE("append_repair_group: records a non-default causal-cap outcome") {
@@ -508,9 +520,18 @@ TEST_CASE("append_repair_group: records a non-default causal-cap outcome") {
   result.causal_cap.violations_before = 999;
   result.causal_cap.violations_after = 999;
 
+  result.seam_blend.ran = true;
+  result.seam_blend.seams.resize(2);
+  result.seam_blend.seams_unfaded.resize(1);
+
   RepairOptions options;
   options.cs2_cap = 0.95;
   options.anchor_pad = 3;
+  options.seam_blend = false;
+  options.seam_tol = 2.5e-3;
+  options.seam_halfwidth = 4;
+  options.seam_fit_cells = 6;
+  options.trim_t_hi_rows = 0;
 
   eeos::append_repair_group(path, result, options, "in.h5", 7ULL, "eos_repair-test");
 
@@ -525,6 +546,13 @@ TEST_CASE("append_repair_group: records a non-default causal-cap outcome") {
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_before") == 999);
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_after") == 999);
   CHECK(read_uint64_attr(group.get(), "causal_reverted") == 1);
+  CHECK(read_uint64_attr(group.get(), "seam_blend") == 0);
+  CHECK(read_double_attr(group.get(), "seam_tol") == 2.5e-3);
+  CHECK(read_uint64_attr(group.get(), "seam_halfwidth") == 4);
+  CHECK(read_uint64_attr(group.get(), "seam_fit_cells") == 6);
+  CHECK(read_uint64_attr(group.get(), "seam_count") == 2);
+  CHECK(read_uint64_attr(group.get(), "seam_unfaded") == 1);
+  CHECK(read_uint64_attr(group.get(), "trim_t_hi_rows") == 0);
 }
 
 TEST_CASE("append_repair_group: empty result writes n_modified=0 and no entry datasets") {

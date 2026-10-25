@@ -192,40 +192,6 @@ bool validate_range(const AxisRange &r, size_t n, const char *label) {
   return true;
 }
 
-// Slices `in`'s axes and every field to the inclusive index box
-// [ia,ib]x[ja,jb]x[ka,kb] (rho x T x Ye), copying values verbatim, and
-// copies every attribute unchanged.
-eeos::RawTable crop_table(const eeos::RawTable &in, size_t ia, size_t ib, size_t ja, size_t jb, size_t ka,
-                           size_t kb) {
-  eeos::RawTable out;
-
-  std::vector<double> logrho(in.logrho().begin() + static_cast<long>(ia),
-                              in.logrho().begin() + static_cast<long>(ib) + 1);
-  std::vector<double> logtemp(in.logtemp().begin() + static_cast<long>(ja),
-                               in.logtemp().begin() + static_cast<long>(jb) + 1);
-  std::vector<double> ye(in.ye().begin() + static_cast<long>(ka), in.ye().begin() + static_cast<long>(kb) + 1);
-  out.set_axes(std::move(logrho), std::move(logtemp), std::move(ye));
-
-  for (const std::string &name : in.field_names()) {
-    const std::vector<double> &src = in.field(name);
-    std::vector<double> dst(out.nrho() * out.ntemp() * out.nye());
-    for (size_t k = 0; k < out.nye(); ++k) {
-      for (size_t j = 0; j < out.ntemp(); ++j) {
-        for (size_t i = 0; i < out.nrho(); ++i) {
-          dst[out.index(i, j, k)] = src[in.index(ia + i, ja + j, ka + k)];
-        }
-      }
-    }
-    out.add_field(name, std::move(dst));
-  }
-
-  for (const std::string &attr_name : in.attribute_names()) {
-    out.add_attribute(attr_name, in.attribute(attr_name));
-  }
-
-  return out;
-}
-
 } // namespace
 
 int main(int argc, char **argv) {
@@ -264,7 +230,7 @@ int main(int argc, char **argv) {
     const auto ja = static_cast<size_t>(pa.jt.a), jb = static_cast<size_t>(pa.jt.b);
     const auto ka = static_cast<size_t>(pa.kye.a), kb = static_cast<size_t>(pa.kye.b);
 
-    const eeos::RawTable out_table = crop_table(in_table, ia, ib, ja, jb, ka, kb);
+    const eeos::RawTable out_table = eeos::crop_table(in_table, ia, ib, ja, jb, ka, kb);
 
     const unsigned long long source_fnv1a = eeos::fnv1a_file(in_path);
 

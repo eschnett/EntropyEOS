@@ -1,7 +1,9 @@
 #include "entropy_eos/host/table.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 namespace eeos {
 
@@ -100,5 +102,52 @@ double RawTable::attribute(const std::string &name) const {
 }
 
 double RawTable::energy_shift() const { return attribute("energy_shift"); }
+
+RawTable crop_table(const RawTable &in, size_t ia, size_t ib, size_t ja, size_t jb, size_t ka,
+                    size_t kb, const std::vector<std::string> *fields) {
+  if (ia > ib || ib >= in.nrho() || ja > jb || jb >= in.ntemp() || ka > kb || kb >= in.nye()) {
+    throw std::out_of_range("crop_table: index box [" + std::to_string(ia) + "," +
+                            std::to_string(ib) + "]x[" + std::to_string(ja) + "," +
+                            std::to_string(jb) + "]x[" + std::to_string(ka) + "," +
+                            std::to_string(kb) + "] does not fit the table's " +
+                            std::to_string(in.nrho()) + "x" + std::to_string(in.ntemp()) + "x" +
+                            std::to_string(in.nye()) + " grid");
+  }
+
+  RawTable out;
+  std::vector<double> logrho(in.logrho().begin() + static_cast<long>(ia),
+                             in.logrho().begin() + static_cast<long>(ib) + 1);
+  std::vector<double> logtemp(in.logtemp().begin() + static_cast<long>(ja),
+                              in.logtemp().begin() + static_cast<long>(jb) + 1);
+  std::vector<double> ye(in.ye().begin() + static_cast<long>(ka),
+                         in.ye().begin() + static_cast<long>(kb) + 1);
+  out.set_axes(std::move(logrho), std::move(logtemp), std::move(ye));
+
+  for (const std::string &name : in.field_names()) {
+    if (fields != nullptr && std::find(fields->begin(), fields->end(), name) == fields->end()) {
+      continue;
+    }
+    const std::vector<double> &src = in.field(name);
+    std::vector<double> dst(out.nrho() * out.ntemp() * out.nye());
+    for (size_t k = 0; k < out.nye(); ++k) {
+      for (size_t j = 0; j < out.ntemp(); ++j) {
+        for (size_t i = 0; i < out.nrho(); ++i) {
+          dst[out.index(i, j, k)] = src[in.index(ia + i, ja + j, ka + k)];
+        }
+      }
+    }
+    out.add_field(name, std::move(dst));
+  }
+  if (fields != nullptr) {
+    for (const std::string &name : *fields) {
+      (void)in.field(name); // throws std::out_of_range for a name `in` lacks
+    }
+  }
+
+  for (const std::string &attr_name : in.attribute_names()) {
+    out.add_attribute(attr_name, in.attribute(attr_name));
+  }
+  return out;
+}
 
 } // namespace eeos

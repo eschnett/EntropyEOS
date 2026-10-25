@@ -489,6 +489,57 @@ TEST_CASE("EntropyEOSView::evaluate: derivatives match Richardson-extrapolated F
 // 5. Flags: s/rho/Ye out of range still return finite EOSPoints
 // ==========================================================================
 
+TEST_CASE("EntropyEOSView::evaluate: cs2 flags agree with the returned cs2 (1.2.0)") {
+  // A synthetic table with only the dirty preset's superluminal high-rho
+  // corner, built WITHOUT repair, so cs2 >= 1 really occurs in-box. Every
+  // sample -- in-box and in every extension band -- must carry exactly the
+  // flags its own returned cs2 implies.
+  SyntheticOptions opts;
+  opts.stiffen.push_back(eeos::StiffenDefect{"logenergy", 1e13, 2.0, 1.35e17});
+  RawTable table = eeos::make_synthetic_table(opts);
+  EntropyEOS adapter = eeos::build_entropy_eos(table);
+  const EntropyEOSView view = adapter.view();
+
+  std::mt19937 rng(20261025u);
+  std::uniform_real_distribution<double> xq(view.x_lo - 0.5, view.x_hi), yq(view.y_lo, view.y_hi),
+      fq(-0.2, 1.2);
+  const int n = eeos_n(20000, 2000);
+  int acausal = 0, mismatches = 0;
+  for (int i = 0; i < n; ++i) {
+    const double rho = std::pow(10.0, xq(rng));
+    const double ye = yq(rng);
+    const SRange sr = view.srange(rho, ye);
+    const double s = sr.s_min + fq(rng) * (sr.s_max - sr.s_min);
+    const EOSPoint pt = view.evaluate(rho, s, ye, nan_guess());
+    const bool want_acausal = !(pt.cs2 < 1.0);
+    const bool want_nonpositive = !(pt.cs2 > 0.0);
+    if (((pt.flags & eeos::flag_cs2_acausal) != 0) != want_acausal ||
+        ((pt.flags & eeos::flag_cs2_nonpositive) != 0) != want_nonpositive) {
+      ++mismatches;
+    }
+    if (want_acausal) ++acausal;
+  }
+  CHECK(mismatches == 0);
+  CHECK(acausal > 0); // the stiffened corner is sampled
+
+  // The bits sit outside both existing groups.
+  CHECK((eeos::flag_cs2_out_of_range & eeos::flag_pol_any) == 0u);
+  CHECK((eeos::flag_cs2_out_of_range & 0xffu) == 0u);
+}
+
+TEST_CASE("signal_cs2: clamps into [0, cs2_hi], NaN -> cs2_hi, passes valid values through") {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  CHECK(eeos::signal_cs2(nan) == 1.0);
+  CHECK(eeos::signal_cs2(nan, 0.99) == 0.99);
+  CHECK(eeos::signal_cs2(-0.3) == 0.0);
+  CHECK(eeos::signal_cs2(4.88) == 1.0);
+  CHECK(eeos::signal_cs2(4.88, 0.99) == 0.99);
+  CHECK(eeos::signal_cs2(std::numeric_limits<double>::infinity()) == 1.0);
+  for (double v : {0.0, 1e-300, 0.3331, 0.999999, 1.0}) {
+    CHECK(eeos::signal_cs2(v) == v); // bitwise pass-through inside [0, 1]
+  }
+}
+
 TEST_CASE("EntropyEOSView::evaluate: out-of-range flags, always finite") {
   SyntheticOptions opts;
   EntropyEOS adapter = build_synthetic(opts);
@@ -641,6 +692,12 @@ TEST_CASE("EntropyEOSView::srange: matches closed-form s(rho, T_min/T_max, Ye) a
   RawTable table = eeos::make_synthetic_table(opts);
   EntropyEOS adapter = eeos::build_entropy_eos(table);
   const EntropyEOSView view = adapter.view();
+  // The built box's own T range: since 1.2.0 the default build leaves the
+  // hottest row out of the fit (BuildOptions::trim_t_hi_rows = 1), so the
+  // top is the second-to-last table temperature, not opts.temp_max_MeV.
+  const double T_lo = std::pow(10.0, view.u_lo);
+  const double T_hi = std::pow(10.0, view.u_hi);
+  CHECK(view.u_hi == doctest::Approx(table.logtemp()[table.ntemp() - 2]).epsilon(1e-14));
 
   const double kappa = adapter.kappa();
   for (size_t i = 0; i < table.nrho(); ++i) {
@@ -652,8 +709,8 @@ TEST_CASE("EntropyEOSView::srange: matches closed-form s(rho, T_min/T_max, Ye) a
       // closed-form s reference stays a function of the physical rho.
       const SRange sr = view.srange(kappa * rho, ye);
 
-      const double s_lo_ref = eeos::synthetic_s(rho, opts.temp_min_MeV, ye, opts);
-      const double s_hi_ref = eeos::synthetic_s(rho, opts.temp_max_MeV, ye, opts);
+      const double s_lo_ref = eeos::synthetic_s(rho, T_lo, ye, opts);
+      const double s_hi_ref = eeos::synthetic_s(rho, T_hi, ye, opts);
 
       CHECK(rel_err(sr.s_min, s_lo_ref) <= 1e-10);
       CHECK(rel_err(sr.s_max, s_hi_ref) <= 1e-10);
@@ -1018,4 +1075,42 @@ TEST_CASE("EntropyEOSView::sigma_extended: strictly monotone increasing in u acr
       prev = cur;
     }
   }
+}
+
+TEST_CASE("build_entropy_eos: trim_t_hi_rows drops the hottest rows from the fit (1.2.0)") {
+  SyntheticOptions opts; // default grid, ntemp = 30
+  RawTable table = eeos::make_synthetic_table(opts);
+  const std::vector<double> &lt = table.logtemp();
+
+  // The build's and the repair's defaults agree, so the repair's causal-cap
+  // audit covers exactly the box the default build fits.
+  CHECK(BuildOptions().trim_t_hi_rows == 1);
+  CHECK(eeos::RepairOptions().trim_t_hi_rows == BuildOptions().trim_t_hi_rows);
+
+  for (int trim : {0, 1, 3}) {
+    BuildOptions bo;
+    bo.trim_t_hi_rows = trim;
+    const EntropyEOS adapter = eeos::build_entropy_eos(table, bo);
+    const EntropyEOSView view = adapter.view();
+    CHECK(view.u_lo == doctest::Approx(lt.front()).epsilon(1e-14));
+    CHECK(view.u_hi == doctest::Approx(lt[lt.size() - 1 - static_cast<size_t>(trim)]).epsilon(1e-14));
+
+    // A state at the table's own T_max lies inside the box only without a
+    // trim; with one it is served by the u-high tail -- finite and flagged.
+    const double rho = std::sqrt(std::pow(10.0, view.x_lo) * std::pow(10.0, view.x_hi));
+    const double ye = 0.5 * (view.y_lo + view.y_hi);
+    const double s = eeos::synthetic_s(rho / adapter.kappa(), opts.temp_max_MeV, ye, opts);
+    const EOSPoint pt = view.evaluate(rho, s, ye, nan_guess());
+    CHECK(std::isfinite(pt.U));
+    CHECK(std::isfinite(pt.cs2));
+    CHECK(((pt.flags & eeos::flag_ext_s_high) != 0) == (trim > 0));
+    CHECK(pt.T_F_MeV == doctest::Approx(opts.temp_max_MeV).epsilon(trim == 0 ? 1e-6 : 0.05));
+  }
+
+  BuildOptions too_many;
+  too_many.trim_t_hi_rows = static_cast<int>(table.ntemp()) - 3; // leaves 3 rows
+  CHECK_THROWS_AS(eeos::build_entropy_eos(table, too_many), std::runtime_error);
+  BuildOptions negative;
+  negative.trim_t_hi_rows = -1;
+  CHECK_THROWS_AS(eeos::build_entropy_eos(table, negative), std::runtime_error);
 }

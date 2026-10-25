@@ -6,6 +6,8 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "entropy_eos/host/table.hpp"
 
@@ -187,4 +189,35 @@ TEST_CASE("validate_axes: infinite axis throws") {
   const double inf = std::numeric_limits<double>::infinity();
   t.set_axes(/*logrho=*/{5.0, 6.0, 7.0}, /*logtemp=*/{0.0, inf}, /*ye=*/{0.1, 0.5});
   CHECK_THROWS_AS(t.validate_axes(), std::runtime_error);
+}
+
+TEST_CASE("crop_table: slices axes and fields verbatim, copies attributes, filters fields") {
+  RawTable t = make_small_table();
+  t.add_field("other", std::vector<double>(t.nrho() * t.ntemp() * t.nye(), 7.5));
+  t.add_attribute("energy_shift", 1.5e18);
+
+  const RawTable c = eeos::crop_table(t, 1, 2, 1, 1, 0, 1);
+  REQUIRE(c.nrho() == 2);
+  REQUIRE(c.ntemp() == 1);
+  REQUIRE(c.nye() == 2);
+  CHECK(c.logrho()[0] == 6.0);
+  CHECK(c.logtemp()[0] == 0.0);
+  CHECK(c.field_names() == t.field_names());
+  for (size_t k = 0; k < c.nye(); ++k) {
+    for (size_t i = 0; i < c.nrho(); ++i) {
+      CHECK(c.field("probe")[c.index(i, 0, k)] == t.field("probe")[t.index(1 + i, 1, k)]);
+    }
+  }
+  CHECK(c.attribute("energy_shift") == 1.5e18);
+
+  const std::vector<std::string> only = {"other"};
+  const RawTable f = eeos::crop_table(t, 0, 2, 0, 1, 0, 1, &only);
+  CHECK(f.field_names() == only);
+  CHECK_FALSE(f.has_field("probe"));
+  CHECK(f.has_attribute("energy_shift"));
+
+  CHECK_THROWS_AS(eeos::crop_table(t, 0, 3, 0, 1, 0, 1), std::out_of_range); // past the axis
+  CHECK_THROWS_AS(eeos::crop_table(t, 2, 1, 0, 1, 0, 1), std::out_of_range); // empty range
+  const std::vector<std::string> missing = {"nope"};
+  CHECK_THROWS_AS(eeos::crop_table(t, 0, 2, 0, 1, 0, 1, &missing), std::out_of_range);
 }

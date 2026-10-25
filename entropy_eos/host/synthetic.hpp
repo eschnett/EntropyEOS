@@ -94,6 +94,26 @@ struct StiffenDefect {
   double amplitude = 0.0; // erg/g; the term's value exactly at rho = rho_c_gcc
 };
 
+// Plants a rho-column stitching seam (1.2.0; mimics the Hempel DD2/SFHo
+// seam at rho ~ 1.4e7 g/cc, CODE.md open decision 6). Above log10(T/MeV) =
+// logT_onset, every node at irho >= irho_a + 2 is shifted by step(T), and the
+// node at irho_a + 1 by step(T)/2, where
+//
+//   step(T) = amplitude * ((logT - logT_onset) / (logT_max - logT_onset))^2
+//
+// with logT_max the grid's own top: a level step across cells irho_a ..
+// irho_a + 2 that grows smoothly from zero with T and is identical at every
+// Ye. It is applied as `step` to "logpress", `step/2` to "logenergy" (both
+// stored as log10) and as the factor 10^step to "entropy", so all three carry
+// the matching kink, as on the real tables. Because the shift only grows with
+// T, monotonicity in T is untouched; what it breaks is smoothness in rho,
+// which repair's seam-blend stage is built to restore.
+struct SeamDefect {
+  size_t irho_a = 0;
+  double logT_onset = 0.0;
+  double amplitude = 0.0; // step in log10(p) at the hottest row
+};
+
 // Sets the stored value of `field` at grid index (irho, jT, kYe) outright
 // (replacing it, not adding to it). Unlike SeededViolation's additive delta,
 // this can plant Inf/NaN cleanly -- used to mimic real tables' occasional
@@ -150,6 +170,7 @@ struct SyntheticOptions {
   std::vector<WiggleDefect> wiggle;
   std::vector<OffsetDefect> offset;
   std::vector<StiffenDefect> stiffen;
+  std::vector<SeamDefect> seam;
   std::vector<SeededViolation> seed;
   std::vector<SetValue> setvalue;
 };
@@ -204,15 +225,18 @@ double synthetic_cs2(double rho_gcc, double temp_MeV, double ye, const Synthetic
 //   2. opts.wiggle    (oscillatory perturbation)
 //   3. opts.offset    (constant shift)
 //   4. opts.stiffen   (smooth high-density power-law energy excess)
-//   5. opts.seed      (existing per-point additive violations)
-//   6. opts.setvalue  (outright sets, last, so a planted Inf/NaN cannot be
+//   5. opts.seam      (rho-column stitching seam at high T)
+//   6. opts.seed      (existing per-point additive violations)
+//   7. opts.setvalue  (outright sets, last, so a planted Inf/NaN cannot be
 //                       perturbed by any earlier or later step)
 // Every FlattenDefect/WiggleDefect/OffsetDefect/SetValue index (and, for the
 // block defects, irho0<=irho1, kYe0<=kYe1, jT0<=jT1) is validated against
 // the table's actual grid size; an out-of-range index throws
 // std::out_of_range (as does naming a field the table does not have, via
 // RawTable::field()). A StiffenDefect with a non-positive rho_c_gcc throws
-// std::invalid_argument. All defects are deterministic -- no RNG anywhere.
+// std::invalid_argument, as does a SeamDefect whose cells irho_a .. irho_a+2
+// do not fit the rho axis or whose logT_onset is not below the grid's top
+// temperature. All defects are deterministic -- no RNG anywhere.
 RawTable make_synthetic_table(const SyntheticOptions &opts = SyntheticOptions());
 
 // Default grid (40 x 30 x 10), with opts.with_aux_fields = true and a fixed
@@ -229,6 +253,9 @@ RawTable make_synthetic_table(const SyntheticOptions &opts = SyntheticOptions())
 //   - a "logenergy" StiffenDefect making the top rho cells superluminal at
 //     every T and Ye (mimics the LS220/SRO acausal high-density corner --
 //     eos-causality-repair.md S2 -- and exercises repair's causal-cap stage);
+//   - a SeamDefect at irho 13-15 in the top four T rows (mimics the Hempel
+//     DD2/SFHo rho-column stitching seam and exercises repair's seam-blend
+//     stage);
 //   - "cs2"/"gamma" SetValue defects planting Inf/NaN (mimics LS220's
 //     handful of non-finite cs2/gamma points).
 SyntheticOptions dirty_synthetic_options();

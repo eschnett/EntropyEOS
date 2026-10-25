@@ -646,6 +646,23 @@ std::string append_repair_group(const std::string &path, const RepairResult &res
   write_attr_uint64(group.get(), "causal_cs2_violations_after",
                      static_cast<std::uint64_t>(result.causal_cap.violations_after));
   write_attr_uint64(group.get(), "causal_reverted", result.causal_cap.reverted ? 1u : 0u);
+  // 1.2.0 seam-blend parameters and outcome (repair.hpp, RepairOptions::
+  // seam_blend): "seam_count" seams blended, "seam_unfaded" detected but
+  // left alone because they do not fade out (RepairResult::SeamBlendSummary).
+  write_attr_uint64(group.get(), "seam_blend", options.seam_blend ? 1u : 0u);
+  write_attr_double(group.get(), "seam_tol", options.seam_tol);
+  write_attr_uint64(group.get(), "seam_halfwidth",
+                     static_cast<std::uint64_t>(options.seam_halfwidth));
+  write_attr_uint64(group.get(), "seam_fit_cells",
+                     static_cast<std::uint64_t>(options.seam_fit_cells));
+  write_attr_uint64(group.get(), "seam_count",
+                     static_cast<std::uint64_t>(result.seam_blend.seams.size()));
+  write_attr_uint64(group.get(), "seam_unfaded",
+                     static_cast<std::uint64_t>(result.seam_blend.seams_unfaded.size()));
+  // 1.2.0 T_max trim of the causal-cap stage's fit (RepairOptions::
+  // trim_t_hi_rows): the box its audit and projection covered.
+  write_attr_uint64(group.get(), "trim_t_hi_rows",
+                     static_cast<std::uint64_t>(options.trim_t_hi_rows));
   write_attr_string(group.get(), "tool_version", tool_version);
   write_attr_string(group.get(), "input_path", input_path);
   write_attr_uint64(group.get(), "input_fnv1a", static_cast<std::uint64_t>(input_fnv1a));

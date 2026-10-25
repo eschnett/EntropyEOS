@@ -15,11 +15,11 @@
 // is therefore the idempotence check for a repaired table.
 //
 //   eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]
-//              [--no-spline-safe] [--no-spline-safe-3d]
-//              [--no-causal-cap] [--cs2-cap X] [--log FILE]
+//              [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]
+//              [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N] [--log FILE]
 //   eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]
-//              [--no-spline-safe] [--no-spline-safe-3d]
-//              [--no-causal-cap] [--cs2-cap X]
+//              [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]
+//              [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N]
 //   eos_repair --version
 //
 // Exit codes: 0 = already clean (which includes re-repairing an
@@ -55,14 +55,22 @@ const char *const kToolVersion = "entropy_eos eos_repair " EEOS_VERSION_STRING;
 void print_usage(std::ostream &os) {
   os << "usage:\n"
         "  eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]\n"
-        "             [--no-spline-safe] [--no-spline-safe-3d]\n"
-        "             [--no-causal-cap] [--cs2-cap X] [--log FILE]\n"
+        "             [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]\n"
+        "             [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N] [--log FILE]\n"
         "  eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]\n"
-        "             [--no-spline-safe] [--no-spline-safe-3d]\n"
-        "             [--no-causal-cap] [--cs2-cap X]\n"
+        "             [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]\n"
+        "             [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N]\n"
         "  eos_repair --version\n"
         "\n"
-        "Repairs a stellarcollapse-format EOS table so that \"entropy\" and\n"
+        "First -- unless --no-seam-blend -- the seam-blend stage (1.2.0, CODE.md\n"
+        "milestone M3k) finds rho-column stitching seams (a localized level step\n"
+        "in \"logpress\" across a few rho cells, at the same cells for every Ye,\n"
+        "fading out in T; the Hempel DD2/SFHo tables have one at rho ~ 1.4e7\n"
+        "g/cc above ~70 MeV) and replaces a window around each with a smooth\n"
+        "C^2 blend of the two sides, in \"entropy\", \"logenergy\" and\n"
+        "\"logpress\" alike -- the only stage that edits \"logpress\". A seam\n"
+        "that does not fade out within the rows where it can be followed is\n"
+        "reported, not blended. Then it repairs the table so that \"entropy\" and\n"
         "\"logenergy\" are strictly monotone increasing in temperature at every\n"
         "(rho, Ye): L2 isotonic regression (PAVA) followed by a minimum-slope\n"
         "strictification pass (see CODE.md \"Repair harness\"), then -- unless\n"
@@ -114,6 +122,9 @@ void print_usage(std::ostream &os) {
         "                      kB/baryon; default: RepairOptions::min_slope_entropy)\n"
         "  --min-slope-loge X  minimum logenergy slope per T grid step (absolute,\n"
         "                      log10(erg/g); default: RepairOptions::min_slope_logenergy)\n"
+        "  --no-seam-blend     skip the seam-blend stage\n"
+        "                      (RepairOptions::seam_blend = false); stitching\n"
+        "                      seams then pass through unchanged. On by default.\n"
         "  --no-spline-safe    skip the per-column spline-safe smoothing loop\n"
         "                      (RepairOptions::spline_safe = false); repair is\n"
         "                      then plain PAVA + strictification, as before\n"
@@ -131,6 +142,16 @@ void print_usage(std::ostream &os) {
         "                      cs2_max = 1.0, so the gap absorbs refit ringing\n"
         "                      and leaves the con2prim Newton some 1 - c_s^2\n"
         "                      conditioning headroom)\n"
+        "  --trim-t-hi N       how many of the hottest T rows the causal-cap stage\n"
+        "                      leaves out of its fit (RepairOptions::\n"
+        "                      trim_t_hi_rows, default 1): the same rows the\n"
+        "                      adapter build drops by default\n"
+        "                      (BuildOptions::trim_t_hi_rows), so the stage audits\n"
+        "                      exactly the fit the adapter evaluates; those rows'\n"
+        "                      logenergy is not capped, only shifted with the last\n"
+        "                      kept row so its T increments are kept. 0 = full\n"
+        "                      box, as before 1.2.0. Recorded in the provenance\n"
+        "                      group.\n"
         "  --log FILE          write a human-readable repair log to FILE (not\n"
         "                      valid together with --check-only)\n"
         "  -h, --help          print this message\n"
@@ -150,11 +171,14 @@ struct ParsedArgs {
   double min_slope_s = 0.0;
   bool have_min_slope_loge = false;
   double min_slope_loge = 0.0;
+  bool no_seam_blend = false;
   bool no_spline_safe = false;
   bool no_spline_safe_3d = false;
   bool no_causal_cap = false;
   bool have_cs2_cap = false;
   double cs2_cap = 0.0;
+  bool have_trim_t_hi = false;
+  long long trim_t_hi = 0;
   bool have_log = false;
   std::string log_path;
   std::vector<std::string> positionals;
@@ -200,6 +224,8 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
         return false;
       }
       out.have_min_slope_loge = true;
+    } else if (a == "--no-seam-blend") {
+      out.no_seam_blend = true;
     } else if (a == "--no-spline-safe") {
       out.no_spline_safe = true;
     } else if (a == "--no-spline-safe-3d") {
@@ -226,6 +252,25 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
         return false;
       }
       out.have_cs2_cap = true;
+    } else if (a == "--trim-t-hi") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_repair: option '--trim-t-hi' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.trim_t_hi = std::stoll(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_repair: invalid number for --trim-t-hi: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (out.trim_t_hi < 0) {
+        std::cerr << "eos_repair: --trim-t-hi must be >= 0\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_trim_t_hi = true;
     } else if (a == "--log") {
       if (i + 1 >= args.size()) {
         std::cerr << "eos_repair: option '--log' requires a value\n\n";
@@ -293,6 +338,10 @@ void write_log(const std::string &log_path, const std::string &in_path, const st
       << std::dec << std::setfill(' ') << "\n";
   log << "min_slope_entropy:   " << options.min_slope_entropy << "\n";
   log << "min_slope_logenergy: " << options.min_slope_logenergy << "\n";
+  log << "seam_blend:          " << (options.seam_blend ? "on" : "off") << "\n";
+  log << "seam_tol:            " << options.seam_tol << "\n";
+  log << "seam_halfwidth:      " << options.seam_halfwidth << "\n";
+  log << "seam_fit_cells:      " << options.seam_fit_cells << "\n";
   log << "spline_safe:         " << (options.spline_safe ? "on" : "off") << "\n";
   log << "spline_safe_3d:      " << (options.spline_safe_3d ? "on" : "off") << "\n";
   log << "causal_cap:          " << (options.causal_cap ? "on" : "off") << "\n";
@@ -301,6 +350,7 @@ void write_log(const std::string &log_path, const std::string &in_path, const st
   log << "causal_rounds_max:   " << options.causal_rounds_max << "\n";
   log << "trace_depth_max:     " << options.trace_depth_max << "\n";
   log << "anchor_pad:          " << options.anchor_pad << "\n";
+  log << "trim_t_hi_rows:      " << options.trim_t_hi_rows << "\n";
   log << "timestamp:           " << std::put_time(&now_tm, "%Y-%m-%dT%H:%M:%SZ") << "\n";
   log << "\n";
 
@@ -396,6 +446,9 @@ int main(int argc, char **argv) {
     if (pa.have_min_slope_loge) {
       repair_opts.min_slope_logenergy = pa.min_slope_loge;
     }
+    if (pa.no_seam_blend) {
+      repair_opts.seam_blend = false;
+    }
     if (pa.no_spline_safe) {
       repair_opts.spline_safe = false;
     }
@@ -407,6 +460,9 @@ int main(int argc, char **argv) {
     }
     if (pa.have_cs2_cap) {
       repair_opts.cs2_cap = pa.cs2_cap;
+    }
+    if (pa.have_trim_t_hi) {
+      repair_opts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);
     }
 
     eeos::RepairResult result = eeos::repair_table(table, repair_opts);

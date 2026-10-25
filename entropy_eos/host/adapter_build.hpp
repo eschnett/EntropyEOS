@@ -65,6 +65,19 @@ struct BuildOptions {
   // monotonicity floor ext_slope_floor_L wins lexicographically if the two
   // ever conflict (reported by check_adapter()'s extension-band map).
   double cs2_ext_cap = 0.99;
+
+  // 1.2.0: how many of the table's hottest T rows to leave out of the fit
+  // (CODE.md milestone M3k). The fitted box's u_hi -- and with it the M3g
+  // u-high tail's launch point -- becomes the last row kept, and states
+  // above it are served by that causal tail (flag_ext_s_high), exactly as
+  // states above T_max always were. Default 1, for every table: on the
+  // Hempel DD2/SFHo tables the T_max row is unreliable (its own stored cs2
+  // is garbage) and the fit's last T cell turns it into in-box c_s^2 >= 1
+  // and a superluminal u-high tail; on LS220/SRO dropping it is measured
+  // neutral to better. 0 restores the pre-1.2.0 full box. Keep it equal to
+  // RepairOptions::trim_t_hi_rows (same default), so the repair's
+  // causal-cap stage audits exactly the fit built here. Must be >= 0.
+  int trim_t_hi_rows = 1;
 };
 
 // One location recorded by the monotonicity audit below: the refined-grid
@@ -161,6 +174,10 @@ private:
 
 // Builds an EntropyEOS from `table` (see the module comment). Steps (see
 // eos-adapter-F-to-U.md S2-S5):
+//   0. If opts.trim_t_hi_rows > 0, everything below works on a copy of
+//      `table` cropped to its first ntemp - trim_t_hi_rows T rows (fields
+//      "entropy" and "logenergy" plus the attributes, via crop_table()); the
+//      built box ends at the last row kept.
 //   1. Validate axis uniformity/size and the required
 //      fields/attribute (see below); does not repair.
 //   2. Fit Sigma-hat over "entropy" and L-hat over "logenergy" on the
@@ -194,7 +211,8 @@ private:
 // Throws std::runtime_error if:
 //   - the rho/T/Ye axis is not uniform to within opts.uniform_tol (relative
 //     to that axis's own mean spacing), naming the offending axis;
-//   - any axis has fewer than 4 points;
+//   - any axis has fewer than 4 points (the T axis counted after the trim),
+//     or opts.trim_t_hi_rows is negative;
 //   - "logenergy" or "entropy" is missing from `table`, or contains a
 //     non-finite value;
 //   - the "energy_shift" attribute is missing.

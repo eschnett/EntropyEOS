@@ -100,4 +100,17 @@ private:
   std::unordered_map<std::string, size_t> attribute_index_;
 };
 
+// Slices `in` to the inclusive index box [ia, ib] x [ja, jb] x [ka, kb]
+// (rho x T x Ye): the three axes, every field (or only those named in
+// `fields`, kept in `in`'s own field order) copied verbatim, and every
+// attribute unchanged -- no unit conversion, no reinterpretation, so the
+// "RawTable is verbatim" rule holds for the result too. Used by
+// tools/eos_crop and by the adapter build's and the repair's T_max trim
+// (BuildOptions/RepairOptions::trim_t_hi_rows). Throws std::out_of_range if
+// a range is empty or reaches past its axis, and (via field()) if `fields`
+// names a field `in` does not have. Does not enforce any minimum axis size;
+// callers that fit the result check that themselves.
+RawTable crop_table(const RawTable &in, size_t ia, size_t ib, size_t ja, size_t jb, size_t ka,
+                    size_t kb, const std::vector<std::string> *fields = nullptr);
+
 } // namespace eeos

@@ -26,10 +26,11 @@
 //                              --synthetic-dirty)
 //            [--write-synthetic PATH] [--csv PREFIX] [--worst N]
 //            [--no-repair] [--node-stride N] [--soak N] [--m-B GRAMS]
+//            [--trim-t-hi N]
 //   eos_test --level con2prim (FILE.h5 | --synthetic | --synthetic-seeded |
 //                               --synthetic-dirty)
 //            [--write-synthetic PATH] [--csv PREFIX] [--worst N]
-//            [--no-repair] [--m-B GRAMS]
+//            [--no-repair] [--m-B GRAMS] [--trim-t-hi N]
 //            [--states N] [--wmax X] [--sigma-max X] [--rt-tol X]
 //            [--rho-atm X] [--w-cap X]
 //
@@ -102,9 +103,11 @@ void print_usage(std::ostream &os) {
         "                       fields (cs2/gamma/mu_e), and a fixed deterministic\n"
         "                       defect set (a wiggle-induced entropy\n"
         "                       non-monotone-T cluster, a logenergy plateau, a\n"
-        "                       negative-entropy cold corner, and planted\n"
-        "                       Inf/NaN in cs2/gamma) mimicking pathologies found\n"
-        "                       in the real LS220/SRO tables\n"
+        "                       negative-entropy cold corner, a superluminal\n"
+        "                       high-density corner, a rho-column stitching seam\n"
+        "                       at high T, and planted Inf/NaN in cs2/gamma)\n"
+        "                       mimicking pathologies found in the real\n"
+        "                       LS220/SRO/DD2/SFHo tables\n"
         "\n"
         "options:\n"
         "  --level LEVEL        check level: \"table\" (default), \"adapter\", or\n"
@@ -133,6 +136,11 @@ void print_usage(std::ostream &os) {
         "                       adapter/con2prim). Default is the amu; SRO tables\n"
         "                       empirically use the neutron mass 1.67492749804e-24 g\n"
         "                       (see CODE.md)\n"
+        "  --trim-t-hi N        --level adapter/con2prim only: how many of the\n"
+        "                       hottest T rows the build (and the in-memory\n"
+        "                       repair's causal-cap stage) leave out of the fit:\n"
+        "                       BuildOptions/RepairOptions::trim_t_hi_rows, default\n"
+        "                       1; 0 = the full table box, as before 1.2.0\n"
         "  --no-repair          --level adapter/con2prim only: skip the default\n"
         "                       in-memory repair_table() pass and build directly\n"
         "                       from the loaded table\n"
@@ -231,6 +239,8 @@ struct ParsedArgs {
   bool have_m_B = false;
   double m_B = 0.0;
   bool no_repair = false;
+  bool have_trim_t_hi = false;
+  long long trim_t_hi = 0;
   bool have_node_stride = false;
   long long node_stride = 0;
   bool have_soak = false;
@@ -335,6 +345,25 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
       out.have_m_B = true;
     } else if (a == "--no-repair") {
       out.no_repair = true;
+    } else if (a == "--trim-t-hi") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_test: option '--trim-t-hi' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.trim_t_hi = std::stoll(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_test: invalid number for --trim-t-hi: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (out.trim_t_hi < 0) {
+        std::cerr << "eos_test: --trim-t-hi must be >= 0\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_trim_t_hi = true;
     } else if (a == "--node-stride") {
       if (i + 1 >= args.size()) {
         std::cerr << "eos_test: option '--node-stride' requires a value\n\n";
@@ -510,6 +539,12 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
     return false;
   }
 
+  if (out.have_trim_t_hi && out.level != "adapter" && out.level != "con2prim") {
+    std::cerr << "eos_test: --trim-t-hi is only valid with --level adapter or --level con2prim\n\n";
+    print_usage(std::cerr);
+    return false;
+  }
+
   if (out.no_repair && out.level != "adapter" && out.level != "con2prim") {
     std::cerr << "eos_test: --no-repair is only valid with --level adapter or --level con2prim\n\n";
     print_usage(std::cerr);
@@ -561,7 +596,8 @@ eeos::RawTable load_table(const ParsedArgs &pa) {
     eeos::SyntheticOptions sopts = eeos::dirty_synthetic_options();
     std::cout << "eos_test --synthetic-dirty: dirty_synthetic_options() (" << sopts.flatten.size()
               << " flatten, " << sopts.wiggle.size() << " wiggle, " << sopts.offset.size()
-              << " offset, " << sopts.setvalue.size() << " setvalue defect(s), aux fields "
+              << " offset, " << sopts.stiffen.size() << " stiffen, " << sopts.seam.size()
+              << " seam, " << sopts.setvalue.size() << " setvalue defect(s), aux fields "
               << (sopts.with_aux_fields ? "on" : "off") << "):\n";
     for (const eeos::FlattenDefect &d : sopts.flatten) {
       std::cout << "  flatten " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
@@ -576,6 +612,14 @@ eeos::RawTable load_table(const ParsedArgs &pa) {
       std::cout << "  offset " << d.field << " irho=[" << d.irho0 << "," << d.irho1 << "] kYe=["
                  << d.kYe0 << "," << d.kYe1 << "] jT=[" << d.jT0 << "," << d.jT1
                  << "] offset=" << d.offset << "\n";
+    }
+    for (const eeos::StiffenDefect &d : sopts.stiffen) {
+      std::cout << "  stiffen " << d.field << " rho_c=" << d.rho_c_gcc << " alpha=" << d.alpha
+                 << " amplitude=" << d.amplitude << "\n";
+    }
+    for (const eeos::SeamDefect &d : sopts.seam) {
+      std::cout << "  seam irho=[" << d.irho_a << "," << d.irho_a + 2
+                 << "] logT_onset=" << d.logT_onset << " amplitude=" << d.amplitude << "\n";
     }
     for (const eeos::SetValue &v : sopts.setvalue) {
       std::cout << "  setvalue " << v.field << " at (irho=" << v.irho << ", jT=" << v.jT
@@ -667,10 +711,15 @@ int run_adapter_level(const ParsedArgs &pa) {
   eeos::RawTable table = load_table(pa);
 
   if (!pa.no_repair) {
-    const eeos::RepairResult repair_result = eeos::repair_table(table);
+    eeos::RepairOptions ropts;
+    if (pa.have_trim_t_hi) {
+      ropts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);
+    }
+    const eeos::RepairResult repair_result = eeos::repair_table(table, ropts);
     std::cout << "repair (in-memory): status="
               << (repair_result.status == eeos::Status::ok ? "ok" : "repaired")
-              << " entries=" << repair_result.entries.size();
+              << " entries=" << repair_result.entries.size()
+              << " seams=" << repair_result.seam_blend.seams.size();
     for (const eeos::RepairResult::FieldSummary &s : repair_result.summaries) {
       std::cout << " " << s.field << "_changed=" << s.modified;
     }
@@ -688,6 +737,9 @@ int run_adapter_level(const ParsedArgs &pa) {
     // collapse, CODE.md "M2 design notes"): SRO tables use the neutron mass
     // m_neutron_g; pass --m-B 1.67492749804e-24 for those.
     bopts.m_B_table_g = pa.m_B;
+  }
+  if (pa.have_trim_t_hi) {
+    bopts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);
   }
   const eeos::EntropyEOS adapter = eeos::build_entropy_eos(table, bopts);
 
@@ -722,10 +774,15 @@ int run_con2prim_level(const ParsedArgs &pa) {
   // it verbatim: check_con2prim() audits a built EntropyEOS, same as
   // check_adapter()).
   if (!pa.no_repair) {
-    const eeos::RepairResult repair_result = eeos::repair_table(table);
+    eeos::RepairOptions ropts;
+    if (pa.have_trim_t_hi) {
+      ropts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);
+    }
+    const eeos::RepairResult repair_result = eeos::repair_table(table, ropts);
     std::cout << "repair (in-memory): status="
               << (repair_result.status == eeos::Status::ok ? "ok" : "repaired")
-              << " entries=" << repair_result.entries.size();
+              << " entries=" << repair_result.entries.size()
+              << " seams=" << repair_result.seam_blend.seams.size();
     for (const eeos::RepairResult::FieldSummary &s : repair_result.summaries) {
       std::cout << " " << s.field << "_changed=" << s.modified;
     }
@@ -743,6 +800,9 @@ int run_con2prim_level(const ParsedArgs &pa) {
     // collapse, CODE.md "M2 design notes"): SRO tables use the neutron mass
     // m_neutron_g; pass --m-B 1.67492749804e-24 for those.
     bopts.m_B_table_g = pa.m_B;
+  }
+  if (pa.have_trim_t_hi) {
+    bopts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);
   }
   const eeos::EntropyEOS adapter = eeos::build_entropy_eos(table, bopts);
 

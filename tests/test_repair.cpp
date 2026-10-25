@@ -890,3 +890,187 @@ TEST_CASE("repair_table: a no-defect table leaves the 3D stage a true no-op") {
     CHECK(s.rounds3d_violation_history[1] == 0);
   }
 }
+
+// --- (8) 1.2.0 seam-blend stage ---------------------------------------------
+//
+// SeamDefect{13, 1.35, 0.04} on the default grid: a level step across irho
+// 13..15 in the top four T rows (jT 26..29), detected at the full seam_tol in
+// jT 27..29 and blended over jT 26..29 (see synthetic.cpp's dirty preset,
+// which plants the same seam).
+
+namespace {
+
+SyntheticOptions seam_only_options() {
+  SyntheticOptions opts;
+  opts.seam.push_back(eeos::SeamDefect{13, 1.35, 0.04});
+  return opts;
+}
+
+double logpress_d2(const RawTable &t, size_t irho, size_t jT, size_t kYe) {
+  const std::vector<double> &lp = t.field("logpress");
+  return lp[t.index(irho + 1, jT, kYe)] - 2.0 * lp[t.index(irho, jT, kYe)] +
+         lp[t.index(irho - 1, jT, kYe)];
+}
+
+} // namespace
+
+TEST_CASE("repair_table seam-blend: detects the planted seam and smooths it in all three fields") {
+  RawTable table = eeos::make_synthetic_table(seam_only_options());
+  const RawTable before = table;
+  const RepairResult result = eeos::repair_table(table);
+
+  const RepairResult::SeamBlendSummary &b = result.seam_blend;
+  CHECK(b.ran);
+  REQUIRE(b.seams.size() == 1);
+  CHECK(b.seams[0].irho_lo == 13);
+  CHECK(b.seams[0].irho_hi == 15);
+  CHECK(b.seams[0].jT_lo == 26);
+  CHECK(b.seams[0].jT_hi == 29);
+  CHECK(b.seams[0].jT_detect_lo == 27);
+  CHECK(b.seams[0].max_step == doctest::Approx(0.04).epsilon(0.05));
+  CHECK(b.seams_unfaded.empty());
+  CHECK(b.columns_blended == 4 * table.nye());
+  CHECK(b.columns_skipped == 0);
+
+  // The step is no longer localized: the blend spreads the same level change
+  // over the 13-cell window, so the largest second difference of logpress
+  // near the seam drops by more than an order of magnitude (from the step's
+  // own +-0.02 at the hottest row; what remains is the smoothstep's own
+  // curvature, ~ step * 6/13^2), and nothing seam-shaped is left -- which
+  // the idempotence test below checks via a second detection.
+  double max_before = 0.0, max_after = 0.0;
+  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+    for (size_t jT = 26; jT <= 29; ++jT) {
+      for (size_t irho = 6; irho <= 22; ++irho) {
+        max_before = std::max(max_before, std::fabs(logpress_d2(before, irho, jT, kYe)));
+        max_after = std::max(max_after, std::fabs(logpress_d2(table, irho, jT, kYe)));
+      }
+    }
+  }
+  CHECK(max_before == doctest::Approx(0.02).epsilon(1e-6));
+  CHECK(max_after < 0.1 * max_before);
+
+  // Every entry lies inside the blend window irho [8, 20] x jT [26, 29], all
+  // three fields have some, logpress entries come last, and the logged old
+  // values are the input's.
+  size_t n_entropy = 0, n_logenergy = 0, n_logpress = 0;
+  bool seen_logpress = false, order_ok = true;
+  for (const RepairEntry &e : result.entries) {
+    CHECK(e.irho >= 8);
+    CHECK(e.irho <= 20);
+    CHECK(e.jT >= 26);
+    CHECK(e.old_value == before.field(e.field)[before.index(e.irho, e.jT, e.kYe)]);
+    if (e.field == "entropy") ++n_entropy;
+    if (e.field == "logenergy") ++n_logenergy;
+    if (e.field == "logpress") {
+      ++n_logpress;
+      seen_logpress = true;
+    } else if (seen_logpress) {
+      order_ok = false;
+    }
+  }
+  CHECK(n_entropy > 0);
+  CHECK(n_logenergy > 0);
+  CHECK(n_logpress == b.logpress_modified);
+  CHECK(n_logpress > 0);
+  CHECK(order_ok);
+}
+
+TEST_CASE("repair_table seam-blend: idempotent, deterministic, and off means off") {
+  RawTable first = eeos::make_synthetic_table(seam_only_options());
+  const RepairResult r1 = eeos::repair_table(first);
+  REQUIRE(r1.seam_blend.seams.size() == 1);
+
+  RawTable again = first;
+  const RepairResult r2 = eeos::repair_table(again);
+  CHECK(r2.seam_blend.ran);
+  CHECK(r2.seam_blend.seams.empty());
+  CHECK(r2.entries.empty());
+  CHECK(r2.status == eeos::Status::ok);
+
+  RawTable other = eeos::make_synthetic_table(seam_only_options());
+  const RepairResult r3 = eeos::repair_table(other);
+  CHECK(entries_equal(r1.entries, r3.entries));
+  for (const char *f : {"entropy", "logenergy", "logpress"}) {
+    CHECK(fields_bit_identical(first, other, f));
+  }
+
+  RawTable off = eeos::make_synthetic_table(seam_only_options());
+  const RawTable off_before = off;
+  RepairOptions opts;
+  opts.seam_blend = false;
+  const RepairResult r4 = eeos::repair_table(off, opts);
+  CHECK_FALSE(r4.seam_blend.ran);
+  CHECK(fields_bit_identical(off, off_before, "logpress"));
+  for (const RepairEntry &e : r4.entries) {
+    CHECK(e.field != "logpress");
+  }
+}
+
+TEST_CASE("repair_table seam-blend: a clean table is a bitwise no-op, and the stage needs "
+          "logpress") {
+  RawTable clean = eeos::make_synthetic_table();
+  const RawTable clean_before = clean;
+  const RepairResult r = eeos::repair_table(clean);
+  CHECK(r.seam_blend.ran);
+  CHECK(r.seam_blend.seams.empty());
+  CHECK(r.seam_blend.seams_unfaded.empty());
+  CHECK(r.seam_blend.logpress_modified == 0);
+  CHECK(fields_bit_identical(clean, clean_before, "logpress"));
+
+  // Without a logpress field the stage is skipped, not an error.
+  RawTable no_p;
+  {
+    RawTable full = eeos::make_synthetic_table(seam_only_options());
+    no_p.set_axes(full.logrho(), full.logtemp(), full.ye());
+    no_p.add_field("entropy", full.field("entropy"));
+    no_p.add_field("logenergy", full.field("logenergy"));
+    no_p.add_attribute("energy_shift", full.energy_shift());
+  }
+  const RepairResult r2 = eeos::repair_table(no_p);
+  CHECK_FALSE(r2.seam_blend.ran);
+}
+
+TEST_CASE("repair_table seam-blend: a seam that does not fade where it can be followed is "
+          "reported, not blended") {
+  // The step now starts below the grid, so it is present (and growing) in
+  // every row; making the ground loud at irho 10 for jT <= 20 hides its
+  // pattern there while the step itself is still large. Blending only
+  // jT 21..29 would leave an edit edge of the step's size between jT 20 and
+  // 21, so the stage must leave the seam alone and say so.
+  SyntheticOptions opts;
+  opts.seam.push_back(eeos::SeamDefect{13, -1.801, 0.04});
+  RawTable table = eeos::make_synthetic_table(opts);
+  std::vector<double> &lp = table.field("logpress");
+  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+    for (size_t jT = 0; jT <= 20; ++jT) {
+      lp[table.index(10, jT, kYe)] += 0.01;
+    }
+  }
+  const RawTable before = table;
+  const RepairResult r = eeos::repair_table(table);
+  CHECK(r.seam_blend.ran);
+  CHECK(r.seam_blend.seams.empty());
+  REQUIRE(r.seam_blend.seams_unfaded.size() == 1);
+  CHECK(r.seam_blend.seams_unfaded[0].irho_lo == 13);
+  CHECK(r.seam_blend.seams_unfaded[0].irho_hi == 15);
+  CHECK(r.seam_blend.seams_unfaded[0].jT_lo == 21);
+  CHECK(r.seam_blend.seams_unfaded[0].jT_hi == 29);
+  CHECK(fields_bit_identical(table, before, "logpress"));
+}
+
+TEST_CASE("repair_table seam-blend: invalid options throw before anything is modified") {
+  RawTable table = eeos::make_synthetic_table(seam_only_options());
+  const RawTable before = table;
+  for (int which = 0; which < 4; ++which) {
+    RepairOptions opts;
+    if (which == 0) opts.seam_tol = 0.0;
+    if (which == 1) opts.seam_fit_cells = 2;
+    if (which == 2) opts.seam_halfwidth = 0;
+    if (which == 3) opts.seam_halfwidth = opts.seam_fit_cells + 1;
+    CHECK_THROWS_AS(eeos::repair_table(table, opts), std::invalid_argument);
+    for (const char *f : {"entropy", "logenergy", "logpress"}) {
+      CHECK(fields_bit_identical(table, before, f));
+    }
+  }
+}

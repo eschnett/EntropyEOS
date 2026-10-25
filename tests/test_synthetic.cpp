@@ -276,7 +276,9 @@ TEST_CASE("synthetic table: default options (all defect vectors empty) are a no-
 // (see synthetic.cpp): wiggle on "entropy" over irho[30,35] x kYe[6,8] x
 // jT[10,20]; flatten on "logenergy" over irho[5,15] x kYe[2,4] x jT[3,12];
 // offset on "entropy" over irho[0,3] x kYe[0,2] x jT[0,2]; setvalue on "cs2"
-// at (20,15,5) (+Inf) and (21,16,5) (NaN), and on "gamma" at (20,15,5) (NaN).
+// at (20,15,5) (+Inf) and (21,16,5) (NaN), and on "gamma" at (20,15,5) (NaN);
+// a seam (logpress, logenergy, entropy) over irho[14,39] x jT[26,29], every
+// kYe (SeamDefect{13, 1.35, 0.04}).
 
 TEST_CASE("dirty_synthetic_options: default grid, aux fields present") {
   RawTable table = eeos::make_synthetic_table(dirty_synthetic_options());
@@ -358,7 +360,8 @@ TEST_CASE("dirty_synthetic_options: no block defect outside the specified blocks
   };
   // Chosen to sit outside every defect block: flatten is irho[5,15] x
   // kYe[2,4] x jT[3,12]; wiggle is irho[30,35] x kYe[6,8] x jT[10,20];
-  // offset is irho[0,3] x kYe[0,2] x jT[0,2]; setvalue hits exactly
+  // offset is irho[0,3] x kYe[0,2] x jT[0,2]; the seam is irho[14,39] x
+  // jT[26,29] at every kYe; setvalue hits exactly
   // (20,15,5)/(21,16,5) in "cs2" and (20,15,5) in "gamma". Each point below
   // fails at least one of the three range conditions for every block (a
   // block only applies where irho, kYe, *and* jT are all in range at once),
@@ -396,11 +399,11 @@ TEST_CASE("dirty_synthetic_options: the stiffened corner adds A*(rho/rho_c)^alph
   const std::vector<double> &ld = dirty.field("logenergy");
 
   // Away from the other defects' blocks (irho >= 20 excludes flatten; kYe = 0
-  // excludes wiggle), the dirty logenergy is exactly the clean one with the
-  // power-law term added to 10^value.
+  // excludes wiggle; jT < 26 excludes the seam), the dirty logenergy is
+  // exactly the clean one with the power-law term added to 10^value.
   for (size_t irho = 20; irho < dirty.nrho(); ++irho) {
     const double term = amp * std::pow(dirty.rho(irho) / rho_c, alpha);
-    for (size_t jT = 0; jT < dirty.ntemp(); ++jT) {
+    for (size_t jT = 0; jT < 26; ++jT) {
       const size_t idx = dirty.index(irho, jT, 0);
       const double expect = std::log10(std::pow(10.0, lc[idx]) + term);
       CHECK(ld[idx] == doctest::Approx(expect).epsilon(1e-14));
@@ -426,4 +429,38 @@ TEST_CASE("dirty_synthetic_options: the stiffened corner adds A*(rho/rho_c)^alph
   for (size_t jT = 0; jT < dirty.ntemp(); ++jT) {
     CHECK(ld[dirty.index(0, jT, 9)] == lc[dirty.index(0, jT, 9)]);
   }
+}
+
+TEST_CASE("dirty_synthetic_options: the seam is a Ye-independent level step across irho 13..15 "
+          "in the top four T rows") {
+  // The preset's SeamDefect{13, 1.35, 0.04} (see synthetic.cpp).
+  SyntheticOptions clean_opts;
+  clean_opts.with_aux_fields = true;
+  RawTable clean = eeos::make_synthetic_table(clean_opts);
+  RawTable dirty = eeos::make_synthetic_table(dirty_synthetic_options());
+  const std::vector<double> &pc = clean.field("logpress");
+  const std::vector<double> &pd = dirty.field("logpress");
+  const double logT_max = dirty.logtemp().back();
+
+  for (size_t kYe = 0; kYe < dirty.nye(); ++kYe) {
+    for (size_t jT = 0; jT < dirty.ntemp(); ++jT) {
+      const double lt = dirty.logtemp()[jT];
+      const double z = lt > 1.35 ? (lt - 1.35) / (logT_max - 1.35) : 0.0;
+      const double step = 0.04 * z * z;
+      CHECK((step > 0.0) == (jT >= 26));
+      for (size_t irho = 0; irho < dirty.nrho(); ++irho) {
+        const double shift = irho <= 13 ? 0.0 : (irho == 14 ? 0.5 * step : step);
+        const size_t idx = dirty.index(irho, jT, kYe);
+        CHECK(pd[idx] - pc[idx] == doctest::Approx(shift).epsilon(1e-12).scale(1.0));
+      }
+    }
+  }
+}
+
+TEST_CASE("SeamDefect: cells that do not fit, or an onset at the top, throw") {
+  SyntheticOptions opts;
+  opts.seam.push_back(eeos::SeamDefect{opts.nrho - 2, 1.0, 0.01});
+  CHECK_THROWS_AS(eeos::make_synthetic_table(opts), std::invalid_argument);
+  opts.seam.back() = eeos::SeamDefect{10, std::log10(opts.temp_max_MeV), 0.01};
+  CHECK_THROWS_AS(eeos::make_synthetic_table(opts), std::invalid_argument);
 }
