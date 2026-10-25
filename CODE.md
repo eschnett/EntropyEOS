@@ -40,7 +40,7 @@ its §10 audit list and §11 API are implemented here). Items marked **[decide]*
 Semantic versioning, recorded in the source; the `main` branch carries the history (no
 git tags). **1.0.0** was the first release: M1–M4 complete and measured (see
 "Milestones"), the API below stable under the contract in this section. The current
-version is **1.1.0**.
+version is **1.2.0**.
 
 ### Mechanism
 
@@ -71,7 +71,7 @@ Two things sit on top of it:
   (b) (`make install PREFIX=…`, see "Environment"), where headers and the archive are two
   separately installed artifacts and a stale archive under an updated include tree links
   silently. Mode (a) (copied source) cannot drift and pays nothing for the check. The
-  archive also carries an `@(#)entropy_eos-1.1.0` ident string, so
+  archive also carries an `@(#)entropy_eos-1.2.0` ident string, so
   `strings libentropy_eos.a | grep entropy_eos-` identifies a binary whose provenance is
   otherwise lost.
 - `--version` on every tool (`eos_repair`, `eos_test`, `eos_crop`), answered before
