@@ -566,7 +566,10 @@ EEOS_HOST_DEVICE inline real aeval_lock_weight(real A, real B, real C, real D, r
   real z = (cap - c_inf) / kLockGateWidth;
   if (!(z > real(0))) return real(0); // also NaN
   if (z > real(1)) z = real(1);
-  return z * z * z * (real(10) - real(15) * z + real(6) * z * z);
+  // The smoothstep is exactly 1 at z = 1, but just below it rounding (and
+  // FMA contraction, e.g. g++ on x86-64) can land one ulp above 1.
+  const real s = z * z * z * (real(10) - real(15) * z + real(6) * z * z);
+  return s < real(1) ? s : real(1);
 }
 
 enum class TailAxis { x, u };
