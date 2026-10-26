@@ -5,7 +5,9 @@ Draft v0.2, August 27, 2026. Companion to `eos-adapter-F-to-U.md` (§8 requireme
 `z_w = z(1−c_s²)tanh w` conditioning that motivates this). **Approved 2026-08-27**
 (stage default on, `cs2_cap = 0.99`); **implemented 2026-08-27** as the M3f
 `RepairOptions::causal_cap` stage of `entropy_eos/host/repair.{hpp,cpp}`, with the
-measured results in §10 below and in CODE.md's "M3f empirical findings".
+measured results in §10 below and in CODE.md's "M3f empirical findings". **Amended
+2026-10-26 (1.3.0, M3l):** default `cs2_cap = 0.95` and a proportional tolerance in
+the backstop's monotonicity rule — §11.
 
 ## 1. Problem
 
@@ -176,7 +178,9 @@ file contains, exactly the box the adapter build fits.
    order: (a) monotonicity violation counts no worse than the pre-stage state,
    (b) c_s² violation count minimal among audited states. If (a) fails, revert to
    the pre-stage state (never trade the T-solve's hard requirement for
-   causality); the stage then reports itself reverted.
+   causality); the stage then reports itself reverted. (**1.3.0, §11:** (a) allows
+   a regression of `floor(causal_mono_slack · before)` samples, default 0.1%, for a
+   state that also has strictly fewer c_s² violations.)
 
 Write-back, provenance, determinism, and `--check-only` semantics are unchanged:
 every changed value becomes a `RepairEntry` (field `"logenergy"`, old/new vs. the
@@ -193,10 +197,11 @@ chain stays auditable through each group's own `input_fnv1a`.)
 |---|---|---|
 | `causal_cap` | on (decided) | run the stage at all |
 | `cs2_max` | 1.0 | audit threshold: a sample with c_s² ≥ this is a violation |
-| `cs2_cap` | 0.99 (decided) | target slope c̄ of the projection (hysteresis vs. cs2_max absorbs refit ringing; `1−cs2` conditioning headroom for the Newton) |
+| `cs2_cap` | 0.95 (1.3.0, §11; was 0.99) | target slope c̄ of the projection (hysteresis vs. cs2_max absorbs refit ringing; `1−cs2` conditioning headroom for the Newton) |
 | `causal_rounds_max` | 64 (M3j; was 8) | absolute ceiling on the round count — a runaway backstop, not a working budget: the loop stops on its own once two consecutive rounds fail to improve. Measured need: ≤ 10 rounds (LS220/SRO/DD2), 30 (SFHo) |
 | `trace_depth_max` | 64 | cells the anchor search may descend before giving up on a node (report, don't edit) — measured depth: ≤ 11 (LS220), ≤ 18 (SRO) |
 | `anchor_pad` | 2 | consecutive causal refined steps required before anchoring (hysteresis) |
+| `causal_mono_slack` | 1e-3 (1.3.0, §11) | step 6's tolerance on the `logenergy` monotonicity count, as a fraction of the pre-stage count, granted only to a state with fewer c_s² violations; 0 is the strict rule |
 
 `eos_repair` grows `--no-causal-cap` and `--cs2-cap X`. The default is **on**
 (decided 2026-08-27): the tool's contract is "make the table satisfy the hard
@@ -267,7 +272,8 @@ unphysical by its own stored `cs2` column.
 1. ~~Stage default~~ — decided 2026-08-27: **on**, with `--no-causal-cap` to opt
    out.
 2. ~~`cs2_cap`~~ — decided 2026-08-27: **0.99** (revisit only if the measured
-   fidelity cost or residual ringing says otherwise).
+   fidelity cost or residual ringing says otherwise). **Revisited 2026-10-26**: the
+   residual ringing did say otherwise — 0.95 with a backstop tolerance (§11).
 3. ~~SRO map~~ — done (§2): same suffix corner, depth ≤ 18, stored relativistic
    cs2 agrees 100%; `trace_depth_max = 64` stands. SRO's interior sliver at
    (ρ ≈ 2.7×10¹³, Ye = 0.645) is v1-untouched by the scoping rule; if M3 testing
@@ -318,3 +324,53 @@ at nodes while `c_s²` is a second derivative of the fit, so the stage needs
 tables (~0.1%), false on coarse synthetic grids (~3% at 0.26 dex/cell), which is why
 the CI preset only asserts detection and reduction while the ρ-resolved unit test
 asserts zero.
+
+## 11. Amendment (1.3.0, M3l): backstop tolerance and `cs2_cap = 0.95`
+
+Both findings of §10 were re-measured on five tables (LS220-2009, SRO, DD2, SFHo and
+APR-LDP, an SROEOS table whose own `cs2` exceeds 1 above ρ ≈ 1.55×10¹⁵ g/cm³), and
+both are changed. Numbers: CODE.md, "M3l empirical findings".
+
+**The tolerance.** Step 6(a) becomes
+
+    keep  iff  mono_after ≤ mono_before + (cs2_after < cs2_before ? slack : 0)
+          and  cs2_after ≤ cs2_before,     slack = floor(causal_mono_slack · mono_before),
+
+with `causal_mono_slack = 1e-3` (`RepairOptions`, `--causal-mono-slack`, recorded in
+the provenance group; `causal_backstop_keeps()` is the rule itself, exposed for unit
+tests). Three properties are deliberate:
+
+- *Proportional to the pre-stage count.* A table without monotonicity residual gets
+  no slack, so the stage can never introduce that defect class into a table that did
+  not already carry it (the synthetic tables all have count 0 and stay strict).
+- *Granted only for causality.* A projection that does not strictly reduce the c_s²
+  count gets no slack; the tolerance trades a little of one residual for a lot of
+  the other, never for nothing.
+- *Small.* 0.1% is 20 samples on LS220's 20,650. It absorbs the regressions that made
+  the outcome discontinuous in the cap — +2 to +14 samples at caps 0.98, 0.97, 0.945
+  and 0.94, which previously reverted the whole stage — and still rejects +51 at
+  0.93. The regressed samples are all in the ρ_max cell's cold end, inside the capped
+  corner, with `|L_u| ≤ 1.5×10⁻¹¹`: the projection making the degenerate corner's
+  `logenergy` T-flat to round-off. They do not change the adapter's worst `L_u`
+  (3.7×10⁻²), its `roundtrip_T` count (0), or con2prim's 40,000-state failures.
+
+With it, LS220's residual is continuous in the cap: 4,054 (0.99), 1,093 (0.98), 396
+(0.97), 241 (0.96), 209 (0.95), 197 (0.94) refined samples, then a revert at 0.93.
+
+**The cap.** §10's "0.99 is not the best point on its own curve" holds on every
+table. The projection controls ε at nodes while c_s² is a second derivative of the
+refit, so the refit rings around the cap; a 1% gap leaves the capped corner with
+samples above 1. At 0.95 the adapter's in-box `c_s² ≥ 1` count is 0 on LS220, SRO
+and SFHo (from 49 / 70 / 17) and falls 3,165 → 257 on APR-LDP, whose
+interpolation-noisy corner (a period-3 sawtooth in the fit's second derivatives from
+merging a 50-per-decade source table onto 30 per decade) needs the wider gap most.
+DD2 does not change: its cap never acts. The cost: no table gains an edit larger than
+10⁻³ dex on a node its own stored `cs2` calls causal; the already-acausal corner is
+edited slightly deeper (largest `|Δ log₁₀(ε + shift)|` LS220 0.081 → 0.097, SRO 0.085
+→ 0.104, APR-LDP 0.518 → 0.548). Lower is not better everywhere: SRO's residual
+rises again at 0.93 (5,118 → 46,078 refined samples), so 0.95 is the best single
+value measured, and the per-table optimum (0.95–0.97, APR-LDP 0.93) does not
+justify per-table defaults. `cs2_ext_cap`, the adapter's extension-tail cap that
+was set to "match `cs2_cap`" (`eos-causal-tail.md`), stays 0.99: it is a separate
+mechanism, and lowering it has not been measured.
+

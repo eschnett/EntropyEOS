@@ -14,7 +14,7 @@
 // The single place a release is recorded. Everything below is derived from
 // these three numbers, so a bump means editing exactly this block.
 #define EEOS_VERSION_MAJOR 1
-#define EEOS_VERSION_MINOR 2
+#define EEOS_VERSION_MINOR 3
 #define EEOS_VERSION_PATCH 0
 
 // Encoded as major*10000 + minor*100 + patch, so that a consumer can compile

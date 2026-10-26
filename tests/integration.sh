@@ -182,11 +182,12 @@ fi
 # NOT be asserted is a zero residual: the default synthetic grid's rho axis is
 # 0.256 dex per cell, coarse enough that the fitted cubic's second derivative
 # -- which is what c_s^2 is built from -- carries a ~3% error on a capped
-# profile, larger than the 1% cs2_max/cs2_cap hysteresis, so the stage
-# collapses the corner's severity but cannot drive the sample count to zero on
-# THIS grid. tests/test_causal_cap.cpp plants the same defect on a
-# rho-resolved grid, where the identical stage does reach zero; the real
-# tables (Part B) are rho-resolved like that one, not like this one.
+# profile. Under 1.2.0's 1% cs2_max/cs2_cap gap (cs2_cap = 0.99) that left
+# 12,425 of 24,833 refined samples; under 1.3.0's 5% gap (0.95) the corner
+# converges and 329 remain, all in interior runs of the preset's other
+# defects, which the stage reports and never edits. tests/test_causal_cap.cpp
+# plants the same defect on a rho-resolved grid, where the identical stage
+# reaches zero.
 cc_line=$(grep -E '^  causal-cap: ' "$T/dirty_repair.log" || true)
 if [ -z "$cc_line" ]; then
   echo "FAIL: eos_repair log has no causal-cap summary line"
