@@ -1767,6 +1767,24 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
 
   RepairResult result;
 
+  // T-row trim (repair.hpp, RepairOptions::trim_t_hi_rows): drop the hottest
+  // rows the table has not already had dropped, before anything else looks
+  // at it, and record the running total in the table itself.
+  {
+    const double already_d =
+        table.has_attribute(kTHiRowsDroppedAttr) ? table.attribute(kTHiRowsDroppedAttr) : 0.0;
+    const size_t already = already_d > 0.0 ? static_cast<size_t>(already_d) : 0;
+    const size_t want = static_cast<size_t>(options.trim_t_hi_rows);
+    const size_t drop = want > already ? want - already : 0;
+    result.logtemp_max_before = table.logtemp().back();
+    if (drop > 0 && table.ntemp() >= drop + 4) {
+      table = crop_table(table, 0, table.nrho() - 1, 0, table.ntemp() - 1 - drop, 0, table.nye() - 1);
+      table.add_attribute(kTHiRowsDroppedAttr, static_cast<double>(already + drop));
+      result.t_hi_rows_dropped = drop;
+    }
+    result.logtemp_max_after = table.logtemp().back();
+  }
+
   const size_t nrho = table.nrho();
   const size_t ntemp = table.ntemp();
   const size_t nye = table.nye();
@@ -1863,43 +1881,8 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
       const bool have_l = !stats3d_by_field[li].violation_history.empty();
       const size_t mono_s = stats3d_by_field[si].violations_remaining;
       const size_t mono_l = stats3d_by_field[li].violations_remaining;
-      const size_t trim = static_cast<size_t>(options.trim_t_hi_rows);
-      if (trim == 0) {
-        causal_cap_stage(table, table.field("entropy"), table.field("logenergy"), options,
-                         have_s ? &mono_s : nullptr, have_l ? &mono_l : nullptr,
-                         result.causal_cap);
-      } else if (ntemp >= trim + 4) {
-        // The adapter build's box (BuildOptions::trim_t_hi_rows): run the
-        // stage on that crop and copy its logenergy back. The 3D stage's
-        // counts describe the full table, so the stage measures its own
-        // pre-stage monotonicity counts on the crop.
-        const std::vector<std::string> both = {"entropy", "logenergy"};
-        RawTable box = crop_table(table, 0, nrho - 1, 0, ntemp - 1 - trim, 0, nye - 1, &both);
-        causal_cap_stage(box, box.field("entropy"), box.field("logenergy"), options, nullptr,
-                         nullptr, result.causal_cap);
-        std::vector<double> &logenergy = table.field("logenergy");
-        const std::vector<double> &box_logenergy = box.field("logenergy");
-        const size_t j_last = box.ntemp() - 1;
-        for (size_t kYe = 0; kYe < nye; ++kYe) {
-          for (size_t irho = 0; irho < nrho; ++irho) {
-            // The trimmed rows follow the last kept row's change, so the
-            // stored increments in T above the box stay exactly as they
-            // were. Left alone, a capped last row under an uncapped trimmed
-            // row is a new kink in T that the next run's per-column stage
-            // would smooth back into the box, undoing idempotence.
-            const double shift = box_logenergy[box.index(irho, j_last, kYe)] -
-                                 logenergy[table.index(irho, j_last, kYe)];
-            for (size_t jT = 0; jT < box.ntemp(); ++jT) {
-              logenergy[table.index(irho, jT, kYe)] = box_logenergy[box.index(irho, jT, kYe)];
-            }
-            if (shift != 0.0) {
-              for (size_t jT = box.ntemp(); jT < ntemp; ++jT) {
-                logenergy[table.index(irho, jT, kYe)] += shift;
-              }
-            }
-          }
-        }
-      }
+      causal_cap_stage(table, table.field("entropy"), table.field("logenergy"), options,
+                       have_s ? &mono_s : nullptr, have_l ? &mono_l : nullptr, result.causal_cap);
     }
   }
 
@@ -1978,13 +1961,18 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
     }
   }
 
-  result.status = result.entries.empty() ? Status::ok : Status::repaired;
+  result.status =
+      result.entries.empty() && result.t_hi_rows_dropped == 0 ? Status::ok : Status::repaired;
   return result;
 }
 
 void RepairResult::print(std::ostream &os) const {
   os << "repair_table: " << (status == Status::ok ? "no changes (already monotone)" : "repaired")
      << "\n";
+  if (t_hi_rows_dropped > 0) {
+    os << "  t-trim: dropped " << t_hi_rows_dropped << " hottest T row(s), log10(T_max/MeV) "
+       << logtemp_max_before << " -> " << logtemp_max_after << "\n";
+  }
   const SeamBlendSummary &b = seam_blend;
   if (b.ran) {
     os << "  seam-blend: seams=" << b.seams.size() << " columns_blended=" << b.columns_blended

@@ -326,7 +326,17 @@ logic at all. The tool never modifies its input; it writes a faithful copy of ev
 untouched dataset alongside the repaired fields, a `/repair` provenance group recording
 per-field indices, old and new values, parameters, tool version and an input checksum,
 and a human-readable log. Only `entropy` and `logenergy` are ever edited, plus `logpress`
-by the seam blend below, the one stage that keeps it consistent with them. A missing or
+by the seam blend below, the one stage that keeps it consistent with them. Since 1.2.0 the
+repair also drops the table's hottest temperature row before anything else
+(`RepairOptions::trim_t_hi_rows = 1`, `--trim-t-hi 0` keeps it): on DD2 and SFHo that row
+is unreliable — its own stored sound speed is garbage, its temperature derivatives are
+noisy — and the fit's last cell turns it into in-box $c_s^2 \ge 1$ and a superluminal hot
+tail, while on LS220 and SRO dropping it is measured to be neutral or better. Dropping it
+from the *file*, rather than only from the fit, is deliberate: every row of a repaired
+table is a repaired row, so any code that reads the file and fits all of it — this
+library's build, an older release, another interpolator — sees the same data. The
+output records the trim (`eeos_t_hi_rows_dropped`), so re-repairing it drops nothing
+more. A missing or
 non-finite value in one of *those* is fatal — a broken file, not physics noise, and the
 run throws before touching anything — whereas non-finite values in columns the pipeline
 never interprets are reported and passed through byte-identically, which is what lets
@@ -397,9 +407,7 @@ temperature, and takes the violation count from 4,076,091 to 7,622 — of which 
 exactly those untouched interior runs. A lexicographic backstop then requires that
 monotonicity counts have not regressed and the $c_s^2$ count has not risen, reverting
 the entire stage otherwise: causality is never enforced at the price of the $T$-solve's
-hard requirement. The stage audits exactly the box the adapter build fits, which by
-default leaves the hottest temperature row out (below), and the rows left out only
-follow the last kept row's change so their increments in $T$ are kept.
+hard requirement.
 
 The interior runs it leaves alone are almost all the $\sigma_T$ pockets below
 $T \approx 0.1$ MeV, where the tables reach far below the validity of nuclear statistical
@@ -431,13 +439,10 @@ convert units, fit $C^2$ tensor-product cubic B-splines to entropy and
 $\log(\epsilon + \Delta)$, choose $\kappa$ from a fine scan of the *fitted* splines
 (which can undershoot the data minimum, so scanning the raw data would not be enough),
 and extend both fields beyond the physical box — eight grid cells per side in $\log\rho$
-and $\log T$ — with $C^2$, monotone, *causal* tails. By default the fit leaves the
-table's hottest temperature row out (`BuildOptions::trim_t_hi_rows = 1`): on DD2 and
-SFHo that row is unreliable — its own stored sound speed is garbage — and the fit's last
-cell turns it into in-box $c_s^2 \ge 1$ and a superluminal hot tail, while on LS220 and
-SRO dropping it is measured to be neutral or better. States above the new edge are
-served by the causal hot tail, as states above $T_{\max}$ always were; `0` restores the
-full box. Out of bounds is handled by smooth
+and $\log T$ — with $C^2$, monotone, *causal* tails. (States above a repaired table's
+new, one-row-lower $T_{\max}$ are served by the causal hot tail, as states above
+$T_{\max}$ always were; `BuildOptions::trim_t_hi_rows` can also leave rows out of the fit
+of a table that was not repaired.) Out of bounds is handled by smooth
 extension plus a flag, not by a hard clamp, since a clamp zeroes
 derivatives and stalls or misleads Newton. Validity is judged only at the end, on the converged
 state, by the policies above. The tails are also built to approach the right asymptotics

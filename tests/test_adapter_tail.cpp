@@ -585,11 +585,8 @@ TEST_CASE("M3g: srange_extended().s_max on the LS220 real table (guarded)") {
   // Radiation-like hot seam: alpha ~ 3*ln10 per decade of T and the 8-cell
   // extension spans ~0.26 dex, so s_max grows by ~10^0.78 ~ 6x -- the
   // eos-causal-tail.md S4 number. Measured 3.27-6.01x here, against
-  // 2.26-2.99x for the pre-M3g linear tail on the same 20 sampled points;
-  // 3.00-6.01x since 1.2.0, whose default build drops the hottest T row
-  // (BuildOptions::trim_t_hi_rows = 1) and so launches the tail one row lower,
-  // where alpha is a little smaller at the high-density sample points.
-  check_srange_growth(adapter.view(), "LS220", 2.5, 12.0);
+  // 2.26-2.99x for the pre-M3g linear tail on the same 20 sampled points.
+  check_srange_growth(adapter.view(), "LS220", 3.0, 12.0);
 }
 
 // ==========================================================================

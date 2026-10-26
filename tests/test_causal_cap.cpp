@@ -77,6 +77,15 @@ SyntheticOptions stiff_corner_options() {
   return opts;
 }
 
+// Default options with the 1.2.0 T-row trim off, for tests that compare the
+// repaired table with the input index by index (repair_table() drops the
+// hottest T row by default -- RepairOptions::trim_t_hi_rows).
+RepairOptions untrimmed() {
+  RepairOptions o;
+  o.trim_t_hi_rows = 0;
+  return o;
+}
+
 size_t count_entries_for(const RepairResult &r, const std::string &field) {
   size_t n = 0;
   for (const eeos::RepairEntry &e : r.entries) {
@@ -243,7 +252,7 @@ TEST_CASE("repair_table: causal-cap is a no-op on a clean synthetic table") {
   RawTable table = eeos::make_synthetic_table(opts);
   const std::vector<double> logenergy_before = table.field("logenergy");
 
-  const RepairResult r = eeos::repair_table(table);
+  const RepairResult r = eeos::repair_table(table, untrimmed());
   CHECK(r.causal_cap.ran);
   CHECK(r.causal_cap.violations_before == 0);
   CHECK(r.causal_cap.violations_after == 0);
@@ -258,7 +267,7 @@ TEST_CASE("repair_table: causal-cap detects and removes a stiffened high-density
   RawTable table = eeos::make_synthetic_table(stiff_corner_options());
   RawTable reference = eeos::make_synthetic_table(stiff_corner_options());
 
-  const RepairResult r = eeos::repair_table(table);
+  const RepairResult r = eeos::repair_table(table, untrimmed());
   const RepairResult::CausalCapSummary &c = r.causal_cap;
 
   REQUIRE(c.ran);
@@ -451,46 +460,22 @@ TEST_CASE("repair_table: causal-cap reports, but never edits, the dirty preset's
   CHECK(second.causal_cap.interior_untouched > 0);
 }
 
-TEST_CASE("repair_table: with trim_t_hi_rows the causal cap skips the trimmed rows but keeps "
-          "their T increments (1.2.0)") {
+TEST_CASE("repair_table: with the default T-row trim the corner is still removed, idempotently "
+          "(1.2.0)") {
   RawTable table = eeos::make_synthetic_table(stiff_corner_options());
-  const RawTable before = table;
+  const size_t ntemp_in = table.ntemp();
   const RepairResult r = eeos::repair_table(table); // default trim_t_hi_rows = 1
+  CHECK(r.t_hi_rows_dropped == 1);
+  CHECK(table.ntemp() == ntemp_in - 1);
   REQUIRE(r.causal_cap.ran);
-  REQUIRE(r.causal_cap.nodes_capped > 0);
+  CHECK(r.causal_cap.violations_before > 0);
+  CHECK(r.causal_cap.violations_after == 0);
+  CHECK_FALSE(r.causal_cap.reverted);
 
-  const size_t top = table.ntemp() - 1;
-  const std::vector<double> &now = table.field("logenergy");
-  const std::vector<double> &was = before.field("logenergy");
-  size_t shifted = 0;
-  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
-    for (size_t irho = 0; irho < table.nrho(); ++irho) {
-      const size_t i_top = table.index(irho, top, kYe);
-      const size_t i_last = table.index(irho, top - 1, kYe);
-      // The increment between the last kept row and the trimmed one is the
-      // input's (up to the one rounding of the shift) ...
-      CHECK(now[i_top] - now[i_last] ==
-            doctest::Approx(was[i_top] - was[i_last]).epsilon(1e-12).scale(1.0));
-      // ... and an uncapped column's trimmed row is bit-identical.
-      if (now[i_last] == was[i_last]) {
-        CHECK(now[i_top] == was[i_top]);
-      } else {
-        ++shifted;
-      }
-    }
-  }
-  CHECK(shifted > 0);
-
-  // With the trim off, the stage audits the full box, as before 1.2.0.
-  RawTable full = eeos::make_synthetic_table(stiff_corner_options());
-  RepairOptions opts;
-  opts.trim_t_hi_rows = 0;
-  const RepairResult r0 = eeos::repair_table(full, opts);
-  CHECK(r0.causal_cap.ran);
-  CHECK(r0.causal_cap.violations_after == 0);
-
-  RepairOptions bad;
-  bad.trim_t_hi_rows = -1;
-  RawTable untouched = eeos::make_synthetic_table(stiff_corner_options());
-  CHECK_THROWS_AS(eeos::repair_table(untouched, bad), std::invalid_argument);
+  const std::vector<double> after_first = table.field("logenergy");
+  const RepairResult again = eeos::repair_table(table);
+  CHECK(again.entries.empty());
+  CHECK(again.t_hi_rows_dropped == 0);
+  CHECK(again.status == eeos::Status::ok);
+  CHECK(table.field("logenergy") == after_first); // bitwise
 }

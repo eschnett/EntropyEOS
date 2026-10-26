@@ -232,19 +232,22 @@ struct RepairOptions {
   // final verification always at (4,4,4), mirroring the 3D stage. The
   // adiabat trace steps by one refined rho step, hrho/refine3d_xy.
 
-  // 1.2.0: how many of the hottest T rows the causal-cap stage leaves out of
-  // its fit, audit and projection -- the same number the adapter build
-  // drops (BuildOptions::trim_t_hi_rows, same default 1), so the stage keeps
-  // auditing exactly the fit the adapter evaluates. Those rows are never
-  // audited or projected; their logenergy only follows the last kept row's
-  // change, (irho, kYe) by (irho, kYe), so the stored increments in T above
-  // the box stay exactly as they were (a capped last row under an uncapped
-  // trimmed row would be a new kink in T, which the next run's per-column
-  // stage would smooth back into the box -- breaking idempotence). Every
-  // other stage still works on the full stored table. 0 restores the
-  // pre-1.2.0 full-box audit. Must be >= 0; a
-  // trim that leaves fewer than 4 T rows skips the stage (ran = false), like
-  // any grid too small to fit.
+  // 1.2.0: how many of the table's hottest T rows repair_table() DROPS --
+  // from the T axis and from every field -- before any other stage runs, so
+  // a repaired table holds only rows the stages below actually repaired.
+  // Default 1, for every table: on the Hempel DD2/SFHo tables the T_max row
+  // is unreliable (its own stored cs2 is garbage, its T-derivatives noisy),
+  // and the fit's last T cell turns it into c_s^2 >= 1 in the box and a
+  // superluminal hot tail; on LS220/SRO dropping it is measured neutral to
+  // better (CODE.md milestone M3k). States above the new T_max are served by
+  // the adapter's causal u-high tail, as states above T_max always were.
+  //
+  // Recorded in the table's kTHiRowsDroppedAttr attribute (table.hpp), which
+  // eos_repair writes into its output and read_stellarcollapse() surfaces
+  // again: the rows to drop are this option minus what that attribute says
+  // was already dropped, so re-repairing a repaired table drops nothing more.
+  // A table with fewer than trim + 4 T rows is not trimmed. 0 keeps every row
+  // (the pre-1.2.0 behaviour). Must be >= 0.
   int trim_t_hi_rows = 1;
 
   // --- 1.2.0 seam-blend stage (repair_table()'s doc comment, steps S1-S3) --
@@ -295,9 +298,18 @@ struct RepairResult {
   // work (e.g. under OpenMP).
   std::vector<RepairEntry> entries;
 
-  // ok iff entries is empty, repaired otherwise. repair_table() never
-  // returns Status::fatal: structural problems throw instead (see above).
+  // ok iff entries is empty and no T row was dropped, repaired otherwise.
+  // repair_table() never returns Status::fatal: structural problems throw
+  // instead (see above).
   Status status = Status::ok;
+
+  // 1.2.0 T-row trim (RepairOptions::trim_t_hi_rows): rows dropped by THIS
+  // call (0 when the table had already been trimmed as far as asked), and
+  // the hottest log10(T/MeV) before and after. Dropped rows carry no
+  // RepairEntry; their removal is the change.
+  size_t t_hi_rows_dropped = 0;
+  double logtemp_max_before = 0.0;
+  double logtemp_max_after = 0.0;
 
   struct FieldSummary {
     std::string field;
@@ -514,6 +526,13 @@ struct RepairResult {
 
 // Repairs `table` in place.
 //
+// T-row trim (1.2.0), first of all: if options.trim_t_hi_rows asks for more
+// rows than the table's kTHiRowsDroppedAttr says were already dropped, the
+// difference is cut off the hot end of the T axis and of every field, and the
+// attribute is updated -- see RepairOptions::trim_t_hi_rows. Every stage
+// below, and every index in RepairResult::entries, refers to the trimmed
+// table.
+//
 // Seam-blend stage (1.2.0), run ONCE before everything else if
 // options.seam_blend (see RepairOptions::seam_blend for when it is skipped).
 // With F = seam_fit_cells, W = seam_halfwidth, x = log10(rho), and
@@ -648,12 +667,6 @@ struct RepairResult {
 //   the verification's own audits -- *not* including the backstop's own
 //   audit in step 4, which is bookkeeping, not a "round") is appended, in
 //   order, to FieldSummary::rounds3d_violation_history.
-//
-// (1.2.0: with options.trim_t_hi_rows = N > 0 -- the default is 1 -- the
-// whole causal-cap stage below runs on the table's first ntemp - N T rows,
-// exactly the box the adapter build fits with the same N; the trimmed
-// rows' logenergy is only shifted by the last kept row's change, so its
-// increments in T are kept -- see RepairOptions::trim_t_hi_rows.)
 //
 // Causal-cap stage (M3f, eos-causality-repair.md), run ONCE after every
 // field has been through both stages above, if options.causal_cap (default

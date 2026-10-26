@@ -212,14 +212,15 @@ else
   exit 1
 fi
 
-# 1.2.0 seam-blend stage: the preset's SeamDefect (irho 13..15, jT 26..29)
+# 1.2.0 seam-blend stage: the preset's SeamDefect (irho 13..15, jT 26..29;
+# the default T-row trim drops jT 29 first, so it is blended over 26..28)
 # must be found and blended, and "logpress" -- which only this stage edits --
 # must appear in the log's entries.
-sb_line=$(grep -E '^    seam: irho \[13,15\] jT \[26,29\]' "$T/dirty_repair.log" || true)
+sb_line=$(grep -E '^    seam: irho \[13,15\] jT \[26,28\]' "$T/dirty_repair.log" || true)
 if [ -n "$sb_line" ] && grep -qE '^logpress \(' "$T/dirty_repair.log"; then
   echo "PASS: seam-blend found and blended the dirty preset's seam --$sb_line"
 else
-  echo "FAIL: seam-blend did not report the dirty preset's seam at irho [13,15], jT [26,29]" \
+  echo "FAIL: seam-blend did not report the dirty preset's seam at irho [13,15], jT [26,28]" \
     "with logpress entries (see $T/dirty_repair.log)"
   exit 1
 fi

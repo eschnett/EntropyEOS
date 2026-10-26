@@ -133,10 +133,9 @@ Runs inside `repair_table()` as the last stage, per Ye slice for the traces
 (slices independent → OpenMP), after the per-column and 3D-monotonicity stages
 (and, since 1.2.0, after the seam-blend stage that runs before all of them —
 CODE.md milestone M3k). Requires both fields; edits only `logenergy`. Since 1.2.0
-it also works on exactly the box the adapter build fits: by default that box leaves
-the hottest T row out (`RepairOptions`/`BuildOptions::trim_t_hi_rows = 1`), and
-the trimmed rows' `logenergy` only follows the last kept row's change, so their
-increments in T are kept.
+the table it sees has already lost its hottest T row: `repair_table()` drops it
+first (`RepairOptions::trim_t_hi_rows = 1`), so the stage audits, and the written
+file contains, exactly the box the adapter build fits.
 
 1. **Audit**: fit σ and L with `fit_bspline_3d` on the current data; sample c_s²
    via the chain rule on the refined grid (main loop at (refine3d_xy, refine3d_u,

@@ -35,9 +35,11 @@ namespace eeos {
 //     datasets are encountered in the file (see the .cpp for what "file
 //     order" means for a format that generally has no creation-order
 //     index), so RawTable::field_names() reproduces it;
-//   - the scalar {1} datasets "energy_shift" and "have_rel_cs2", if present,
-//     become RawTable attributes (as double, regardless of their stored
-//     type -- HDF5 converts on read);
+//   - the scalar {1} datasets "energy_shift", "have_rel_cs2" and (1.2.0)
+//     kTHiRowsDroppedAttr ("eeos_t_hi_rows_dropped", written by a repair
+//     that dropped T rows -- see table.hpp), if present, become RawTable
+//     attributes (as double, regardless of their stored type -- HDF5
+//     converts on read);
 //   - everything else (opaque provenance blobs, "points*", any dataset
 //     whose dims or type don't match the rules above) is left out of the
 //     RawTable entirely; write_stellarcollapse()'s (path_out, table,
@@ -58,7 +60,12 @@ RawTable read_stellarcollapse(const std::string &path);
 // left as passthrough -- is copied byte-for-byte via H5Ocopy, so it survives
 // even though the RawTable never held it. `path_in`'s datasets are visited
 // in the same "file order" read_stellarcollapse() uses; any table field not
-// found by name in path_in is appended at the end of `path_out`.
+// found by name in path_in is appended at the end of `path_out`. Two 1.2.0
+// exceptions to the passthrough, both for repair_table()'s T-row trim
+// (RepairOptions::trim_t_hi_rows): a "points*" scalar whose value no longer
+// matches the table's grid size is written fresh from the table, and the
+// table's kTHiRowsDroppedAttr attribute, if any, is written from the table
+// (appended at the end if path_in lacks it).
 //
 // Documented consequence: "energy_shift" (and "have_rel_cs2", if present)
 // are always passthrough-copied from path_in by this overload, because
@@ -126,8 +133,9 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //     see RepairResult::CausalCapSummary), the 1.2.0 seam-blend stage's
 //     ("seam_blend" 0/1, "seam_tol" double, "seam_halfwidth"/
 //     "seam_fit_cells" uint64, plus "seam_count"/"seam_unfaded" uint64 --
-//     see RepairResult::SeamBlendSummary), "trim_t_hi_rows" (uint64, the
-//     causal-cap stage's T_max trim), "tool_version"/"input_path"
+//     see RepairResult::SeamBlendSummary), "trim_t_hi_rows" and
+//     "t_hi_rows_dropped" (uint64, the 1.2.0 T-row trim's option and what
+//     this run dropped), "tool_version"/"input_path"
 //     (fixed-length string datasets -- sic, see the .cpp: HDF5 *attributes*
 //     here, not top-level datasets), "input_fnv1a" (uint64_t) and
 //     "n_modified" (uint64_t).

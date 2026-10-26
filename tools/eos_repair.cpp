@@ -142,15 +142,14 @@ void print_usage(std::ostream &os) {
         "                      cs2_max = 1.0, so the gap absorbs refit ringing\n"
         "                      and leaves the con2prim Newton some 1 - c_s^2\n"
         "                      conditioning headroom)\n"
-        "  --trim-t-hi N       how many of the hottest T rows the causal-cap stage\n"
-        "                      leaves out of its fit (RepairOptions::\n"
-        "                      trim_t_hi_rows, default 1): the same rows the\n"
-        "                      adapter build drops by default\n"
-        "                      (BuildOptions::trim_t_hi_rows), so the stage audits\n"
-        "                      exactly the fit the adapter evaluates; those rows'\n"
-        "                      logenergy is not capped, only shifted with the last\n"
-        "                      kept row so its T increments are kept. 0 = full\n"
-        "                      box, as before 1.2.0. Recorded in the provenance\n"
+        "  --trim-t-hi N       how many of the hottest T rows to drop from the\n"
+        "                      table before repairing it (RepairOptions::\n"
+        "                      trim_t_hi_rows, default 1): OUT.h5's T axis is\n"
+        "                      that many rows shorter, so every row in it is a\n"
+        "                      repaired row. The count already dropped is stored\n"
+        "                      in OUT.h5 (\"eeos_t_hi_rows_dropped\"), so\n"
+        "                      re-repairing it drops nothing more. 0 keeps every\n"
+        "                      row, as before 1.2.0. Recorded in the provenance\n"
         "                      group.\n"
         "  --log FILE          write a human-readable repair log to FILE (not\n"
         "                      valid together with --check-only)\n"
@@ -468,15 +467,19 @@ int main(int argc, char **argv) {
     eeos::RepairResult result = eeos::repair_table(table, repair_opts);
     print_rounds3d_progress(std::cout, result);
     print_causal_cap_progress(std::cout, result);
+    // 1.2.0: dropping T rows (RepairOptions::trim_t_hi_rows) is a change
+    // too, even when no remaining value moved.
+    const bool changed = result.status != eeos::Status::ok;
 
     if (pa.check_only) {
       std::cout << "eos_repair --check-only: "
-                << (result.entries.empty()
-                        ? std::string("table already satisfies monotonicity (0 changes)")
-                        : "would repair " + std::to_string(result.entries.size()) + " value(s)")
+                << (!changed ? std::string("table already satisfies monotonicity (0 changes)")
+                             : "would repair " + std::to_string(result.entries.size()) +
+                                   " value(s) and drop " + std::to_string(result.t_hi_rows_dropped) +
+                                   " T row(s)")
                 << "\n";
       result.print(std::cout);
-      return result.entries.empty() ? kExitOk : kExitChanged;
+      return changed ? kExitChanged : kExitOk;
     }
 
     eeos::write_stellarcollapse(out_path, table, in_path);
@@ -493,7 +496,7 @@ int main(int argc, char **argv) {
     // change something appends its own group, numbered ("/repair_2",
     // "/repair_3", ...) when the input already carried one, so a chain of
     // repairs stays auditable through each group's own input_fnv1a.
-    if (result.entries.empty()) {
+    if (!changed) {
       std::cout << "eos_repair: wrote '" << out_path << "' (no changes; no new provenance group)\n";
     } else {
       const std::string group_name = eeos::append_repair_group(out_path, result, repair_opts,
@@ -507,7 +510,7 @@ int main(int argc, char **argv) {
       write_log(pa.log_path, in_path, out_path, input_fnv1a, repair_opts, result);
     }
 
-    return result.entries.empty() ? kExitOk : kExitChanged;
+    return changed ? kExitChanged : kExitOk;
   } catch (const std::exception &e) {
     std::cerr << "eos_repair: " << e.what() << "\n";
     return kExitFatal;

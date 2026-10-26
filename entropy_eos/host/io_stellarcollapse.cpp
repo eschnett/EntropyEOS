@@ -464,7 +464,7 @@ RawTable read_stellarcollapse(const std::string &path) {
     }
     const hid_t dset = obj.get();
 
-    if (name == "energy_shift" || name == "have_rel_cs2") {
+    if (name == "energy_shift" || name == "have_rel_cs2" || name == kTHiRowsDroppedAttr) {
       if (dataset_is_scalar(dset)) {
         table.add_attribute(name, read_scalar_as_double(dset, path, name));
       }
@@ -490,6 +490,24 @@ RawTable read_stellarcollapse(const std::string &path) {
 
   return table;
 }
+
+namespace {
+
+// Whether the source file's scalar "points*" dataset `name` still equals the
+// table's own grid size along that axis (false once repair_table() has
+// dropped T rows -- RepairOptions::trim_t_hi_rows).
+bool source_points_match(hid_t src, const std::string &name, const RawTable &table,
+                         const std::string &path_in) {
+  Handle dset(H5Dopen2(src, name.c_str(), H5P_DEFAULT), H5Dclose);
+  if (!dset.valid() || !dataset_is_scalar(dset.get())) {
+    return true; // not ours to rewrite; copy it as found
+  }
+  const double v = read_scalar_as_double(dset.get(), path_in, name);
+  const size_t n = name == "pointsrho" ? table.nrho() : name == "pointstemp" ? table.ntemp() : table.nye();
+  return v == static_cast<double>(n);
+}
+
+} // namespace
 
 void write_stellarcollapse(const std::string &path_out, const RawTable &table,
                             const std::string &path_in) {
@@ -517,6 +535,15 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table,
       write_1d_double(dst.get(), name, table.ye());
     } else if (table.has_field(name)) {
       write_3d_double(dst.get(), name, table.field(name), nye, ntemp, nrho);
+    } else if ((name == "pointsrho" || name == "pointstemp" || name == "pointsye") &&
+               !source_points_match(src.get(), name, table, path_in)) {
+      // 1.2.0: repair_table() can drop T rows, so the grid sizes are written
+      // from the table whenever they no longer match the source's.
+      write_scalar_int(dst.get(), name, static_cast<int>(name == "pointsrho"    ? table.nrho()
+                                                          : name == "pointstemp" ? table.ntemp()
+                                                                                 : table.nye()));
+    } else if (name == kTHiRowsDroppedAttr && table.has_attribute(name)) {
+      write_scalar_double(dst.get(), name, table.attribute(name));
     } else {
       // Passthrough: opaque provenance blobs, "points*", "energy_shift",
       // "have_rel_cs2", or anything else the RawTable doesn't carry --
@@ -538,6 +565,10 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table,
     if (written.find(field_name) == written.end()) {
       write_3d_double(dst.get(), field_name, table.field(field_name), nye, ntemp, nrho);
     }
+  }
+  // So is the 1.2.0 T-trim record, the first time a repair drops rows.
+  if (table.has_attribute(kTHiRowsDroppedAttr) && written.find(kTHiRowsDroppedAttr) == written.end()) {
+    write_scalar_double(dst.get(), kTHiRowsDroppedAttr, table.attribute(kTHiRowsDroppedAttr));
   }
 }
 
@@ -659,10 +690,12 @@ std::string append_repair_group(const std::string &path, const RepairResult &res
                      static_cast<std::uint64_t>(result.seam_blend.seams.size()));
   write_attr_uint64(group.get(), "seam_unfaded",
                      static_cast<std::uint64_t>(result.seam_blend.seams_unfaded.size()));
-  // 1.2.0 T_max trim of the causal-cap stage's fit (RepairOptions::
-  // trim_t_hi_rows): the box its audit and projection covered.
+  // 1.2.0 T-row trim (RepairOptions::trim_t_hi_rows): the option, and the
+  // rows this run actually dropped from the hot end of the T axis.
   write_attr_uint64(group.get(), "trim_t_hi_rows",
                      static_cast<std::uint64_t>(options.trim_t_hi_rows));
+  write_attr_uint64(group.get(), "t_hi_rows_dropped",
+                     static_cast<std::uint64_t>(result.t_hi_rows_dropped));
   write_attr_string(group.get(), "tool_version", tool_version);
   write_attr_string(group.get(), "input_path", input_path);
   write_attr_uint64(group.get(), "input_fnv1a", static_cast<std::uint64_t>(input_fnv1a));

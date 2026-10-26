@@ -692,12 +692,12 @@ TEST_CASE("EntropyEOSView::srange: matches closed-form s(rho, T_min/T_max, Ye) a
   RawTable table = eeos::make_synthetic_table(opts);
   EntropyEOS adapter = eeos::build_entropy_eos(table);
   const EntropyEOSView view = adapter.view();
-  // The built box's own T range: since 1.2.0 the default build leaves the
-  // hottest row out of the fit (BuildOptions::trim_t_hi_rows = 1), so the
-  // top is the second-to-last table temperature, not opts.temp_max_MeV.
+  // The built box's own T range (the whole table: the default build fits
+  // every row -- BuildOptions::trim_t_hi_rows = 0; it is repair_table() that
+  // drops the hottest row, and this table was not repaired).
   const double T_lo = std::pow(10.0, view.u_lo);
   const double T_hi = std::pow(10.0, view.u_hi);
-  CHECK(view.u_hi == doctest::Approx(table.logtemp()[table.ntemp() - 2]).epsilon(1e-14));
+  CHECK(view.u_hi == doctest::Approx(table.logtemp().back()).epsilon(1e-14));
 
   const double kappa = adapter.kappa();
   for (size_t i = 0; i < table.nrho(); ++i) {
@@ -1077,15 +1077,15 @@ TEST_CASE("EntropyEOSView::sigma_extended: strictly monotone increasing in u acr
   }
 }
 
-TEST_CASE("build_entropy_eos: trim_t_hi_rows drops the hottest rows from the fit (1.2.0)") {
+TEST_CASE("build_entropy_eos: trim_t_hi_rows leaves the hottest rows out of the fit (1.2.0)") {
   SyntheticOptions opts; // default grid, ntemp = 30
   RawTable table = eeos::make_synthetic_table(opts);
   const std::vector<double> &lt = table.logtemp();
 
-  // The build's and the repair's defaults agree, so the repair's causal-cap
-  // audit covers exactly the box the default build fits.
-  CHECK(BuildOptions().trim_t_hi_rows == 1);
-  CHECK(eeos::RepairOptions().trim_t_hi_rows == BuildOptions().trim_t_hi_rows);
+  // The repair drops the hottest row from the table by default; the build
+  // fits whatever it is given, so its own trim (for unrepaired tables) is off.
+  CHECK(eeos::RepairOptions().trim_t_hi_rows == 1);
+  CHECK(BuildOptions().trim_t_hi_rows == 0);
 
   for (int trim : {0, 1, 3}) {
     BuildOptions bo;

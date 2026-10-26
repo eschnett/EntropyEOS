@@ -137,10 +137,11 @@ void print_usage(std::ostream &os) {
         "                       empirically use the neutron mass 1.67492749804e-24 g\n"
         "                       (see CODE.md)\n"
         "  --trim-t-hi N        --level adapter/con2prim only: how many of the\n"
-        "                       hottest T rows the build (and the in-memory\n"
-        "                       repair's causal-cap stage) leave out of the fit:\n"
-        "                       BuildOptions/RepairOptions::trim_t_hi_rows, default\n"
-        "                       1; 0 = the full table box, as before 1.2.0\n"
+        "                       hottest T rows to drop -- by the in-memory repair\n"
+        "                       (RepairOptions::trim_t_hi_rows, default 1), or,\n"
+        "                       with --no-repair, by the build\n"
+        "                       (BuildOptions::trim_t_hi_rows, default 0); 0 =\n"
+        "                       the full table, as before 1.2.0\n"
         "  --no-repair          --level adapter/con2prim only: skip the default\n"
         "                       in-memory repair_table() pass and build directly\n"
         "                       from the loaded table\n"
@@ -719,7 +720,8 @@ int run_adapter_level(const ParsedArgs &pa) {
     std::cout << "repair (in-memory): status="
               << (repair_result.status == eeos::Status::ok ? "ok" : "repaired")
               << " entries=" << repair_result.entries.size()
-              << " seams=" << repair_result.seam_blend.seams.size();
+              << " seams=" << repair_result.seam_blend.seams.size()
+              << " t_rows_dropped=" << repair_result.t_hi_rows_dropped;
     for (const eeos::RepairResult::FieldSummary &s : repair_result.summaries) {
       std::cout << " " << s.field << "_changed=" << s.modified;
     }
@@ -738,7 +740,7 @@ int run_adapter_level(const ParsedArgs &pa) {
     // m_neutron_g; pass --m-B 1.67492749804e-24 for those.
     bopts.m_B_table_g = pa.m_B;
   }
-  if (pa.have_trim_t_hi) {
+  if (pa.have_trim_t_hi && pa.no_repair) {
     bopts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);
   }
   const eeos::EntropyEOS adapter = eeos::build_entropy_eos(table, bopts);
@@ -782,7 +784,8 @@ int run_con2prim_level(const ParsedArgs &pa) {
     std::cout << "repair (in-memory): status="
               << (repair_result.status == eeos::Status::ok ? "ok" : "repaired")
               << " entries=" << repair_result.entries.size()
-              << " seams=" << repair_result.seam_blend.seams.size();
+              << " seams=" << repair_result.seam_blend.seams.size()
+              << " t_rows_dropped=" << repair_result.t_hi_rows_dropped;
     for (const eeos::RepairResult::FieldSummary &s : repair_result.summaries) {
       std::cout << " " << s.field << "_changed=" << s.modified;
     }
@@ -801,7 +804,7 @@ int run_con2prim_level(const ParsedArgs &pa) {
     // m_neutron_g; pass --m-B 1.67492749804e-24 for those.
     bopts.m_B_table_g = pa.m_B;
   }
-  if (pa.have_trim_t_hi) {
+  if (pa.have_trim_t_hi && pa.no_repair) {
     bopts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);
   }
   const eeos::EntropyEOS adapter = eeos::build_entropy_eos(table, bopts);

@@ -66,18 +66,14 @@ struct BuildOptions {
   // ever conflict (reported by check_adapter()'s extension-band map).
   double cs2_ext_cap = 0.99;
 
-  // 1.2.0: how many of the table's hottest T rows to leave out of the fit
-  // (CODE.md milestone M3k). The fitted box's u_hi -- and with it the M3g
-  // u-high tail's launch point -- becomes the last row kept, and states
-  // above it are served by that causal tail (flag_ext_s_high), exactly as
-  // states above T_max always were. Default 1, for every table: on the
-  // Hempel DD2/SFHo tables the T_max row is unreliable (its own stored cs2
-  // is garbage) and the fit's last T cell turns it into in-box c_s^2 >= 1
-  // and a superluminal u-high tail; on LS220/SRO dropping it is measured
-  // neutral to better. 0 restores the pre-1.2.0 full box. Keep it equal to
-  // RepairOptions::trim_t_hi_rows (same default), so the repair's
-  // causal-cap stage audits exactly the fit built here. Must be >= 0.
-  int trim_t_hi_rows = 1;
+  // 1.2.0: how many of the table's hottest T rows to leave out of the fit.
+  // Default 0: repair_table() already drops the unreliable top row from the
+  // table itself (RepairOptions::trim_t_hi_rows, default 1), so a repaired
+  // table is fitted whole. This option is for fitting a table that did NOT
+  // go through repair_table(), where the fitted box's u_hi -- and with it the
+  // M3g u-high tail's launch point -- becomes the last row kept, and states
+  // above it are served by that causal tail (flag_ext_s_high). Must be >= 0.
+  int trim_t_hi_rows = 0;
 };
 
 // One location recorded by the monotonicity audit below: the refined-grid

@@ -352,6 +352,42 @@ TEST_CASE("write_stellarcollapse (with source): passthrough round trip is exact"
   CHECK(read_scalar_number(path_b, "pointsye") == static_cast<long long>(b.nye()));
 }
 
+TEST_CASE("write_stellarcollapse (with source): a T-trimmed repair writes consistent points* and "
+          "its trim record, and reads back without dropping more (1.2.0)") {
+  SyntheticOptions opts;
+  opts.nrho = 6;
+  opts.ntemp = 8;
+  opts.nye = 4;
+  const std::string path_in = scratch_path("trim_in.h5");
+  eeos::write_stellarcollapse(path_in, eeos::make_synthetic_table(opts));
+
+  RawTable table = eeos::read_stellarcollapse(path_in);
+  const eeos::RepairResult r = eeos::repair_table(table); // default trim_t_hi_rows = 1
+  REQUIRE(r.t_hi_rows_dropped == 1);
+  const std::string path_out = scratch_path("trim_out.h5");
+  eeos::write_stellarcollapse(path_out, table, path_in);
+
+  // The source's points* no longer match, so they were written from the
+  // table; the reader's own cross-check would throw otherwise.
+  CHECK(read_scalar_number(path_out, "pointstemp") == static_cast<long long>(opts.ntemp - 1));
+  CHECK(read_scalar_number(path_out, "pointsrho") == static_cast<long long>(opts.nrho));
+  RawTable back = eeos::read_stellarcollapse(path_out);
+  REQUIRE(back.ntemp() == opts.ntemp - 1);
+  REQUIRE(back.has_attribute(eeos::kTHiRowsDroppedAttr));
+  CHECK(back.attribute(eeos::kTHiRowsDroppedAttr) == 1.0);
+
+  // Re-repairing the written file drops nothing more, and writing it again
+  // (source = the trimmed file) copies everything as found.
+  const eeos::RepairResult again = eeos::repair_table(back);
+  CHECK(again.t_hi_rows_dropped == 0);
+  CHECK(back.ntemp() == opts.ntemp - 1);
+  const std::string path_again = scratch_path("trim_again.h5");
+  eeos::write_stellarcollapse(path_again, back, path_out);
+  RawTable back2 = eeos::read_stellarcollapse(path_again);
+  CHECK(back2.ntemp() == opts.ntemp - 1);
+  CHECK(back2.attribute(eeos::kTHiRowsDroppedAttr) == 1.0);
+}
+
 // --- (2b) opaque-blob passthrough without a real table -----------------------
 //
 // Exercises the same opaque-provenance-blob passthrough guarantee as (5)'s

@@ -100,6 +100,14 @@ private:
   std::unordered_map<std::string, size_t> attribute_index_;
 };
 
+// Name of the RawTable attribute (and, in a written file, of the scalar {1}
+// dataset read_stellarcollapse() surfaces as it) that records how many of
+// the source table's hottest T rows repair_table() has already dropped
+// (RepairOptions::trim_t_hi_rows, 1.2.0). A table without it has dropped
+// none; repair_table() reads it so that re-repairing a repaired table does
+// not drop another row.
+inline constexpr char kTHiRowsDroppedAttr[] = "eeos_t_hi_rows_dropped";
+
 // Slices `in` to the inclusive index box [ia, ib] x [ja, jb] x [ka, kb]
 // (rho x T x Ye): the three axes, every field (or only those named in
 // `fields`, kept in `in`'s own field order) copied verbatim, and every

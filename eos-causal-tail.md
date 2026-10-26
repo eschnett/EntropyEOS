@@ -240,7 +240,7 @@ and the second term grows without bound. It vanishes at a radiation seam
 `repair_table()` rebuilds at ρ ≈ 1.4e7 on DD2/SFHo (the ratio varies by ±0.1 across
 it, so `c_s² ≤ 0` from the seam on and `p ≤ 0` at 6–7 cells), and the matter-dominated
 hot seam at ρ ~ 1e15 (`c_s²` 0.70 → 0.18 over the 8-cell band, ≤ 0 at ~10 cells). The
-T_max trim (`BuildOptions::trim_t_hi_rows`) made the first one visible: DD2's u-high
+T_max trim (`RepairOptions::trim_t_hi_rows`) made the first one visible: DD2's u-high
 `p ≤ 0` went 0 → 6,307 when the tail was launched from 152 MeV instead of 158.
 
 **The lock.** L's u-high secondary track gets the effective curvature that ramps its
