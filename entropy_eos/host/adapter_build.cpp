@@ -329,7 +329,10 @@ EntropyEOSView EntropyEOS::view_with(const real *sigma_c, const real *L_c) const
   return v;
 }
 
-EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
+namespace {
+
+// build_entropy_eos() steps 1-4, on the (already trimmed) table.
+EntropyEOS build_box(const RawTable &table, const BuildOptions &opts) {
   // --- 1. Validate (does not repair) ---------------------------------------
   const std::size_t nrho = table.nrho();
   const std::size_t ntemp = table.ntemp();
@@ -420,6 +423,34 @@ EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
                      shift_hat, conv_t, x_lo, x_hi, u_lo, u_hi, y_lo, y_hi, x_ext_lo, x_ext_hi, u_ext_lo,
                      u_ext_hi, opts.ext_slope_floor_sigma, opts.ext_slope_floor_L, opts.cs2_ext_cap,
                      scan.audit, /*max_iter=*/50);
+}
+
+} // namespace
+
+EntropyEOS build_entropy_eos(const RawTable &table, const BuildOptions &opts) {
+  // --- 0. T_max trim (BuildOptions::trim_t_hi_rows) ------------------------
+  if (opts.trim_t_hi_rows < 0) {
+    throw std::runtime_error("build_entropy_eos: trim_t_hi_rows must be >= 0");
+  }
+  if (opts.trim_t_hi_rows == 0) {
+    return build_box(table, opts);
+  }
+  const std::size_t trim = static_cast<std::size_t>(opts.trim_t_hi_rows);
+  if (table.ntemp() < trim + 4) {
+    throw std::runtime_error("build_entropy_eos: T axis has fewer than 4 points after trimming " +
+                             std::to_string(trim) + " row(s)");
+  }
+  // Same messages as the untrimmed path for a missing field or attribute;
+  // crop_table() itself would report those differently.
+  check_field_present_finite(table, "logenergy");
+  check_field_present_finite(table, "entropy");
+  if (!table.has_attribute("energy_shift")) {
+    throw std::runtime_error("build_entropy_eos: table has no 'energy_shift' attribute");
+  }
+  const std::vector<std::string> fields = {"entropy", "logenergy"};
+  const RawTable trimmed = crop_table(table, 0, table.nrho() - 1, 0, table.ntemp() - 1 - trim, 0,
+                                      table.nye() - 1, &fields);
+  return build_box(trimmed, opts);
 }
 
 } // namespace eeos

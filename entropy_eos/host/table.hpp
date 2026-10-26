@@ -100,4 +100,25 @@ private:
   std::unordered_map<std::string, size_t> attribute_index_;
 };
 
+// Name of the RawTable attribute (and, in a written file, of the scalar {1}
+// dataset read_stellarcollapse() surfaces as it) that records how many of
+// the source table's hottest T rows repair_table() has already dropped
+// (RepairOptions::trim_t_hi_rows, 1.2.0). A table without it has dropped
+// none; repair_table() reads it so that re-repairing a repaired table does
+// not drop another row.
+inline constexpr char kTHiRowsDroppedAttr[] = "eeos_t_hi_rows_dropped";
+
+// Slices `in` to the inclusive index box [ia, ib] x [ja, jb] x [ka, kb]
+// (rho x T x Ye): the three axes, every field (or only those named in
+// `fields`, kept in `in`'s own field order) copied verbatim, and every
+// attribute unchanged -- no unit conversion, no reinterpretation, so the
+// "RawTable is verbatim" rule holds for the result too. Used by
+// tools/eos_crop and by the adapter build's and the repair's T_max trim
+// (BuildOptions/RepairOptions::trim_t_hi_rows). Throws std::out_of_range if
+// a range is empty or reaches past its axis, and (via field()) if `fields`
+// names a field `in` does not have. Does not enforce any minimum axis size;
+// callers that fit the result check that themselves.
+RawTable crop_table(const RawTable &in, size_t ia, size_t ib, size_t ja, size_t jb, size_t ka,
+                    size_t kb, const std::vector<std::string> *fields = nullptr);
+
 } // namespace eeos

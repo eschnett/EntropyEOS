@@ -92,6 +92,21 @@ constexpr unsigned flag_pol_any = flag_pol_atmosphere | flag_pol_ceiling | flag_
                                   flag_pol_s_ceiled | flag_pol_w_capped | flag_pol_rho_ceiled |
                                   flag_pol_ye_clamped | flag_pol_nonfinite | flag_pol_rho_floored;
 
+// Point flags describing the returned sound speed (1.2.0). Like bits 0-5 they
+// say what the EOS evaluation found, not what anyone did about it: the
+// returned EOSPoint::cs2 is the fitted potential's own value and is never
+// clamped (the con2prim Newton consumes it, and a clamped value would belong to
+// no single U -- eos-causality-repair.md S1). They sit above the policy group
+// so that group stays contiguous. The residual in-box sources on real tables
+// are the documented sigma_T pockets (CODE.md open decision 4); signal_cs2()
+// (core/adapter_eval.hpp) is the clamped value for characteristic speeds.
+constexpr unsigned flag_cs2_acausal = 1u << 17;     // !(cs2 < 1): superluminal sound speed (or NaN)
+constexpr unsigned flag_cs2_nonpositive = 1u << 18; // !(cs2 > 0): imaginary sound speed (or NaN)
+
+// Either sound-speed flag: `flags & flag_cs2_out_of_range` answers "is the
+// returned cs2 outside (0, 1)?".
+constexpr unsigned flag_cs2_out_of_range = flag_cs2_acausal | flag_cs2_nonpositive;
+
 // Coarse-grained outcome of an operation (evaluation, repair, ...). `ok` means
 // nothing notable happened; `repaired` means the result is usable but some
 // flag above was set or a value was adjusted; `fatal` means the result must

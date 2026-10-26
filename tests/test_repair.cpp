@@ -218,6 +218,16 @@ bool fields_bit_identical(const RawTable &a, const RawTable &b, const std::strin
   return true;
 }
 
+// Default options with the 1.2.0 T-row trim off (RepairOptions::
+// trim_t_hi_rows = 0), for tests whose subject is another stage and which
+// compare the repaired table with the input index by index; the trim itself
+// has its own tests below.
+RepairOptions untrimmed() {
+  RepairOptions o;
+  o.trim_t_hi_rows = 0;
+  return o;
+}
+
 bool entries_equal(const std::vector<RepairEntry> &a, const std::vector<RepairEntry> &b) {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {
@@ -255,7 +265,7 @@ TEST_CASE("repair_table: synthetic table with seeded violations is repaired corr
   RawTable seeded = eeos::make_synthetic_table(opts);
   const RawTable seeded_copy = seeded; // snapshot before repair, per spec
 
-  RepairResult result = eeos::repair_table(seeded);
+  RepairResult result = eeos::repair_table(seeded, untrimmed());
 
   CHECK(result.status == eeos::Status::repaired);
   CHECK_FALSE(result.entries.empty());
@@ -422,12 +432,20 @@ TEST_CASE("RepairResult::print: produces non-empty, sane output") {
   CHECK(text.find("entropy") != std::string::npos);
   CHECK(text.find("logenergy") != std::string::npos);
 
-  // A clean table's print() should say so and report zero modifications.
+  // A clean table's print() should say so and report zero modifications
+  // (with the 1.2.0 T-row trim off; with it on, the dropped row is reported).
   RawTable clean_table = eeos::make_synthetic_table(SyntheticOptions{});
-  RepairResult clean_result = eeos::repair_table(clean_table);
+  RepairResult clean_result = eeos::repair_table(clean_table, untrimmed());
   std::ostringstream clean_out;
   clean_result.print(clean_out);
   CHECK(clean_out.str().find("no changes") != std::string::npos);
+
+  RawTable trimmed_table = eeos::make_synthetic_table(SyntheticOptions{});
+  RepairResult trimmed_result = eeos::repair_table(trimmed_table);
+  std::ostringstream trimmed_out;
+  trimmed_result.print(trimmed_out);
+  CHECK(trimmed_out.str().find("repaired") != std::string::npos);
+  CHECK(trimmed_out.str().find("t-trim: dropped 1") != std::string::npos);
 }
 
 // --- (9) M2c-prime spline-safe repair ---------------------------------------
@@ -868,7 +886,7 @@ TEST_CASE("repair_table: dirty-synthetic end-to-end with the 3D stage") {
 
 TEST_CASE("repair_table: a no-defect table leaves the 3D stage a true no-op") {
   RawTable table = eeos::make_synthetic_table(SyntheticOptions{}); // clean, default grid
-  const RepairResult result = eeos::repair_table(table);
+  const RepairResult result = eeos::repair_table(table, untrimmed());
   CHECK(result.entries.empty());
   CHECK(result.status == eeos::Status::ok);
 
@@ -889,4 +907,252 @@ TEST_CASE("repair_table: a no-defect table leaves the 3D stage a true no-op") {
     CHECK(s.rounds3d_violation_history[0] == 0);
     CHECK(s.rounds3d_violation_history[1] == 0);
   }
+}
+
+// --- (8) 1.2.0 seam-blend stage ---------------------------------------------
+//
+// SeamDefect{13, 1.35, 0.04} on the default grid: a level step across irho
+// 13..15 in the top four T rows (jT 26..29), detected at the full seam_tol in
+// jT 27..29 and blended over jT 26..29 (see synthetic.cpp's dirty preset,
+// which plants the same seam).
+
+namespace {
+
+SyntheticOptions seam_only_options() {
+  SyntheticOptions opts;
+  opts.seam.push_back(eeos::SeamDefect{13, 1.35, 0.04});
+  return opts;
+}
+
+double logpress_d2(const RawTable &t, size_t irho, size_t jT, size_t kYe) {
+  const std::vector<double> &lp = t.field("logpress");
+  return lp[t.index(irho + 1, jT, kYe)] - 2.0 * lp[t.index(irho, jT, kYe)] +
+         lp[t.index(irho - 1, jT, kYe)];
+}
+
+} // namespace
+
+TEST_CASE("repair_table seam-blend: detects the planted seam and smooths it in all three fields") {
+  RawTable table = eeos::make_synthetic_table(seam_only_options());
+  const RawTable before = table;
+  const RepairResult result = eeos::repair_table(table, untrimmed());
+
+  const RepairResult::SeamBlendSummary &b = result.seam_blend;
+  CHECK(b.ran);
+  REQUIRE(b.seams.size() == 1);
+  CHECK(b.seams[0].irho_lo == 13);
+  CHECK(b.seams[0].irho_hi == 15);
+  CHECK(b.seams[0].jT_lo == 26);
+  CHECK(b.seams[0].jT_hi == 29);
+  CHECK(b.seams[0].jT_detect_lo == 27);
+  CHECK(b.seams[0].max_step == doctest::Approx(0.04).epsilon(0.05));
+  CHECK(b.seams_unfaded.empty());
+  CHECK(b.columns_blended == 4 * table.nye());
+  CHECK(b.columns_skipped == 0);
+
+  // The step is no longer localized: the blend spreads the same level change
+  // over the 13-cell window, so the largest second difference of logpress
+  // near the seam drops by more than an order of magnitude (from the step's
+  // own +-0.02 at the hottest row; what remains is the smoothstep's own
+  // curvature, ~ step * 6/13^2), and nothing seam-shaped is left -- which
+  // the idempotence test below checks via a second detection.
+  double max_before = 0.0, max_after = 0.0;
+  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+    for (size_t jT = 26; jT <= 29; ++jT) {
+      for (size_t irho = 6; irho <= 22; ++irho) {
+        max_before = std::max(max_before, std::fabs(logpress_d2(before, irho, jT, kYe)));
+        max_after = std::max(max_after, std::fabs(logpress_d2(table, irho, jT, kYe)));
+      }
+    }
+  }
+  CHECK(max_before == doctest::Approx(0.02).epsilon(1e-6));
+  CHECK(max_after < 0.1 * max_before);
+
+  // Every entry lies inside the blend window irho [8, 20] x jT [26, 29], all
+  // three fields have some, logpress entries come last, and the logged old
+  // values are the input's.
+  size_t n_entropy = 0, n_logenergy = 0, n_logpress = 0;
+  bool seen_logpress = false, order_ok = true;
+  for (const RepairEntry &e : result.entries) {
+    CHECK(e.irho >= 8);
+    CHECK(e.irho <= 20);
+    CHECK(e.jT >= 26);
+    CHECK(e.old_value == before.field(e.field)[before.index(e.irho, e.jT, e.kYe)]);
+    if (e.field == "entropy") ++n_entropy;
+    if (e.field == "logenergy") ++n_logenergy;
+    if (e.field == "logpress") {
+      ++n_logpress;
+      seen_logpress = true;
+    } else if (seen_logpress) {
+      order_ok = false;
+    }
+  }
+  CHECK(n_entropy > 0);
+  CHECK(n_logenergy > 0);
+  CHECK(n_logpress == b.logpress_modified);
+  CHECK(n_logpress > 0);
+  CHECK(order_ok);
+}
+
+TEST_CASE("repair_table seam-blend: idempotent, deterministic, and off means off") {
+  RawTable first = eeos::make_synthetic_table(seam_only_options());
+  const RepairResult r1 = eeos::repair_table(first, untrimmed());
+  REQUIRE(r1.seam_blend.seams.size() == 1);
+
+  RawTable again = first;
+  const RepairResult r2 = eeos::repair_table(again, untrimmed());
+  CHECK(r2.seam_blend.ran);
+  CHECK(r2.seam_blend.seams.empty());
+  CHECK(r2.entries.empty());
+  CHECK(r2.status == eeos::Status::ok);
+
+  RawTable other = eeos::make_synthetic_table(seam_only_options());
+  const RepairResult r3 = eeos::repair_table(other, untrimmed());
+  CHECK(entries_equal(r1.entries, r3.entries));
+  for (const char *f : {"entropy", "logenergy", "logpress"}) {
+    CHECK(fields_bit_identical(first, other, f));
+  }
+
+  RawTable off = eeos::make_synthetic_table(seam_only_options());
+  const RawTable off_before = off;
+  RepairOptions opts = untrimmed();
+  opts.seam_blend = false;
+  const RepairResult r4 = eeos::repair_table(off, opts);
+  CHECK_FALSE(r4.seam_blend.ran);
+  CHECK(fields_bit_identical(off, off_before, "logpress"));
+  for (const RepairEntry &e : r4.entries) {
+    CHECK(e.field != "logpress");
+  }
+}
+
+TEST_CASE("repair_table seam-blend: a clean table is a bitwise no-op, and the stage needs "
+          "logpress") {
+  RawTable clean = eeos::make_synthetic_table();
+  const RawTable clean_before = clean;
+  const RepairResult r = eeos::repair_table(clean, untrimmed());
+  CHECK(r.seam_blend.ran);
+  CHECK(r.seam_blend.seams.empty());
+  CHECK(r.seam_blend.seams_unfaded.empty());
+  CHECK(r.seam_blend.logpress_modified == 0);
+  CHECK(fields_bit_identical(clean, clean_before, "logpress"));
+
+  // Without a logpress field the stage is skipped, not an error.
+  RawTable no_p;
+  {
+    RawTable full = eeos::make_synthetic_table(seam_only_options());
+    no_p.set_axes(full.logrho(), full.logtemp(), full.ye());
+    no_p.add_field("entropy", full.field("entropy"));
+    no_p.add_field("logenergy", full.field("logenergy"));
+    no_p.add_attribute("energy_shift", full.energy_shift());
+  }
+  const RepairResult r2 = eeos::repair_table(no_p, untrimmed());
+  CHECK_FALSE(r2.seam_blend.ran);
+}
+
+TEST_CASE("repair_table seam-blend: a seam that does not fade where it can be followed is "
+          "reported, not blended") {
+  // The step now starts below the grid, so it is present (and growing) in
+  // every row; making the ground loud at irho 10 for jT <= 20 hides its
+  // pattern there while the step itself is still large. Blending only
+  // jT 21..29 would leave an edit edge of the step's size between jT 20 and
+  // 21, so the stage must leave the seam alone and say so.
+  SyntheticOptions opts;
+  opts.seam.push_back(eeos::SeamDefect{13, -1.801, 0.04});
+  RawTable table = eeos::make_synthetic_table(opts);
+  std::vector<double> &lp = table.field("logpress");
+  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+    for (size_t jT = 0; jT <= 20; ++jT) {
+      lp[table.index(10, jT, kYe)] += 0.01;
+    }
+  }
+  const RawTable before = table;
+  const RepairResult r = eeos::repair_table(table, untrimmed());
+  CHECK(r.seam_blend.ran);
+  CHECK(r.seam_blend.seams.empty());
+  REQUIRE(r.seam_blend.seams_unfaded.size() == 1);
+  CHECK(r.seam_blend.seams_unfaded[0].irho_lo == 13);
+  CHECK(r.seam_blend.seams_unfaded[0].irho_hi == 15);
+  CHECK(r.seam_blend.seams_unfaded[0].jT_lo == 21);
+  CHECK(r.seam_blend.seams_unfaded[0].jT_hi == 29);
+  CHECK(fields_bit_identical(table, before, "logpress"));
+}
+
+TEST_CASE("repair_table seam-blend: invalid options throw before anything is modified") {
+  RawTable table = eeos::make_synthetic_table(seam_only_options());
+  const RawTable before = table;
+  for (int which = 0; which < 4; ++which) {
+    RepairOptions opts = untrimmed();
+    if (which == 0) opts.seam_tol = 0.0;
+    if (which == 1) opts.seam_fit_cells = 2;
+    if (which == 2) opts.seam_halfwidth = 0;
+    if (which == 3) opts.seam_halfwidth = opts.seam_fit_cells + 1;
+    CHECK_THROWS_AS(eeos::repair_table(table, opts), std::invalid_argument);
+    for (const char *f : {"entropy", "logenergy", "logpress"}) {
+      CHECK(fields_bit_identical(table, before, f));
+    }
+  }
+}
+
+// --- (9) 1.2.0 T-row trim ---------------------------------------------------
+
+TEST_CASE("repair_table T-row trim: drops the hottest row, records it, and never drops it twice") {
+  const RawTable input = eeos::make_synthetic_table(); // clean, default grid (ntemp = 30)
+  RawTable table = input;
+  const RepairResult r = eeos::repair_table(table); // default trim_t_hi_rows = 1
+
+  REQUIRE(table.ntemp() == input.ntemp() - 1);
+  CHECK(r.t_hi_rows_dropped == 1);
+  CHECK(r.status == eeos::Status::repaired); // the dropped row is the change...
+  CHECK(r.entries.empty());                  // ...and nothing else moved
+  CHECK(r.logtemp_max_before == input.logtemp().back());
+  CHECK(r.logtemp_max_after == input.logtemp()[input.ntemp() - 2]);
+  CHECK(table.attribute(eeos::kTHiRowsDroppedAttr) == 1.0);
+  CHECK(table.attribute("energy_shift") == input.attribute("energy_shift"));
+  for (size_t j = 0; j < table.ntemp(); ++j) {
+    CHECK(table.logtemp()[j] == input.logtemp()[j]);
+  }
+  for (const std::string &f : input.field_names()) {
+    bool same = true;
+    for (size_t k = 0; k < table.nye(); ++k)
+      for (size_t j = 0; j < table.ntemp(); ++j)
+        for (size_t i = 0; i < table.nrho(); ++i)
+          same = same && same_bits(table.field(f)[table.index(i, j, k)], input.field(f)[input.index(i, j, k)]);
+    CHECK_MESSAGE(same, f);
+  }
+
+  // Re-repairing drops nothing more: the attribute says it is done.
+  const RepairResult again = eeos::repair_table(table);
+  CHECK(again.t_hi_rows_dropped == 0);
+  CHECK(again.status == eeos::Status::ok);
+  CHECK(table.ntemp() == input.ntemp() - 1);
+
+  // Asking for more drops only the difference, and the record accumulates.
+  RepairOptions two;
+  two.trim_t_hi_rows = 2;
+  const RepairResult more = eeos::repair_table(table, two);
+  CHECK(more.t_hi_rows_dropped == 1);
+  CHECK(table.ntemp() == input.ntemp() - 2);
+  CHECK(table.attribute(eeos::kTHiRowsDroppedAttr) == 2.0);
+
+  // 0 keeps every row and leaves no record.
+  RawTable kept = input;
+  CHECK(eeos::repair_table(kept, untrimmed()).t_hi_rows_dropped == 0);
+  CHECK(kept.ntemp() == input.ntemp());
+  CHECK_FALSE(kept.has_attribute(eeos::kTHiRowsDroppedAttr));
+}
+
+TEST_CASE("repair_table T-row trim: a table too short to keep 4 rows is not trimmed; negative "
+          "throws") {
+  SyntheticOptions opts;
+  opts.ntemp = 4;
+  RawTable small = eeos::make_synthetic_table(opts);
+  const RepairResult r = eeos::repair_table(small);
+  CHECK(r.t_hi_rows_dropped == 0);
+  CHECK(small.ntemp() == 4);
+
+  RawTable table = eeos::make_synthetic_table();
+  RepairOptions bad;
+  bad.trim_t_hi_rows = -1;
+  CHECK_THROWS_AS(eeos::repair_table(table, bad), std::invalid_argument);
+  CHECK(table.ntemp() == SyntheticOptions().ntemp);
 }

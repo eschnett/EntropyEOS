@@ -998,3 +998,111 @@ TEST_CASE("M3i far x-low tail: SFHo real table (guarded)") {
   if (eeos_skip_big_table("test_adapter_tail (SFHo): real table")) return;
   check_real_table_xlow_tail(kSFHoPath, "SFHo", eeos::m_amu_g);
 }
+
+// ==========================================================================
+// M3k (1.2.0): the u-high ratio lock on L's secondary track, and its gate
+// (adapter_eval.hpp, "M3K U-HIGH RATIO LOCK").
+// ==========================================================================
+
+namespace {
+
+// dL/dx|_s from tail-evolved L and log-sigma samples: L_x - (L_u/g_u) g_x.
+double dLdx_at_fixed_s(const BsplineEval3 &L, const BsplineEval3 &g) {
+  return L.fx - (L.fu / g.fu) * g.fx;
+}
+
+BsplineEval3 make_sample(double f, double fx, double fu, double fxx, double fxu, double fuu) {
+  BsplineEval3 b;
+  b.f = f;
+  b.fx = fx;
+  b.fu = fu;
+  b.fy = 0.0;
+  b.fxx = fxx;
+  b.fxu = fxu;
+  b.fuu = fuu;
+  return b;
+}
+
+} // namespace
+
+TEST_CASE("M3k ratio lock: dL/dx at fixed s is depth-independent beyond the blend cell, C1 at "
+          "the seam") {
+  using eeos::detail::TailAxis;
+  using eeos::detail::TailSpec;
+  const double w = 0.05;
+  // A matter-like seam: the slope ratio varies with x (L_xu != r g_xu), so the
+  // unlocked tail drifts linearly with depth.
+  const BsplineEval3 Lb = make_sample(20.5, -0.8, 4.2, 0.3, 0.5, 0.4);
+  const BsplineEval3 gb = make_sample(std::log(50.0), -2.0, 7.0, 0.1, -0.6, 0.2);
+  const double alpha = eeos::detail::aeval_phase2_slope(Track1D{gb.f, gb.fu, gb.fuu}, 1.0, w);
+
+  const TailSpec gspec{w, 0.0, 0.0};
+  const TailSpec locked{w, 0.0, 0.0, alpha, gb.fxu, gb.fx, gb.fxx, 0.99};
+  const TailSpec unlocked{w, 0.0, 0.0};
+
+  // The gate is fully open here (the locked tail's c_inf ~ 0.47 << 0.99).
+  const double r = eeos::detail::aeval_phase2_slope(Track1D{Lb.f, Lb.fu, Lb.fuu}, 1.0, w) / alpha;
+  CHECK(eeos::detail::aeval_lock_weight(Lb.fx + w / 3 * Lb.fxu, gb.fx + w / 3 * gb.fxu, Lb.fxx,
+                                        gb.fxx, r, 0.99) == 1.0);
+
+  std::vector<double> lk, ul;
+  for (double depth : {1.5, 2.0, 4.0, 8.0, 16.0}) {
+    const double d = depth * w;
+    const BsplineEval3 g = eeos::detail::aeval_apply_tail(gb, d, TailAxis::u, gspec);
+    lk.push_back(dLdx_at_fixed_s(eeos::detail::aeval_apply_tail(Lb, d, TailAxis::u, locked), g));
+    ul.push_back(dLdx_at_fixed_s(eeos::detail::aeval_apply_tail(Lb, d, TailAxis::u, unlocked), g));
+  }
+  for (size_t i = 1; i < lk.size(); ++i) {
+    CHECK(lk[i] == doctest::Approx(lk[0]).epsilon(1e-12));
+  }
+  CHECK(std::fabs(ul.back() - ul.front()) > 0.1); // the drift the lock removes
+
+  // C1 at the seam: value, fx and fxu of the locked tail match the spline
+  // sample as d -> 0+, and its value track is the unlocked one exactly.
+  const BsplineEval3 at0 = eeos::detail::aeval_apply_tail(Lb, 1e-12, TailAxis::u, locked);
+  CHECK(at0.fx == doctest::Approx(Lb.fx).epsilon(1e-10));
+  CHECK(at0.fxu == doctest::Approx(Lb.fxu).epsilon(1e-9));
+  for (double depth : {0.5, 3.0}) {
+    const BsplineEval3 a = eeos::detail::aeval_apply_tail(Lb, depth * w, TailAxis::u, locked);
+    const BsplineEval3 b = eeos::detail::aeval_apply_tail(Lb, depth * w, TailAxis::u, unlocked);
+    CHECK(bit_equal(a.f, b.f));
+    CHECK(bit_equal(a.fu, b.fu));
+    CHECK(bit_equal(a.fuu, b.fuu));
+  }
+}
+
+TEST_CASE("M3k lock gate: open below the cap, closed at and above it, smooth in between") {
+  using eeos::detail::aeval_lock_weight;
+  // c_inf = k0 + j0/(ln10 (1 + k0)) with k0 = A - r B, j0 = C - r D; take
+  // r = 0 and D = 0 so c_inf = A + C/(ln10 (1 + A)).
+  const double cap = 0.99;
+  CHECK(aeval_lock_weight(0.3, -1.0, 0.0, 0.0, 0.0, cap) == 1.0);  // c_inf = 0.3
+  CHECK(aeval_lock_weight(0.99, -1.0, 0.0, 0.0, 0.0, cap) == 0.0); // at the cap
+  CHECK(aeval_lock_weight(1.2, -1.0, 0.0, 0.0, 0.0, cap) == 0.0);  // stiff seam
+  CHECK(aeval_lock_weight(-1.5, -1.0, 0.0, 0.0, 0.0, cap) == 0.0); // 1 + k0 <= 0
+  CHECK(aeval_lock_weight(std::numeric_limits<double>::quiet_NaN(), -1.0, 0.0, 0.0, 0.0, cap) == 0.0);
+  // The stiff x-structure alone can close it: A small, C large.
+  CHECK(aeval_lock_weight(0.48, -1.26, 2.85, 0.68, 0.0, cap) == 0.0);
+  double prev = 1.0;
+  for (double a = 0.85; a <= 0.99; a += 0.01) {
+    const double lam = aeval_lock_weight(a, -1.0, 0.0, 0.0, 0.0, cap);
+    CHECK(lam <= prev);
+    CHECK(lam >= 0.0);
+    prev = lam;
+  }
+
+  // Closed gate: the locked spec reproduces the unlocked (pre-1.2.0) tail
+  // bit for bit.
+  using eeos::detail::TailAxis;
+  using eeos::detail::TailSpec;
+  const double w = 0.05;
+  const BsplineEval3 Lb = make_sample(20.5, 0.9, 1.0, 3.0, 0.5, 0.4); // stiff: A ~ 0.9, C = 3
+  const BsplineEval3 gb = make_sample(std::log(50.0), -1.2, 3.0, 0.7, -0.6, 0.2);
+  const double alpha = eeos::detail::aeval_phase2_slope(Track1D{gb.f, gb.fu, gb.fuu}, 1.0, w);
+  const TailSpec locked{w, 0.0, 0.0, alpha, gb.fxu, gb.fx, gb.fxx, 0.99};
+  const TailSpec unlocked{w, 0.0, 0.0};
+  for (double depth : {0.5, 2.0, 8.0}) {
+    CHECK(sample_bit_equal(eeos::detail::aeval_apply_tail(Lb, depth * w, TailAxis::u, locked),
+                           eeos::detail::aeval_apply_tail(Lb, depth * w, TailAxis::u, unlocked)));
+  }
+}

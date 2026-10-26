@@ -258,7 +258,11 @@ primitive state with no mutation and no solves, and `check_con_state()` diagnose
 *conservative* state using pure arithmetic by default — no EOS evaluation, no solve — so
 it can run on every point of every timestep. Beyond that, every `EOSPoint` and
 `Con2PrimOut` carries flags recording which domain-extension band, if any, the answer
-came from. Mapping invalid states back to valid ones is the job of the policy layer:
+came from, and whether the returned $c_s^2$ lies outside $(0, 1)$ (`flag_cs2_acausal`,
+`flag_cs2_nonpositive`, or both via `flag_cs2_out_of_range`). The returned `cs2` itself
+is never clamped — the Newton consumes it — so a caller computing characteristic speeds
+uses `signal_cs2(pt.cs2)`, which clamps into $[0, 1]$ and maps NaN to 1, for that
+purpose only. Mapping invalid states back to valid ones is the job of the policy layer:
 `PolicyOptions` holds the thresholds, `default_policy(view, rho_atm)` derives all of
 them but $\rho_{\rm atm}$ from the built adapter, and `project_prim_state()` clamps a
 state into validity in place and reports what it changed. Projection is idempotent, so
@@ -321,13 +325,39 @@ repair is a build-time activity on the data, and the run-time path contains no r
 logic at all. The tool never modifies its input; it writes a faithful copy of every
 untouched dataset alongside the repaired fields, a `/repair` provenance group recording
 per-field indices, old and new values, parameters, tool version and an input checksum,
-and a human-readable log. Only `entropy` and `logenergy` are ever edited. A missing or
+and a human-readable log. Only `entropy` and `logenergy` are ever edited, plus `logpress`
+by the seam blend below, the one stage that keeps it consistent with them. Since 1.2.0 the
+repair also drops the table's hottest temperature row before anything else
+(`RepairOptions::trim_t_hi_rows = 1`, `--trim-t-hi 0` keeps it): on DD2 and SFHo that row
+is unreliable — its own stored sound speed is garbage, its temperature derivatives are
+noisy — and the fit's last cell turns it into in-box $c_s^2 \ge 1$ and a superluminal hot
+tail, while on LS220 and SRO dropping it is measured to be neutral or better. Dropping it
+from the *file*, rather than only from the fit, is deliberate: every row of a repaired
+table is a repaired row, so any code that reads the file and fits all of it — this
+library's build, an older release, another interpolator — sees the same data. The
+output records the trim (`eeos_t_hi_rows_dropped`), so re-repairing it drops nothing
+more. A missing or
 non-finite value in one of *those* is fatal — a broken file, not physics noise, and the
 run throws before touching anything — whereas non-finite values in columns the pipeline
 never interprets are reported and passed through byte-identically, which is what lets
 LS220 be repaired at all despite carrying three Inf/NaN points in `cs2` and `gamma`.
 
-Three stages then run in order, each aimed at one failure mode.
+Four stages then run in order, each aimed at one failure mode.
+
+**The seam blend** comes first, for a defect none of the others can see. The Hempel
+tables (DD2, SFHo) are stitched together from two tabulations at $\rho \approx 1.4
+\times 10^7$ g cm⁻³: above about 70 MeV both pieces are smooth, but they meet with a
+level step in pressure, energy and entropy across three density cells, identical at
+every $Y_e$ and reaching 5% in $p$ at $T_{\max}$. The fit turns that step into
+$c_s^2$ up to ~5 and into $c_s^2 \le 0$ and $p \le 0$ in-box, and it is where every
+con2prim failure on DD2 sat. The stage finds such seams from `logpress` alone — a pair
+of opposite-sign second differences along $\rho$ on otherwise quiet ground, at the same
+cells for every $Y_e$ — and replaces a window of five cells either side with a $C^2$
+blend of quadratic fits to the two smooth sides, in all three fields. A seam must fade
+out at both ends of the temperature range where its shape can be followed, or blending
+only part of it would leave an edge as large as the step itself; LS220 has one that does
+not (at $\rho \approx 10^8$ g cm⁻³, from $T_{\min}$ to ~1 MeV), and it is reported and
+left alone.
 
 **Isotonic repair**, per $(\rho, Y_e)$ column along $T$, applies an $L^2$ isotonic
 regression (pool-adjacent-violators, Barlow et al. 1972) to `entropy` and `logenergy`
@@ -379,6 +409,16 @@ monotonicity counts have not regressed and the $c_s^2$ count has not risen, reve
 the entire stage otherwise: causality is never enforced at the price of the $T$-solve's
 hard requirement.
 
+The interior runs it leaves alone are almost all the $\sigma_T$ pockets below
+$T \approx 0.1$ MeV, where the tables reach far below the validity of nuclear statistical
+equilibrium and $\sigma_T$ is nearly flat. They are rare — a few hundred refined samples
+in a hundred million, which a random soak does not hit — but enormous ($c_s^2$ up to
+$10^8$–$10^{11}$). Cropping the table at 0.1 MeV removes them but makes things worse
+overall: the low-temperature extension launched from the new edge then carries
+thousands of acausal and hundreds of thousands of $p \le 0$ samples on DD2. They are
+therefore accepted and guarded: the run-time flags above mark any point where they show
+up.
+
 Repairing the *data* this way, rather than clamping $c_s^2$ at run time, is deliberate: a
 clamped $c_s^2$ corresponds to no single potential $U$, and would silently break the
 identities the Newton algorithm is built on.
@@ -399,7 +439,10 @@ convert units, fit $C^2$ tensor-product cubic B-splines to entropy and
 $\log(\epsilon + \Delta)$, choose $\kappa$ from a fine scan of the *fitted* splines
 (which can undershoot the data minimum, so scanning the raw data would not be enough),
 and extend both fields beyond the physical box — eight grid cells per side in $\log\rho$
-and $\log T$ — with $C^2$, monotone, *causal* tails. Out of bounds is handled by smooth
+and $\log T$ — with $C^2$, monotone, *causal* tails. (States above a repaired table's
+new, one-row-lower $T_{\max}$ are served by the causal hot tail, as states above
+$T_{\max}$ always were; `BuildOptions::trim_t_hi_rows` can also leave rows out of the fit
+of a table that was not repaired.) Out of bounds is handled by smooth
 extension plus a flag, not by a hard clamp, since a clamp zeroes
 derivatives and stalls or misleads Newton. Validity is judged only at the end, on the converged
 state, by the policies above. The tails are also built to approach the right asymptotics
@@ -409,7 +452,10 @@ direction that means continuing $\ln\sigma$ and $\ln\epsilon$ affinely in $\log\
 both become power laws in $\rho$ with the seam's own exponents: the radiation limit
 $c_s^2 \to 1/3$ at a hot seam, degenerating to the ideal-gas behaviour at a cold one. In
 the temperature direction the hot tail is built in $\ln\sigma$ for the same reason, with
-an explicit causal clamp on the energy tail's slope. $Y_e$ is the exception to all of this: it is
+an explicit causal clamp on the energy tail's slope and a lock on the ratio of the two
+tails' slopes: where that ratio varies with density (a matter-dominated hot seam, or the
+seam-blend window), an unlocked tail drifts linearly with depth until $p$ turns
+negative. The lock is applied only where the locked tail's own asymptote stays causal. $Y_e$ is the exception to all of this: it is
 exact and never iterated, so it is simply clamped and flagged.
 
 ## Example
@@ -466,6 +512,8 @@ int main() {
 
   const eeos::EOSPoint pt = view.evaluate(ps.rho, ps.s, ps.ye, /*u_guess=*/kNaN);
   std::printf("p = %.6e   T = %.4f MeV   cs2 = %.4f\n", pt.p, pt.T_F_MeV, pt.cs2);
+  if (pt.flags & eeos::flag_cs2_out_of_range)            // a residual table defect here
+    std::printf("cs2 outside (0,1); wave speeds use %.4f\n", eeos::signal_cs2(pt.cs2));
 
   // --- 4. prim2con: always succeeds ----------------------------------------
   const double B2 = 0.1 * ps.rho, cos_vB = 0.3;
@@ -500,9 +548,9 @@ c++ -O2 -std=c++17 -I. example.cpp libentropy_eos.a -lhdf5 -o example && ./examp
 which prints
 
 ```
-p = 2.376396e+07   T = 1.5811 MeV   cs2 = 0.0039
-rho 9.999e+09 -> 9.999e+09   s 43.394858 -> 43.394858   w 0.800000 -> 0.800000
-state repaired (flags 0x400); adopt safe.cons as the new conserved state
+p = 2.109562e+07   T = 1.4036 MeV   cs2 = 0.0035
+rho 9.999e+09 -> 9.999e+09   s 43.144749 -> 43.144749   w 0.800000 -> 0.800000
+state repaired (flags 0x1400); adopt safe.cons as the new conserved state
 ```
 
 Both usage modes are supported: either link `libentropy_eos.a` as above, with
@@ -566,7 +614,7 @@ vendor hardware yet — reports welcome.
 
 ## Status and testing
 
-This is version **1.1.0**. The version is available to consumers as
+This is version **1.2.0**. The version is available to consumers as
 `EEOS_VERSION_MAJOR/_MINOR/_PATCH`, as an encoded integer `EEOS_VERSION` for
 `#if EEOS_VERSION >= EEOS_VERSION_ENCODE(1, 1, 0)` feature guards, as
 `EEOS_VERSION_STRING`, and as `constexpr eeos::version*` values, all from

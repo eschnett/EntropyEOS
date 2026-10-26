@@ -1360,6 +1360,321 @@ void causal_cap_stage(const RawTable &table, const std::vector<double> &sigma_da
   out.nodes_capped = capped;
 }
 
+// --- 1.2.0 seam-blend stage (repair.hpp, repair_table() steps S1-S3) -------
+
+// Fraction of seam_tol down to which a detected seam's row range keeps
+// growing (step S1's theta = seam_tol/100), so the blend fades out with the
+// step instead of switching off abruptly in T.
+constexpr double kSeamFadeRatio = 1e-2;
+
+// "Quiet ground" (step S1): every other second difference near a seam must
+// be at most this fraction of the weaker of the two seam edges.
+constexpr double kSeamQuietRatio = 0.1;
+
+// Widest seam considered, b - a (DD2/SFHo: 2).
+constexpr int kSeamMaxWidth = 3;
+
+struct SeamSpec {
+  int a = 0, b = 0;                  // the seam's own cells
+  int j_lo = 0, j_hi = 0;            // rows to blend (inclusive)
+  int j_detect_lo = 0;               // lowest row detected at the full seam_tol
+};
+
+// A quadratic in (x - xm), fitted by least squares (step S2).
+struct SeamQuad {
+  double xm = 0.0, c0 = 0.0, c1 = 0.0, c2 = 0.0;
+  double operator()(double x) const {
+    const double d = x - xm;
+    return c0 + d * (c1 + d * c2);
+  }
+};
+
+double det3(double a, double b, double c, double d, double e, double f, double g, double h,
+            double i) {
+  return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+}
+
+// Least-squares quadratic through (x[n], y[n]), n < count (count >= 3,
+// distinct x), centred on the mean of x for conditioning; the 3x3 normal
+// equations are solved by Cramer's rule.
+SeamQuad fit_quadratic(const std::vector<double> &x, const std::vector<double> &y) {
+  const size_t count = x.size();
+  SeamQuad q;
+  for (double v : x) {
+    q.xm += v;
+  }
+  q.xm /= static_cast<double>(count);
+  double s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0, t0 = 0.0, t1 = 0.0, t2 = 0.0;
+  for (size_t n = 0; n < count; ++n) {
+    const double d = x[n] - q.xm;
+    const double dd = d * d;
+    s1 += d;
+    s2 += dd;
+    s3 += dd * d;
+    s4 += dd * dd;
+    t0 += y[n];
+    t1 += d * y[n];
+    t2 += dd * y[n];
+  }
+  const double s0 = static_cast<double>(count);
+  const double det = det3(s0, s1, s2, s1, s2, s3, s2, s3, s4);
+  q.c0 = det3(t0, s1, s2, t1, s2, s3, t2, s3, s4) / det;
+  q.c1 = det3(s0, t0, s2, s1, t1, s3, s2, t2, s4) / det;
+  q.c2 = det3(s0, s1, t0, s1, s2, t1, s2, s3, t2) / det;
+  return q;
+}
+
+// Step S1's pattern test for cells a..b in one (jT, kYe) row of logpress.
+// Any non-finite value makes a comparison false and so fails the test.
+bool seam_pattern(const RawTable &table, const std::vector<double> &logpress, int a, int b,
+                  size_t jT, size_t kYe, int fit_cells, double theta) {
+  const auto d2 = [&](int i) {
+    return logpress[table.index(static_cast<size_t>(i + 1), jT, kYe)] -
+           2.0 * logpress[table.index(static_cast<size_t>(i), jT, kYe)] +
+           logpress[table.index(static_cast<size_t>(i - 1), jT, kYe)];
+  };
+  const double da = d2(a);
+  const double db = d2(b);
+  if (!(da * db < 0.0)) {
+    return false;
+  }
+  const double m = std::min(std::fabs(da), std::fabs(db));
+  if (!(m >= theta)) {
+    return false;
+  }
+  const double quiet = kSeamQuietRatio * m;
+  const auto loud = [&](int i) { return !(std::fabs(d2(i)) <= quiet); };
+  for (int i = a + 1; i < b; ++i) {
+    if (loud(i)) {
+      return false;
+    }
+  }
+  for (int i = a - fit_cells + 1; i <= a - 1; ++i) {
+    if (loud(i)) {
+      return false;
+    }
+  }
+  for (int i = b + 1; i <= b + fit_cells - 1; ++i) {
+    if (loud(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool seam_pattern_every_ye(const RawTable &table, const std::vector<double> &logpress, int a,
+                           int b, size_t jT, int fit_cells, double theta) {
+  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+    if (!seam_pattern(table, logpress, a, b, jT, kYe, fit_cells, theta)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Step S1's end test: the seam has faded in row jT if both of its edges are
+// below theta at every kYe, whatever the shape around them. (A non-finite
+// edge is not faded.)
+bool seam_faded(const RawTable &table, const std::vector<double> &logpress, int a, int b,
+                size_t jT, double theta) {
+  for (size_t kYe = 0; kYe < table.nye(); ++kYe) {
+    const auto d2 = [&](int i) {
+      return logpress[table.index(static_cast<size_t>(i + 1), jT, kYe)] -
+             2.0 * logpress[table.index(static_cast<size_t>(i), jT, kYe)] +
+             logpress[table.index(static_cast<size_t>(i - 1), jT, kYe)];
+    };
+    if (!(std::min(std::fabs(d2(a)), std::fabs(d2(b))) < theta)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Step S1: every seam to blend, in increasing a, with its row range. Seams
+// that do not fade at both ends of their range go to `unfaded` instead, and
+// seams whose fit range overlaps an earlier blended one's are counted in
+// `skipped_overlap`.
+std::vector<SeamSpec> detect_seams(const RawTable &table, const std::vector<double> &logpress,
+                                   const RepairOptions &options, std::vector<SeamSpec> &unfaded,
+                                   size_t &skipped_overlap) {
+  const int nrho = static_cast<int>(table.nrho());
+  const int ntemp = static_cast<int>(table.ntemp());
+  const int F = options.seam_fit_cells;
+  const int margin = std::max(F, options.seam_halfwidth + 1);
+
+  // Detected rows per (a, b), in the deterministic order of the scan.
+  std::vector<SeamSpec> found;
+  std::vector<std::vector<int>> found_rows;
+  for (int jT = 0; jT < ntemp; ++jT) {
+    for (int a = margin; a + 1 + margin <= nrho - 1; ++a) {
+      for (int w = 1; w <= kSeamMaxWidth && a + w + margin <= nrho - 1; ++w) {
+        const int b = a + w;
+        if (!seam_pattern_every_ye(table, logpress, a, b, static_cast<size_t>(jT), F,
+                                   options.seam_tol)) {
+          continue;
+        }
+        size_t s = 0;
+        while (s < found.size() && !(found[s].a == a && found[s].b == b)) {
+          ++s;
+        }
+        if (s == found.size()) {
+          SeamSpec spec;
+          spec.a = a;
+          spec.b = b;
+          found.push_back(spec);
+          found_rows.emplace_back();
+        }
+        found_rows[s].push_back(jT);
+        a = b; // resume the scan past this seam
+        break;
+      }
+    }
+  }
+
+  const double fade = options.seam_tol * kSeamFadeRatio;
+  for (size_t s = 0; s < found.size(); ++s) {
+    SeamSpec &spec = found[s];
+    spec.j_detect_lo = found_rows[s].front();
+    spec.j_lo = found_rows[s].front();
+    spec.j_hi = found_rows[s].back();
+    while (spec.j_lo > 0 && seam_pattern_every_ye(table, logpress, spec.a, spec.b,
+                                                   static_cast<size_t>(spec.j_lo - 1), F, fade)) {
+      --spec.j_lo;
+    }
+    while (spec.j_hi + 1 < ntemp &&
+           seam_pattern_every_ye(table, logpress, spec.a, spec.b,
+                                 static_cast<size_t>(spec.j_hi + 1), F, fade)) {
+      ++spec.j_hi;
+    }
+  }
+  std::sort(found.begin(), found.end(),
+            [](const SeamSpec &l, const SeamSpec &r) { return l.a < r.a; });
+
+  std::vector<SeamSpec> kept;
+  for (const SeamSpec &spec : found) {
+    const bool lo_ok = spec.j_lo == 0 || seam_faded(table, logpress, spec.a, spec.b,
+                                                    static_cast<size_t>(spec.j_lo - 1), fade);
+    const bool hi_ok = spec.j_hi + 1 == ntemp ||
+                       seam_faded(table, logpress, spec.a, spec.b,
+                                  static_cast<size_t>(spec.j_hi + 1), fade);
+    if (!lo_ok || !hi_ok) {
+      unfaded.push_back(spec);
+      continue;
+    }
+    if (!kept.empty() && spec.a - F <= kept.back().b + F) {
+      ++skipped_overlap;
+      continue;
+    }
+    kept.push_back(spec);
+  }
+  return kept;
+}
+
+// Step S2 for one field in one (jT, kYe) row: fits the two sides (in ln v if
+// `log_domain`) and rewrites [a-W, b+W] with the smoothstep blend. Returns
+// |q_R - q_L| at the seam centre, in the fitted variable.
+double blend_seam_row(std::vector<double> &data, const RawTable &table, const SeamSpec &spec,
+                      size_t jT, size_t kYe, int fit_cells, int halfwidth, bool log_domain) {
+  const std::vector<double> &X = table.logrho();
+  const auto value = [&](int i) {
+    const double v = data[table.index(static_cast<size_t>(i), jT, kYe)];
+    return log_domain ? std::log(v) : v;
+  };
+  std::vector<double> xs(static_cast<size_t>(fit_cells)), ys(static_cast<size_t>(fit_cells));
+  for (int n = 0; n < fit_cells; ++n) {
+    xs[static_cast<size_t>(n)] = X[static_cast<size_t>(spec.a - fit_cells + n)];
+    ys[static_cast<size_t>(n)] = value(spec.a - fit_cells + n);
+  }
+  const SeamQuad left = fit_quadratic(xs, ys);
+  for (int n = 0; n < fit_cells; ++n) {
+    xs[static_cast<size_t>(n)] = X[static_cast<size_t>(spec.b + 1 + n)];
+    ys[static_cast<size_t>(n)] = value(spec.b + 1 + n);
+  }
+  const SeamQuad right = fit_quadratic(xs, ys);
+
+  const double xl = X[static_cast<size_t>(spec.a - halfwidth - 1)];
+  const double xr = X[static_cast<size_t>(spec.b + halfwidth + 1)];
+  for (int i = spec.a - halfwidth; i <= spec.b + halfwidth; ++i) {
+    const double x = X[static_cast<size_t>(i)];
+    const double z = (x - xl) / (xr - xl);
+    const double w = z * z * z * (10.0 - 15.0 * z + 6.0 * z * z);
+    const double v = (1.0 - w) * left(x) + w * right(x);
+    data[table.index(static_cast<size_t>(i), jT, kYe)] = log_domain ? std::exp(v) : v;
+  }
+  const double xc = 0.5 * (X[static_cast<size_t>(spec.a)] + X[static_cast<size_t>(spec.b)]);
+  return std::fabs(right(xc) - left(xc));
+}
+
+// The whole seam-blend stage (repair.hpp steps S1-S2). The caller has
+// checked that "entropy" and "logenergy" are listed and "logpress" exists.
+void seam_blend_stage(RawTable &table, const RepairOptions &options,
+                      RepairResult::SeamBlendSummary &out) {
+  out.ran = true;
+  std::vector<double> &entropy = table.field("entropy");
+  std::vector<double> &logenergy = table.field("logenergy");
+  std::vector<double> &logpress = table.field("logpress");
+  const int F = options.seam_fit_cells;
+  const int W = options.seam_halfwidth;
+  const size_t nye = table.nye();
+
+  std::vector<SeamSpec> unfaded;
+  const std::vector<SeamSpec> specs =
+      detect_seams(table, logpress, options, unfaded, out.seams_skipped_overlap);
+  for (const SeamSpec &spec : unfaded) {
+    RepairResult::SeamBlendSummary::Seam seam;
+    seam.irho_lo = static_cast<size_t>(spec.a);
+    seam.irho_hi = static_cast<size_t>(spec.b);
+    seam.jT_lo = static_cast<size_t>(spec.j_lo);
+    seam.jT_hi = static_cast<size_t>(spec.j_hi);
+    seam.jT_detect_lo = static_cast<size_t>(spec.j_detect_lo);
+    out.seams_unfaded.push_back(seam);
+  }
+  for (const SeamSpec &spec : specs) {
+    const size_t nj = static_cast<size_t>(spec.j_hi - spec.j_lo + 1);
+    const long long nrows = static_cast<long long>(nj * nye);
+    std::vector<double> steps(static_cast<size_t>(nrows), 0.0);
+    std::vector<char> blended(static_cast<size_t>(nrows), 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long long r = 0; r < nrows; ++r) {
+      const size_t jT = static_cast<size_t>(spec.j_lo) + static_cast<size_t>(r) % nj;
+      const size_t kYe = static_cast<size_t>(r) / nj;
+      bool finite = true;
+      bool positive = true;
+      for (int i = spec.a - F; i <= spec.b + F; ++i) {
+        const size_t idx = table.index(static_cast<size_t>(i), jT, kYe);
+        finite = finite && std::isfinite(entropy[idx]) && std::isfinite(logenergy[idx]) &&
+                 std::isfinite(logpress[idx]);
+        positive = positive && entropy[idx] > 0.0;
+      }
+      if (!finite) {
+        continue;
+      }
+      blend_seam_row(entropy, table, spec, jT, kYe, F, W, positive);
+      blend_seam_row(logenergy, table, spec, jT, kYe, F, W, false);
+      steps[static_cast<size_t>(r)] = blend_seam_row(logpress, table, spec, jT, kYe, F, W, false);
+      blended[static_cast<size_t>(r)] = 1;
+    }
+
+    RepairResult::SeamBlendSummary::Seam seam;
+    seam.irho_lo = static_cast<size_t>(spec.a);
+    seam.irho_hi = static_cast<size_t>(spec.b);
+    seam.jT_lo = static_cast<size_t>(spec.j_lo);
+    seam.jT_hi = static_cast<size_t>(spec.j_hi);
+    seam.jT_detect_lo = static_cast<size_t>(spec.j_detect_lo);
+    for (size_t r = 0; r < steps.size(); ++r) {
+      seam.max_step = std::max(seam.max_step, steps[r]);
+      if (blended[r] != 0) {
+        ++out.columns_blended;
+      } else {
+        ++out.columns_skipped;
+      }
+    }
+    out.seams.push_back(seam);
+  }
+}
+
 } // namespace
 
 CausalEnvelope causal_envelope(const std::vector<double> &h, double eps_node, double cs2_cap,
@@ -1440,21 +1755,71 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
   if (options.causal_cap && (!(options.cs2_cap > 0.0) || !(options.cs2_cap < options.cs2_max))) {
     throw std::invalid_argument("repair_table: causal_cap requires 0 < cs2_cap < cs2_max");
   }
+  if (options.seam_blend &&
+      (!(options.seam_tol > 0.0) || options.seam_fit_cells < 3 || options.seam_halfwidth < 1 ||
+       options.seam_halfwidth > options.seam_fit_cells)) {
+    throw std::invalid_argument("repair_table: seam_blend requires seam_tol > 0, "
+                                "seam_fit_cells >= 3 and 1 <= seam_halfwidth <= seam_fit_cells");
+  }
+  if (options.trim_t_hi_rows < 0) {
+    throw std::invalid_argument("repair_table: trim_t_hi_rows must be >= 0");
+  }
 
   RepairResult result;
+
+  // T-row trim (repair.hpp, RepairOptions::trim_t_hi_rows): drop the hottest
+  // rows the table has not already had dropped, before anything else looks
+  // at it, and record the running total in the table itself.
+  {
+    const double already_d =
+        table.has_attribute(kTHiRowsDroppedAttr) ? table.attribute(kTHiRowsDroppedAttr) : 0.0;
+    const size_t already = already_d > 0.0 ? static_cast<size_t>(already_d) : 0;
+    const size_t want = static_cast<size_t>(options.trim_t_hi_rows);
+    const size_t drop = want > already ? want - already : 0;
+    result.logtemp_max_before = table.logtemp().back();
+    if (drop > 0 && table.ntemp() >= drop + 4) {
+      table = crop_table(table, 0, table.nrho() - 1, 0, table.ntemp() - 1 - drop, 0, table.nye() - 1);
+      table.add_attribute(kTHiRowsDroppedAttr, static_cast<double>(already + drop));
+      result.t_hi_rows_dropped = drop;
+    }
+    result.logtemp_max_after = table.logtemp().back();
+  }
 
   const size_t nrho = table.nrho();
   const size_t ntemp = table.ntemp();
   const size_t nye = table.nye();
   const size_t ncol = nrho * nye;
 
+  const auto field_index = [&](const std::string &name) -> size_t {
+    for (size_t fi = 0; fi < options.fields.size(); ++fi) {
+      if (options.fields[fi] == name) {
+        return fi;
+      }
+    }
+    return options.fields.size();
+  };
+  const bool both_fields = field_index("entropy") < options.fields.size() &&
+                           field_index("logenergy") < options.fields.size();
+  const bool run_seam_blend = options.seam_blend && both_fields && table.has_field("logpress");
+
   // Snapshots taken before ANY stage runs, so the final write-back below can
   // diff against the true original regardless of how many stages/rounds
   // touched a given index (repair.hpp's repair_table() doc comment, "Final
-  // write-back"). Held for every listed field at once because the causal-cap
-  // stage runs *after* all of them and can still change "logenergy".
+  // write-back"). Held for every listed field at once because the seam-blend
+  // stage runs *before* all of them and the causal-cap stage *after*, and
+  // both can change a field outside its own per-field pass; "logpress" too
+  // when the seam-blend stage will run (it is the only stage that edits it).
   std::vector<std::vector<double>> originals;
   originals.reserve(options.fields.size());
+  for (const std::string &field : options.fields) {
+    originals.push_back(table.field(field));
+  }
+  std::vector<double> logpress_original;
+  if (run_seam_blend) {
+    logpress_original = table.field("logpress");
+    seam_blend_stage(table, options, result.seam_blend);
+  }
+
   std::vector<std::vector<SplineSafeStats>> per_column_spline_by_field;
   per_column_spline_by_field.reserve(options.fields.size());
   std::vector<ThreeDStats> stats3d_by_field(options.fields.size());
@@ -1464,7 +1829,6 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
     const double min_slope = min_slope_for(field, options);
     std::vector<double> &data = table.field(field);
 
-    originals.push_back(data);
     per_column_spline_by_field.emplace_back(ncol);
     std::vector<SplineSafeStats> &per_column_spline = per_column_spline_by_field.back();
 
@@ -1506,17 +1870,9 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
   // "entropy" and edits only "logenergy", so it must run before the
   // write-back below.
   if (options.causal_cap) {
-    const auto field_index = [&](const std::string &name) -> size_t {
-      for (size_t fi = 0; fi < options.fields.size(); ++fi) {
-        if (options.fields[fi] == name) {
-          return fi;
-        }
-      }
-      return options.fields.size();
-    };
     const size_t si = field_index("entropy");
     const size_t li = field_index("logenergy");
-    if (si < options.fields.size() && li < options.fields.size()) {
+    if (both_fields) {
       // The 3D stage's own final (4,4,4) count IS the pre-causal-stage
       // monotonicity count for that field (it measured exactly the state it
       // left behind, and nothing has touched either field since), so reuse
@@ -1585,13 +1941,58 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
     result.summaries.push_back(std::move(summary));
   }
 
-  result.status = result.entries.empty() ? Status::ok : Status::repaired;
+  // "logpress" last: only the seam-blend stage edits it.
+  if (run_seam_blend) {
+    const std::vector<double> &data = table.field("logpress");
+    for (size_t kYe = 0; kYe < nye; ++kYe) {
+      for (size_t irho = 0; irho < nrho; ++irho) {
+        for (size_t jT = 0; jT < ntemp; ++jT) {
+          const size_t idx = table.index(irho, jT, kYe);
+          if (data[idx] != logpress_original[idx]) {
+            result.entries.push_back(
+                RepairEntry{"logpress", irho, jT, kYe, logpress_original[idx], data[idx]});
+            ++result.seam_blend.logpress_modified;
+            result.seam_blend.logpress_max_abs_change =
+                std::max(result.seam_blend.logpress_max_abs_change,
+                         std::fabs(data[idx] - logpress_original[idx]));
+          }
+        }
+      }
+    }
+  }
+
+  result.status =
+      result.entries.empty() && result.t_hi_rows_dropped == 0 ? Status::ok : Status::repaired;
   return result;
 }
 
 void RepairResult::print(std::ostream &os) const {
   os << "repair_table: " << (status == Status::ok ? "no changes (already monotone)" : "repaired")
      << "\n";
+  if (t_hi_rows_dropped > 0) {
+    os << "  t-trim: dropped " << t_hi_rows_dropped << " hottest T row(s), log10(T_max/MeV) "
+       << logtemp_max_before << " -> " << logtemp_max_after << "\n";
+  }
+  const SeamBlendSummary &b = seam_blend;
+  if (b.ran) {
+    os << "  seam-blend: seams=" << b.seams.size() << " columns_blended=" << b.columns_blended
+       << " columns_skipped=" << b.columns_skipped
+       << " skipped_overlap=" << b.seams_skipped_overlap
+       << " logpress_changed=" << b.logpress_modified;
+    if (b.logpress_modified > 0) {
+      os << " max |change| = " << b.logpress_max_abs_change;
+    }
+    os << "\n";
+    for (const SeamBlendSummary::Seam &s : b.seams) {
+      os << "    seam: irho [" << s.irho_lo << "," << s.irho_hi << "] jT [" << s.jT_lo << ","
+         << s.jT_hi << "] detected_from_jT=" << s.jT_detect_lo
+         << " max_step(logpress)=" << s.max_step << "\n";
+    }
+    for (const SeamBlendSummary::Seam &s : b.seams_unfaded) {
+      os << "    seam NOT blended (does not fade at an end of its detectable rows): irho ["
+         << s.irho_lo << "," << s.irho_hi << "] jT [" << s.jT_lo << "," << s.jT_hi << "]\n";
+    }
+  }
   for (const FieldSummary &s : summaries) {
     os << "  " << s.field << ": " << s.modified << " value(s) changed";
     if (s.modified > 0) {

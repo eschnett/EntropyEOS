@@ -267,8 +267,15 @@ void audit_nodes(const EntropyEOSView &view, const RawTable &table, double kappa
                   QuantileStats &out_delta_T_q, QuantileStats &out_delta_p_q, bool &any_fatal,
                   std::vector<std::string> &fatal_messages) {
   const size_t nrho = table.nrho();
-  const size_t ntemp = table.ntemp();
   const size_t nye = table.nye();
+  // 1.2.0: only the rows inside the built box. Rows the build trimmed off
+  // the hot end (BuildOptions::trim_t_hi_rows) are not part of the fit;
+  // their nodes would be answered by the u-high tail, which class E's
+  // extension-band map already audits.
+  size_t ntemp = table.ntemp();
+  while (ntemp > 0 && table.logtemp()[ntemp - 1] > view.u_hi + 1e-9) {
+    --ntemp;
+  }
   const std::vector<double> &entropy = table.field("entropy");
   const bool have_logpress = table.has_field("logpress");
   const std::vector<double> *logpress = have_logpress ? &table.field("logpress") : nullptr;

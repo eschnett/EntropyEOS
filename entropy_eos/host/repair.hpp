@@ -58,6 +58,21 @@
 // eos-causality-repair.md S3 for the mathematics. Only "logenergy" is ever
 // edited; "entropy" never gains a RepairEntry from this stage.
 //
+// 1.2.0 "seam-blend" repair (CODE.md open decision 6, milestone M3k): the
+// Hempel tables (DD2, SFHo) carry a rho-column *stitching seam* -- two
+// internally smooth pieces of the tabulation joined with a level step in
+// pressure, energy and entropy across ~3 rho cells (irho 81-83, rho ~ 1.4e7
+// g/cc), identical at every Ye and growing with T. The fit turns that step
+// into c_s^2 up to ~5 and c_s^2 <= 0 / p <= 0 in-box, and none of the stages
+// above can see it (it is neither non-monotone in T nor edge-anchored). The
+// seam-blend stage (RepairOptions::seam_blend, on by default) runs FIRST:
+// it detects such seams from logpress and replaces a window around each one,
+// in "entropy", "logenergy" and "logpress" alike, with a C^2 blend between
+// quadratic fits of the two smooth sides -- see repair_table()'s doc comment
+// for the detection rule. It is the only stage that edits a field outside
+// RepairOptions::fields: "logpress" is blended too, so the written table
+// stays thermodynamically self-consistent for consumers that read it.
+//
 // Host-only: STL containers, may throw. Structural problems -- a listed
 // field missing from the table, or a non-finite value in a listed field --
 // mean a broken file, not physics noise, and are reported by throwing
@@ -216,6 +231,56 @@ struct RepairOptions {
   // the main loop audits at (refine3d_xy, refine3d_u, refine3d_xy) and the
   // final verification always at (4,4,4), mirroring the 3D stage. The
   // adiabat trace steps by one refined rho step, hrho/refine3d_xy.
+
+  // 1.2.0: how many of the table's hottest T rows repair_table() DROPS --
+  // from the T axis and from every field -- before any other stage runs, so
+  // a repaired table holds only rows the stages below actually repaired.
+  // Default 1, for every table: on the Hempel DD2/SFHo tables the T_max row
+  // is unreliable (its own stored cs2 is garbage, its T-derivatives noisy),
+  // and the fit's last T cell turns it into c_s^2 >= 1 in the box and a
+  // superluminal hot tail; on LS220/SRO dropping it is measured neutral to
+  // better (CODE.md milestone M3k). States above the new T_max are served by
+  // the adapter's causal u-high tail, as states above T_max always were.
+  //
+  // Recorded in the table's kTHiRowsDroppedAttr attribute (table.hpp), which
+  // eos_repair writes into its output and read_stellarcollapse() surfaces
+  // again: the rows to drop are this option minus what that attribute says
+  // was already dropped, so re-repairing a repaired table drops nothing more.
+  // A table with fewer than trim + 4 T rows is not trimmed. 0 keeps every row
+  // (the pre-1.2.0 behaviour). Must be >= 0.
+  int trim_t_hi_rows = 1;
+
+  // --- 1.2.0 seam-blend stage (repair_table()'s doc comment, steps S1-S3) --
+
+  // Run the seam-blend stage before every other stage. On by default: like
+  // the causal cap it is a logged physics edit that acts only where the
+  // table is already broken -- a stitching seam the detection rule below
+  // recognizes. It is a bitwise no-op on LS220, SRO and every synthetic
+  // table without a SeamDefect (measured, CODE.md milestone M3k).
+  //
+  // Silently skipped (RepairResult::SeamBlendSummary::ran = false) unless
+  // BOTH "entropy" and "logenergy" are in `fields` and the table carries a
+  // "logpress" field (the detection reads it, and all three are blended
+  // together so they stay consistent).
+  bool seam_blend = true;
+
+  // Detection threshold: both edges of a seam must show a second difference
+  // of logpress along rho (log10 units, per pair of cells) of at least this
+  // magnitude. Measured on the real tables (M3k): the DD2/SFHo seam reaches
+  // ~1e-2 at T_max and ~6e-3 at 140 MeV, while the largest qualifying
+  // pattern anywhere on LS220/SRO stays far below (see CODE.md M3k for the
+  // numbers). Rows where the seam is weaker are still blended as long as it
+  // keeps the same shape (repair_table()'s step S1).
+  double seam_tol = 1e-3;
+
+  // Half-width W (rho cells) of the blend window on each side of the seam:
+  // cells [a - W, b + W] of a seam occupying cells a..b are rewritten.
+  int seam_halfwidth = 5;
+
+  // Number F of cells on each side of the seam ([a - F, a - 1] and
+  // [b + 1, b + F]) the two quadratic least-squares fits use. Must be >= 3
+  // (a quadratic) and >= seam_halfwidth (the fits must cover the window).
+  int seam_fit_cells = 8;
 };
 
 // One value changed by repair_table(), identified by field and grid index.
@@ -227,14 +292,24 @@ struct RepairEntry {
 
 struct RepairResult {
   // Every changed value, in a deterministic order: by field (in
-  // RepairOptions::fields order), then kYe, then irho, then jT. This order
-  // does not depend on how repair_table() schedules the per-column work
-  // (e.g. under OpenMP).
+  // RepairOptions::fields order, then "logpress" last -- only the
+  // seam-blend stage ever changes it), then kYe, then irho, then jT. This
+  // order does not depend on how repair_table() schedules the per-column
+  // work (e.g. under OpenMP).
   std::vector<RepairEntry> entries;
 
-  // ok iff entries is empty, repaired otherwise. repair_table() never
-  // returns Status::fatal: structural problems throw instead (see above).
+  // ok iff entries is empty and no T row was dropped, repaired otherwise.
+  // repair_table() never returns Status::fatal: structural problems throw
+  // instead (see above).
   Status status = Status::ok;
+
+  // 1.2.0 T-row trim (RepairOptions::trim_t_hi_rows): rows dropped by THIS
+  // call (0 when the table had already been trimmed as far as asked), and
+  // the hottest log10(T/MeV) before and after. Dropped rows carry no
+  // RepairEntry; their removal is the change.
+  size_t t_hi_rows_dropped = 0;
+  double logtemp_max_before = 0.0;
+  double logtemp_max_after = 0.0;
 
   struct FieldSummary {
     std::string field;
@@ -401,12 +476,104 @@ struct RepairResult {
   };
   CausalCapSummary causal_cap;
 
-  // Human-readable summary (status, then one line per field, then the
-  // causal-cap stage's block if it ran).
+  // --- 1.2.0 seam-blend stage ----------------------------------------------
+  struct SeamBlendSummary {
+    // False (and everything below at its default) whenever the stage did
+    // not run: options.seam_blend off, or a missing field (see
+    // RepairOptions::seam_blend). A stage that ran and found nothing has
+    // ran == true and an empty `seams`.
+    bool ran = false;
+
+    // One per blended seam, in increasing irho order.
+    struct Seam {
+      size_t irho_lo = 0, irho_hi = 0; // the seam's own cells a..b
+      size_t jT_lo = 0, jT_hi = 0;     // T rows blended (inclusive)
+      size_t jT_detect_lo = 0;         // lowest row passing the full seam_tol
+      double max_step = 0.0;           // largest |right fit - left fit| of
+                                       // logpress at the seam centre (log10)
+    };
+    std::vector<Seam> seams;
+
+    // Seams detected but NOT blended because they do not fade out at an end
+    // of the rows where the pattern can be followed (repair_table() step
+    // S1): blending them would leave an edit edge as large as the seam
+    // itself in T. max_step is 0 here (nothing was fitted). LS220-2009 has
+    // one at irho 89-90 (rho ~ 1e8 g/cc), present from T_min to ~1 MeV,
+    // where the data around it stops being smooth (CODE.md M3k).
+    std::vector<Seam> seams_unfaded;
+
+    // Seams found but not blended because their fit range overlaps an
+    // earlier seam's (never observed; reported rather than guessed at).
+    size_t seams_skipped_overlap = 0;
+
+    // (jT, kYe) rows of a seam rewritten, and rows left alone because a
+    // value in the fit range of one of the three fields was non-finite.
+    size_t columns_blended = 0;
+    size_t columns_skipped = 0;
+
+    // "logpress" is not in RepairOptions::fields, so its write-back totals
+    // live here (entropy/logenergy are in the per-field summaries).
+    size_t logpress_modified = 0;
+    double logpress_max_abs_change = 0.0;
+  };
+  SeamBlendSummary seam_blend;
+
+  // Human-readable summary (status, then the seam-blend stage's block if it
+  // ran, then one block per field, then the causal-cap stage's block if it
+  // ran).
   void print(std::ostream &os) const;
 };
 
-// Repairs `table` in place. For each field in options.fields:
+// Repairs `table` in place.
+//
+// T-row trim (1.2.0), first of all: if options.trim_t_hi_rows asks for more
+// rows than the table's kTHiRowsDroppedAttr says were already dropped, the
+// difference is cut off the hot end of the T axis and of every field, and the
+// attribute is updated -- see RepairOptions::trim_t_hi_rows. Every stage
+// below, and every index in RepairResult::entries, refers to the trimmed
+// table.
+//
+// Seam-blend stage (1.2.0), run ONCE before everything else if
+// options.seam_blend (see RepairOptions::seam_blend for when it is skipped).
+// With F = seam_fit_cells, W = seam_halfwidth, x = log10(rho), and
+// d2(i) = logpress(i+1) - 2 logpress(i) + logpress(i-1) along rho at fixed
+// (jT, kYe):
+//   S1. Detect. Cells a..b (1 <= b - a <= 3) show the seam pattern at
+//       threshold theta in one (jT, kYe) iff d2(a) and d2(b) have opposite
+//       signs, m = min(|d2(a)|, |d2(b)|) >= theta, and every other d2 in
+//       a+1..b-1 and in the fit ranges' interiors [a-F+1, a-1] and
+//       [b+1, b+F-1] is at most m/10 in magnitude -- a localized step on
+//       quiet ground. Only (a, b) with a-W-1 >= 0, a-F >= 0 and b+W+1,
+//       b+F <= nrho-1 are considered. A row jT is DETECTED iff the pattern
+//       holds at theta = seam_tol at the same (a, b) for EVERY kYe (a
+//       stitching seam is Ye-invariant; physics features are not). The
+//       blended row range is the detected rows' span, extended down and up
+//       for as long as the pattern still holds at every kYe at theta =
+//       seam_tol/100 -- so the edit fades out where the step does instead of
+//       switching off abruptly in T. Each end of that range must be the
+//       table's own T edge or a row where the seam has FADED -- both edges
+//       below seam_tol/100 at every kYe, whatever the shape around them;
+//       otherwise the seam continues somewhere its shape can no longer be
+//       followed, blending only part of it would leave an edit edge as
+//       large as the step in T, and it is reported (seams_unfaded) and not
+//       blended. A seam whose [a-F, b+F] overlaps an earlier blended one's
+//       is reported (seams_skipped_overlap) and not blended either.
+//   S2. Blend, per (jT, kYe) row of the range (rows independent ->
+//       OpenMP), for each of "entropy" (in ln s when every value in
+//       [a-F, b+F] is positive, linearly otherwise), "logenergy" and
+//       "logpress": least-squares quadratics q_L on cells [a-F, a-1] and
+//       q_R on [b+1, b+F]; every cell i in [a-W, b+W] becomes
+//       (1-w) q_L(x_i) + w q_R(x_i), with w the C^2 quintic smoothstep
+//       z^3 (10 - 15 z + 6 z^2) of z = (x_i - x_{a-W-1}) /
+//       (x_{b+W+1} - x_{a-W-1}). A row with a non-finite value in any of
+//       the three fields' [a-F, b+F] is left alone (columns_skipped).
+//   S3. The blended "entropy"/"logenergy" then go through every stage below
+//       like any other data; "logpress" is touched by nothing else.
+// After a blend the window is smooth, so a second run detects nothing there
+// and the stage is idempotent (asserted on synthetic seams and measured on
+// DD2/SFHo, CODE.md M3k).
+//
+// Then, for each field in options.fields:
 //
 // Per-column stage, applied independently to every (irho, kYe) column along
 // T (columns are independent -> OpenMP):
@@ -589,9 +756,11 @@ struct RepairResult {
 //      state's. If either fails, "logenergy" reverts to exactly its
 //      pre-stage bytes and CausalCapSummary::reverted is set.
 //
-// Final write-back, per field: a RepairEntry for every index whose value
-// after *all* stages above (per-column, then 3D if it ran, then causal-cap
-// if it ran) differs from the original input value (exact bitwise != -- always computed against the
+// Final write-back, per field (the listed fields, then "logpress" if the
+// seam-blend stage ran): a RepairEntry for every index whose value
+// after *all* stages above (seam-blend if it ran, per-column, then 3D if it
+// ran, then causal-cap if it ran) differs from the original input value
+// (exact bitwise != -- always computed against the
 // pre-repair original, not incrementally against an intermediate stage's
 // output, so the log stays meaningful across every round of every stage),
 // in the fixed order documented on RepairResult::entries. Indices that never
@@ -672,8 +841,10 @@ struct RepairResult {
 // (only "entropy" and "logenergy" do) or if options.causal_cap is on without
 // 0 < options.cs2_cap < options.cs2_max (the cap must be a physical sound
 // speed strictly below the audit threshold, or the hysteresis that converges
-// the refit ringing does not exist). Both are checked before any field is
-// modified.
+// the refit ringing does not exist), or if options.seam_blend is on without
+// seam_tol > 0, seam_fit_cells >= 3 and 1 <= seam_halfwidth <=
+// seam_fit_cells, or if options.trim_t_hi_rows is negative. All of these are
+// checked before any field is modified.
 RepairResult repair_table(RawTable &table, const RepairOptions &options = RepairOptions());
 
 // The per-column algorithm, exposed for unit testing: L2 isotonic

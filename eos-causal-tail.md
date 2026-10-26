@@ -9,6 +9,9 @@ the implementation). **Implemented 2026-08-27** — measurements in CODE.md's
 "M3g empirical findings" block; §3 as specified, §5's map added.
 **§5's x-low follow-up implemented 2026-08-28 (M3i)** — same family argument on
 the x axis; measurements in CODE.md's "M3i empirical findings" block.
+**§9's u-high ratio lock implemented 2026-10-25 (M3k, 1.2.0)** — removes the tail's
+depth-linear drift where the slope ratio varies with ρ, gated off where the locked tail
+would not be causal; measurements in CODE.md's "M3k empirical findings" block.
 
 **Results in one paragraph.** The u-high band's `c_s² ≥ 1` fraction goes
 **88.4% → 0.007%** (LS220) and **88.0% → 0.009%** (SRO), with the far tail
@@ -219,3 +222,61 @@ M3i findings block.
 2. ~~§7 principle amendment~~ — decided 2026-08-27: yes — amend
    `eos-adapter-F-to-U.md` §7's principle sentence to "finite, smooth, monotone,
    **causal**" as part of the implementation.
+
+## 9. The u-high ratio lock (M3k, 1.2.0)
+
+**Problem.** §3's asymptote `c_s² = b/α − 1` assumes 1/ρ seam scaling: the two log
+slopes' *ratio* is the same at neighbouring densities. Where it is not, the tail drifts.
+In phase 2 (`L_u = m_L`, `g_u = α`, `g = lnσ`, `d = u − u_hi`, no u-curvature), the
+secondary tracks are linear in depth, `L_x(d) = L_x + L_xu d` and `g_x(d) = g_x + g_xu d`,
+so along an adiabat
+
+```
+∂L/∂x|_s = (L_x − r g_x) + (L_xu − r g_xu) d,     r = m_L / α,
+```
+
+and the second term grows without bound. It vanishes at a radiation seam
+(`L_xu = g_xu = 0`) and nowhere else. Measured where it bites: the seam-blend window
+`repair_table()` rebuilds at ρ ≈ 1.4e7 on DD2/SFHo (the ratio varies by ±0.1 across
+it, so `c_s² ≤ 0` from the seam on and `p ≤ 0` at 6–7 cells), and the matter-dominated
+hot seam at ρ ~ 1e15 (`c_s²` 0.70 → 0.18 over the 8-cell band, ≤ 0 at ~10 cells). The
+T_max trim (`RepairOptions::trim_t_hi_rows`) made the first one visible: DD2's u-high
+`p ≤ 0` went 0 → 6,307 when the tail was launched from 152 MeV instead of 158.
+
+**The lock.** L's u-high secondary track gets the effective curvature that ramps its
+slope, over the same one-cell blend the primary track uses, from the spline's `L_xu` to
+the drift-free `r g_xu` — the §3 causal clamp's own effective-track trick, so the tail
+stays C¹ at the seam. Beyond phase 1 the drift term is identically zero, and with
+`L_uu = g_uu = 0` there the second fixed-s derivative is depth-independent too,
+`∂²L/∂x²|_s = L_xx − r g_xx`. Only L's secondary track changes: its value track, and with
+it ε, U, κ's floor scan, `srange()` and the T-solve, are bit-identical.
+
+**The exact phase-2 tail, and why the lock must be gated.** With the lock, the
+phase-2 tail has constant fixed-s slopes `k0 = A − rB` (of ln E, E = ε̂ + Δ̂) and
+`j0 = C − rD` (of L), where `A = L_x + (w/3)L_xu`, `B = g_x + (w/3)g_xu` (the phase-1
+offsets), `C = L_xx`, `D = g_xx` at the seam, and
+
+```
+c_s² = E [k0(1 + k0) + j0/ln10] / [(1 − Δ̂) + E(1 + k0)]  →  c_inf = k0 + j0 / (ln10 (1 + k0)),
+```
+
+monotonically as ε grows into the tail (on LS220 at ρ ≈ 10^15.5: 1.57 predicted, 1.58 evaluated 64 cells
+deep). At a radiation seam (`A = −1`, `B = −ln10`, `C = D = 0`) `c_inf ≤ cap`
+is exactly §3's `b ≤ (1 + cap) α`. A cap on r was tried first and fails where it
+matters: at the ρ ~ 1e15 seams of LS220 and DD2 the locked `c_inf` is 1.2–1.6, and it
+comes from the seam's own x-structure (`A`, `C`), so `c_inf` is already above 1 at
+`r = 0` and no slope cap reaches it. Freezing that stiff structure while ε keeps
+growing is simply the wrong extrapolation there. So the lock is gated: it acts with
+weight `λ = S((cs2_ext_cap − c_inf)/0.1)`, S the quintic smoothstep clamped to [0, 1] —
+full where the locked tail is causal with room to spare, none (the §3 tail, whose drift
+is soft) where it is not, smooth in between because `c_inf` is a smooth function of the
+seam sample.
+
+**Measured** (CODE.md "M3k empirical findings"): DD2 u-high `p ≤ 0` 6,307 → **0**,
+`c_s² ≤ 0` 43,299 → 1,891, `c_s² ≥ 1` stays 0; SFHo `c_s² ≤ 0` 30,940 → **0**; LS220/SRO
+move by a few samples (SRO u-high `c_s² ≤ 0` 16,573 → 16,537 with the trim off). The
+ρ ~ 1e15 hot corners keep the §3 tail and its soft drift, which is what CODE.md's M3g
+open item described; nothing on any table goes acausal because of the lock.
+`tests/test_adapter_tail.cpp` asserts the depth-independence of `∂L/∂x|_s`, C¹ at the
+seam, the unchanged value track, and that a closed gate reproduces the 1.1.0 tail
+bit for bit.

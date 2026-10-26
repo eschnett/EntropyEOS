@@ -35,9 +35,11 @@ namespace eeos {
 //     datasets are encountered in the file (see the .cpp for what "file
 //     order" means for a format that generally has no creation-order
 //     index), so RawTable::field_names() reproduces it;
-//   - the scalar {1} datasets "energy_shift" and "have_rel_cs2", if present,
-//     become RawTable attributes (as double, regardless of their stored
-//     type -- HDF5 converts on read);
+//   - the scalar {1} datasets "energy_shift", "have_rel_cs2" and (1.2.0)
+//     kTHiRowsDroppedAttr ("eeos_t_hi_rows_dropped", written by a repair
+//     that dropped T rows -- see table.hpp), if present, become RawTable
+//     attributes (as double, regardless of their stored type -- HDF5
+//     converts on read);
 //   - everything else (opaque provenance blobs, "points*", any dataset
 //     whose dims or type don't match the rules above) is left out of the
 //     RawTable entirely; write_stellarcollapse()'s (path_out, table,
@@ -58,7 +60,12 @@ RawTable read_stellarcollapse(const std::string &path);
 // left as passthrough -- is copied byte-for-byte via H5Ocopy, so it survives
 // even though the RawTable never held it. `path_in`'s datasets are visited
 // in the same "file order" read_stellarcollapse() uses; any table field not
-// found by name in path_in is appended at the end of `path_out`.
+// found by name in path_in is appended at the end of `path_out`. Two 1.2.0
+// exceptions to the passthrough, both for repair_table()'s T-row trim
+// (RepairOptions::trim_t_hi_rows): a "points*" scalar whose value no longer
+// matches the table's grid size is written fresh from the table, and the
+// table's kTHiRowsDroppedAttr attribute, if any, is written from the table
+// (appended at the end if path_in lacks it).
 //
 // Documented consequence: "energy_shift" (and "have_rel_cs2", if present)
 // are always passthrough-copied from path_in by this overload, because
@@ -109,7 +116,8 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //     under the group: "irho"/"jT"/"kYe" (unsigned), "old_value"/"new_value"
 //     (double), plus "field" -- a fixed-length (32-byte, NUL-padded) string
 //     dataset naming the field of each entry (chosen over an index into a
-//     separate name-list dataset: with only ever "entropy"/"logenergy" in
+//     separate name-list dataset: with only ever "entropy"/"logenergy"
+//     (and, since 1.2.0, "logpress" from the seam-blend stage) in
 //     practice, a plain string column is simpler to inspect with h5ls/h5dump
 //     and to read back in tests, at a storage cost that's negligible next to
 //     the two double columns it sits beside);
@@ -122,7 +130,12 @@ void write_stellarcollapse(const std::string &path_out, const RawTable &table);
 //     ("causal_cap" 0/1, "cs2_max"/"cs2_cap" double, "causal_rounds_max"/
 //     "trace_depth_max"/"anchor_pad" uint64, plus "causal_nodes_capped",
 //     "causal_cs2_violations_before"/"_after" and "causal_reverted" 0/1 --
-//     see RepairResult::CausalCapSummary), "tool_version"/"input_path"
+//     see RepairResult::CausalCapSummary), the 1.2.0 seam-blend stage's
+//     ("seam_blend" 0/1, "seam_tol" double, "seam_halfwidth"/
+//     "seam_fit_cells" uint64, plus "seam_count"/"seam_unfaded" uint64 --
+//     see RepairResult::SeamBlendSummary), "trim_t_hi_rows" and
+//     "t_hi_rows_dropped" (uint64, the 1.2.0 T-row trim's option and what
+//     this run dropped), "tool_version"/"input_path"
 //     (fixed-length string datasets -- sic, see the .cpp: HDF5 *attributes*
 //     here, not top-level datasets), "input_fnv1a" (uint64_t) and
 //     "n_modified" (uint64_t).

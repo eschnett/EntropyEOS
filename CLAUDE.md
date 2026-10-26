@@ -10,7 +10,7 @@ working rules that are easy to miss.
 nuclear equations of state in GRMHD codes: it checks and repairs stellarcollapse-format
 HDF5 tables, turns the $F(\rho, T, Y_e)$ table into a single potential $U(\rho, s, Y_e)$
 (B-spline fit with C² extension tails), and provides `prim2con`/`con2prim` built on
-that potential, iterating on entropy $s$ and rapidity $w$. Version 1.1.0 (M1–M4
+that potential, iterating on entropy $s$ and rapidity $w$. Version 1.2.0 (M1–M4
 complete).
 
 ## Documents

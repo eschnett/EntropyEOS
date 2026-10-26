@@ -433,7 +433,10 @@ struct EOSPoint {
   real mu_tilde;                        // optional
   real u_solved;                        // ln T, warm start for the next call
   unsigned flags;   // CLAMP_YE | EXT_S_LOW | EXT_S_HIGH | EXT_RHO_LOW | OOB_RHO_HIGH | MAXITER
+                    // | CS2_ACAUSAL | CS2_NONPOSITIVE (1.2.0: cs2 outside (0,1), never clamped)
 };
+// 1.2.0: signal_cs2(cs2) = cs2 clamped into [0,1] (NaN -> 1), for characteristic
+// speeds only -- never fed back into the solver.
 
 // Host side: owns spline coefficients; built once from a (repaired) RawTable.
 class EntropyEOS;   // holds kappa, m_B_star, physical box, audit metadata

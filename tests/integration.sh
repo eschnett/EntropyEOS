@@ -10,8 +10,9 @@
 # pathologies actually found in the real LS220/SRO stellarcollapse tables --
 # a handful of non-finite cs2/gamma points, a clustered non-monotone-T
 # entropy patch, a near-flat logenergy plateau, slightly negative cold-corner
-# entropies, and (M3f) a stiffened high-density corner whose constructed U is
-# superluminal -- so CI (which has no tables/*.h5) still exercises
+# entropies, (M3f) a stiffened high-density corner whose constructed U is
+# superluminal, and (1.2.0) a rho-column stitching seam at high T like the
+# Hempel DD2/SFHo tables' -- so CI (which has no tables/*.h5) still exercises
 # eos_test/eos_repair against them. Part B exercises the four real
 # stellarcollapse-format tables under tables/*.h5 (LS220, SRO, DD2, SFHo)
 # when present on this machine, and is skipped gracefully (not failed) when
@@ -208,6 +209,19 @@ if [ "$cc_before" -gt 0 ] && [ "$cc_after" -lt "$cc_before" ] && [ "${cc_nodes:-
 else
   echo "FAIL: causal-cap did not detect/reduce the stiffened corner" \
     "(before=$cc_before after=$cc_after nodes=$cc_nodes)"
+  exit 1
+fi
+
+# 1.2.0 seam-blend stage: the preset's SeamDefect (irho 13..15, jT 26..29;
+# the default T-row trim drops jT 29 first, so it is blended over 26..28)
+# must be found and blended, and "logpress" -- which only this stage edits --
+# must appear in the log's entries.
+sb_line=$(grep -E '^    seam: irho \[13,15\] jT \[26,28\]' "$T/dirty_repair.log" || true)
+if [ -n "$sb_line" ] && grep -qE '^logpress \(' "$T/dirty_repair.log"; then
+  echo "PASS: seam-blend found and blended the dirty preset's seam --$sb_line"
+else
+  echo "FAIL: seam-blend did not report the dirty preset's seam at irho [13,15], jT [26,28]" \
+    "with logpress entries (see $T/dirty_repair.log)"
   exit 1
 fi
 

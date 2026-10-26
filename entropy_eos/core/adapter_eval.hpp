@@ -160,6 +160,56 @@
 // ~1.8x). The bracket scan is log-spaced and the T-solve is a safeguarded
 // Newton on a still strictly monotone sigma, so no solver mechanics change.
 //
+// === M3k U-HIGH RATIO LOCK (1.2.0; eos-causal-tail.md S9) =================
+//
+// The M3g asymptote c_s^2(tail) = b/alpha - 1 assumes the two log slopes'
+// RATIO is the same at neighbouring densities, as it is at a radiation seam
+// (both scale as 1/rho). Where it is not -- a matter-dominated hot seam
+// (DD2/SFHo at rho ~ 1e15, T_max = 158 MeV, still matter-dominated there),
+// or the seam-blend window repair_table() rebuilds at rho ~ 1.4e7 -- the
+// tail drifts: along an adiabat in phase 2 (L_u = m_L, g_u = alpha, g = ln
+// sigma, d = u - u_hi),
+//
+//   dL/dx|_s = (L_x - r g_x) + (L_xu - r g_xu) d,     r = m_L / alpha,
+//
+// and the second term grows linearly with depth, carrying p and c_s^2
+// through zero a few cells into the band (measured: p <= 0 at 6-7 cells and
+// c_s^2 <= 0 from the seam on in the DD2 blend window, c_s^2 0.70 -> 0.18
+// over 8 cells at rho = 1.7e15). The fix locks the ratio: L's u-high
+// SECONDARY track (L_x, L_xu) gets the effective curvature that ramps its
+// slope, over the same one-cell blend the primary track uses, from the
+// spline's L_xu to the drift-free target r * g_xu (g_xu = sigma's log-tail
+// secondary slope at the same seam) -- the M3g causal cap's own trick, so the
+// tail stays C1 at the seam. Beyond phase 1 both dL/dx|_s and (with g_uu =
+// L_uu = 0 there) d2L/dx2|_s = L_xx - r g_xx are then depth-independent.
+// L's VALUE track is untouched, so eps, U, kappa's floor scan, srange()
+// and the T-solve are bit-identical; only U_rho, U_rhorho and U_rhos change,
+// and only in the u-high band. At a radiation seam g_xu = L_xu = 0 already,
+// so the target equals the spline's own slope and the lock is a round-off
+// no-op there (LS220/SRO, every low-density seam).
+//
+// The lock makes the phase-2 tail simple enough to bound EXACTLY, which M3g's
+// cap could not: with A = L_x + (w/3) L_xu, B = g_x + (w/3) g_xu (the
+// phase-1 offsets of the two secondary tracks), C = L_xx, D = g_xx at the
+// seam, the fixed-s slopes in phase 2 are k0 = A - r B = dln(E)/dln(rho)|_s
+// and j0 = C - r D = d2L/dx2|_s (E = eps_hat + shift_hat), and
+//
+//   c_s^2 = E [k0 (1 + k0) + j0/ln10] / [(1 - shift_hat) + E (1 + k0)],
+//
+// which approaches c_inf = k0 + j0 / (ln10 (1 + k0)) monotonically as eps
+// grows into the tail (LS220 at rho ~ 10^15.5: 1.57 predicted, 1.58 found
+// 64 cells deep). That makes the lock safe exactly where c_inf is causal, and
+// harmful where it is not: at the matter-dominated rho ~ 1e15 seams of
+// LS220 and DD2 the seam's own stiff x-structure (L_x, L_xx) gives c_inf ~
+// 1.2-1.6, and since that comes from A and C rather than from the ratio r,
+// no cap on L's u-slope can bring it down (c_inf(r=0) is already > 1 there).
+// So the lock is GATED: it acts with weight lambda = S((cs2_ext_cap -
+// c_inf) / kLockGateWidth), S the quintic smoothstep clamped to [0, 1] --
+// full lock where the locked tail would be causal with room to spare, none
+// (the pre-1.2.0 tail, which drifts soft rather than stiff) where it would
+// not, smooth in between because c_inf is a smooth function of the seam
+// sample. detail::aeval_lock_weight() computes it.
+//
 // === M3i X-LOW CAUSAL TAILS (eos-causal-tail.md S5/S7 follow-up) ==========
 //
 // The class E extension-band map M3g added then measured the *other* band
@@ -262,7 +312,12 @@ struct EOSPoint {
   real u_solved;                        // log10(T_F_MeV), warm start for the next call
   int iters;                            // T-solve iterations performed (0 if an s-extension short-circuited it)
   unsigned flags; // flag_clamp_ye | flag_ext_s_low | flag_ext_s_high | flag_ext_rho_low
-                  // | flag_oob_rho_high | flag_maxiter (see core/defs.hpp)
+                  // | flag_oob_rho_high | flag_maxiter | flag_cs2_acausal
+                  // | flag_cs2_nonpositive (see core/defs.hpp)
+                  //
+                  // 1.2.0: the two cs2 bits are set by eval_at() from the
+                  // returned cs2 itself, in-box and in every extension band
+                  // alike; cs2 stays unclamped (see signal_cs2() below).
                   //
                   // M2d-2: flag_ext_s_low/flag_ext_s_high are now set by
                   // comparing the *solved* u against the physical [u_lo,
@@ -274,6 +329,21 @@ struct EOSPoint {
                   // smooth, rather than "the input was out of range and got
                   // clamped".
 };
+
+// The sound speed squared to use for characteristic speeds (Riemann-solver
+// wave-speed estimates, CFL limits): `cs2` clamped into [0, cs2_hi], with a
+// NaN mapped to cs2_hi (the conservative, fastest choice). Pass EOSPoint::cs2.
+// For signal speeds ONLY: never feed the result back into con2prim or any
+// derivative identity -- the Newton consumes the unclamped cs2 together with
+// U_rho and U_rhorho (z_w = z(1 - cs2) tanh w), and a clamped value belongs
+// to no single potential U (eos-causality-repair.md S1). Points where the
+// clamp acts carry flag_cs2_acausal / flag_cs2_nonpositive.
+EEOS_HOST_DEVICE inline real signal_cs2(real cs2, real cs2_hi = real(1)) {
+  if (cs2 != cs2) {
+    return cs2_hi;
+  }
+  return cs2 < real(0) ? real(0) : (cs2 > cs2_hi ? cs2_hi : cs2);
+}
 
 // Pointwise physical entropy range at fixed (rho*, Ye): [s(T_min), s(T_max)]
 // (solver bracketing; eos-adapter-F-to-U.md S7).
@@ -401,10 +471,14 @@ EEOS_HOST_DEVICE inline Track1D aeval_generic_track(Track1D t, real d, real w, r
 // first and wins lexicographically: a causal cap that fell below the floor
 // is raised back to it (the audit reports such points; they do not occur on
 // the real tables). Only ever called with d > 0 and m_cap > 0.
-EEOS_HOST_DEVICE inline Track1D aeval_capped_track(Track1D t, real d, real w, real m_floor, real m_cap) {
+EEOS_HOST_DEVICE inline Track1D aeval_capped_effective(Track1D t, real w, real m_floor, real m_cap) {
   t = aeval_floor_slope(t, real(1), w, m_floor);
   const real hi = (m_floor > real(0) && m_cap < m_floor) ? m_floor : m_cap;
-  return aeval_ramp_track(aeval_cap_slope(t, w, hi), d, w);
+  return aeval_cap_slope(t, w, hi);
+}
+
+EEOS_HOST_DEVICE inline Track1D aeval_capped_track(Track1D t, real d, real w, real m_floor, real m_cap) {
+  return aeval_ramp_track(aeval_capped_effective(t, w, m_floor, m_cap), d, w);
 }
 
 // M3g: the log-space image g = ln(f) of one BsplineEval3 sample (module
@@ -477,17 +551,45 @@ EEOS_HOST_DEVICE inline bool aeval_xlow_log_ok(const BsplineEval3 &g, real w, re
   return span <= kXLowLogExcursionMax; // false for NaN, which is the point
 }
 
+// M3k: width (in c_s^2) of the band below cs2_ext_cap over which the ratio
+// lock is faded out (module header, "M3K U-HIGH RATIO LOCK").
+constexpr real kLockGateWidth = real(0.1);
+
+// M3k: the ratio lock's weight lambda in [0, 1] at one seam: the quintic
+// smoothstep of (cap - c_inf)/kLockGateWidth, with the locked tail's
+// asymptotic c_inf = k0 + j0/(ln10 (1 + k0)), k0 = A - r B, j0 = C - r D.
+// 0 (no lock) when 1 + k0 <= 0 (h would not stay positive) or for NaN.
+EEOS_HOST_DEVICE inline real aeval_lock_weight(real A, real B, real C, real D, real r, real cap) {
+  const real k0 = A - r * B;
+  if (!(real(1) + k0 > real(0))) return real(0);
+  const real c_inf = k0 + (C - r * D) / (kLn10 * (real(1) + k0));
+  real z = (cap - c_inf) / kLockGateWidth;
+  if (!(z > real(0))) return real(0); // also NaN
+  if (z > real(1)) z = real(1);
+  // The smoothstep is exactly 1 at z = 1, but just below it rounding (and
+  // FMA contraction, e.g. g++ on x86-64) can land one ulp above 1.
+  const real s = z * z * z * (real(10) - real(15) * z + real(6) * z * z);
+  return s < real(1) ? s : real(1);
+}
+
 enum class TailAxis { x, u };
 
 // One axis's tail parameters for aeval_apply_tail(): w = that axis's grid
 // cell (BsplineView3::hx or hu), m_floor = the primary track's slope floor
 // (<=0 to skip the guard -- every tail except a u-direction one), m_cap =
 // the M3g causal cap on the primary track's phase-2 slope (<=0 to skip it --
-// every tail except L's u-HIGH one).
+// every tail except L's u-HIGH one). lock_alpha/lock_gxu: M3k's ratio lock
+// on the secondary track (sigma's log-tail alpha and g_xu at the same seam;
+// lock_alpha <= 0 skips it -- every tail except L's u-HIGH one).
 struct TailSpec {
   real w;
   real m_floor;
   real m_cap;
+  real lock_alpha = real(0);
+  real lock_gxu = real(0);
+  real lock_gx = real(0);
+  real lock_gxx = real(0);
+  real lock_cap = real(0); // cs2_ext_cap, against which the lock is gated
 };
 
 // Applies one axis's designed tail to a full BsplineEval3-shaped sample by
@@ -514,13 +616,30 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
     // fuu, fy: frozen (no fxuu available -- module header).
   } else {
     const Track1D f_in{b.f, b.fu, b.fuu};
-    // M3g: the causal cap only ever applies to L's u-HIGH primary track;
-    // every other track (and every d < 0) takes the pre-M3g path
-    // bit-for-bit.
-    const Track1D f_out = (spec.m_cap > real(0) && d > real(0))
-                              ? aeval_capped_track(f_in, d, spec.w, spec.m_floor, spec.m_cap)
-                              : aeval_generic_track(f_in, d, spec.w, spec.m_floor);
-    const Track1D fx_in{b.fx, b.fxu, real(0)};
+    Track1D fx_in{b.fx, b.fxu, real(0)};
+    Track1D f_out;
+    if (spec.lock_alpha > real(0) && d > real(0)) {
+      // M3k ratio lock (module header): ramp the secondary slope from the
+      // spline's L_xu toward the drift-free r * g_xu, r = (this field's
+      // phase-2 slope) / alpha, with the gate weight lambda. The primary
+      // track is exactly the M3g one.
+      const Track1D t_eff = spec.m_cap > real(0)
+                                ? aeval_capped_effective(f_in, spec.w, spec.m_floor, spec.m_cap)
+                                : aeval_floor_slope(f_in, real(1), spec.w, spec.m_floor);
+      f_out = aeval_ramp_track(t_eff, d, spec.w);
+      const real r = aeval_phase2_slope(t_eff, real(1), spec.w) / spec.lock_alpha;
+      const real w3 = spec.w / real(3);
+      const real lambda = aeval_lock_weight(b.fx + w3 * b.fxu, spec.lock_gx + w3 * spec.lock_gxu,
+                                            b.fxx, spec.lock_gxx, r, spec.lock_cap);
+      fx_in.f2 = real(2) * lambda * (r * spec.lock_gxu - fx_in.f1) / spec.w;
+    } else {
+      // M3g: the causal cap only ever applies to L's u-HIGH primary track;
+      // every other track (and every d < 0) takes the pre-M3g path
+      // bit-for-bit.
+      f_out = (spec.m_cap > real(0) && d > real(0))
+                  ? aeval_capped_track(f_in, d, spec.w, spec.m_floor, spec.m_cap)
+                  : aeval_generic_track(f_in, d, spec.w, spec.m_floor);
+    }
     const Track1D fx_out = aeval_generic_track(fx_in, d, spec.w, real(0));
     out.f = f_out.f0;
     out.fu = f_out.f1;
@@ -553,6 +672,11 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_apply_tail(const BsplineEval3 &b, rea
 //                       only where sigma's log tail supplied an alpha)
 //   shift_hat, inv_c2   energy zero point, which turns u_high_b_cap into a
 //                       cap on L's own slope (aeval_L_slope_cap())
+//   u_high_lock_*       M3k: sigma's log-tail alpha, g_xu, g_x, g_xx at the
+//                       u-high seam, and cs2_ext_cap, for the ratio lock on
+//                       this field's secondary track and its asymptotic
+//                       causal cap (alpha > 0 only for L; 0 -- the default
+//                       -- reproduces the pre-1.2.0 u-high tail exactly)
 struct ExtSpec {
   real x_lo, x_hi, u_lo, u_hi;
   real x_ext_lo;
@@ -561,6 +685,11 @@ struct ExtSpec {
   bool u_high_log;
   real u_high_b_cap;
   real shift_hat, inv_c2;
+  real u_high_lock_alpha = real(0);
+  real u_high_lock_gxu = real(0);
+  real u_high_lock_gx = real(0);
+  real u_high_lock_gxx = real(0);
+  real u_high_lock_cap = real(0);
 };
 
 // Full designed-extension evaluation of one fitted spline (`field` is
@@ -609,7 +738,10 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_extended(const BsplineView3 &field, r
       const real m_cap = (u_above && spec.u_high_b_cap > real(0))
                              ? aeval_L_slope_cap(b.f, spec.u_high_b_cap, spec.shift_hat, spec.inv_c2)
                              : real(0);
-      b = aeval_apply_tail(b, d, TailAxis::u, TailSpec{field.hu, spec.u_m_floor, m_cap});
+      const real lock_alpha = u_above ? spec.u_high_lock_alpha : real(0);
+      b = aeval_apply_tail(b, d, TailAxis::u,
+                           TailSpec{field.hu, spec.u_m_floor, m_cap, lock_alpha, spec.u_high_lock_gxu,
+                                    spec.u_high_lock_gx, spec.u_high_lock_gxx, spec.u_high_lock_cap});
     }
   }
   if (x_below || x_above) {
@@ -639,14 +771,28 @@ EEOS_HOST_DEVICE inline BsplineEval3 aeval_extended(const BsplineView3 &field, r
 // (c_s^2(tail) = b/alpha - 1). Returns 0 when the log tail is inactive
 // (sigma_b <= 0 at the seam), which disables the clamp. `x_seam` must
 // already be clamped to the physical [x_lo, x_hi].
-EEOS_HOST_DEVICE inline real aeval_sigma_u_high_alpha(const BsplineView3 &sigma, real x_seam, real u_hi,
-                                                        real y, real m_floor) {
+// M3k: the same seam sample also supplies g_xu, the log tail's secondary
+// slope, which L's ratio lock needs; both come from this one helper.
+struct SigmaUHigh {
+  real alpha; // 0 when the log tail is inactive (sigma_b <= 0)
+  real g_xu;
+  real g_x;
+  real g_xx;
+};
+
+EEOS_HOST_DEVICE inline SigmaUHigh aeval_sigma_u_high(const BsplineView3 &sigma, real x_seam, real u_hi,
+                                                      real y, real m_floor) {
   const BsplineEval3 b = bspline_eval3(sigma, x_seam, u_hi, y);
-  if (!(b.f > real(0))) return real(0);
+  if (!(b.f > real(0))) return SigmaUHigh{real(0), real(0), real(0), real(0)};
   const BsplineEval3 g = aeval_log_sample(b);
   const real m_floor_g = m_floor > real(0) ? m_floor / b.f : real(0);
   const Track1D t = aeval_floor_slope(Track1D{g.f, g.fu, g.fuu}, real(1), sigma.hu, m_floor_g);
-  return aeval_phase2_slope(t, real(1), sigma.hu);
+  return SigmaUHigh{aeval_phase2_slope(t, real(1), sigma.hu), g.fxu, g.fx, g.fxx};
+}
+
+EEOS_HOST_DEVICE inline real aeval_sigma_u_high_alpha(const BsplineView3 &sigma, real x_seam, real u_hi,
+                                                        real y, real m_floor) {
+  return aeval_sigma_u_high(sigma, x_seam, u_hi, y, m_floor).alpha;
 }
 
 } // namespace detail
@@ -721,7 +867,9 @@ struct EntropyEOSView {
                            shift_hat,
                            inv_c2};
   }
-  EEOS_HOST_DEVICE detail::ExtSpec L_ext_spec(real b_cap) const {
+  EEOS_HOST_DEVICE detail::ExtSpec L_ext_spec(real b_cap,
+                                              detail::SigmaUHigh lock = detail::SigmaUHigh{
+                                                  real(0), real(0), real(0), real(0)}) const {
     return detail::ExtSpec{x_lo,
                            x_hi,
                            u_lo,
@@ -732,7 +880,12 @@ struct EntropyEOSView {
                            /*u_high_log=*/false,
                            b_cap,
                            shift_hat,
-                           inv_c2};
+                           inv_c2,
+                           lock.alpha,
+                           lock.g_xu,
+                           lock.g_x,
+                           lock.g_xx,
+                           lock.alpha > real(0) ? cs2_ext_cap : real(0)};
   }
 
   // M3g: the causal cap on b = dln(eps_hat)/du for an L evaluation whose u
@@ -965,9 +1118,16 @@ EEOS_HOST_DEVICE inline EOSPoint EntropyEOSView::eval_at(real x_use, real u, rea
   const BsplineEval3 sig = detail::aeval_extended(sigma, x_use, u, y, sigma_ext_spec());
   // M3g: above the u_hi seam, L's tail slope is held to the causal bound
   // b <= (1 + cs2_ext_cap)*alpha, alpha being sigma's own log-tail growth
-  // rate at the same seam (one extra sigma sample, on this path only).
-  const real b_cap = u > u_hi ? u_high_b_cap(x_use, y) : real(0);
-  const BsplineEval3 Lv = detail::aeval_extended(L, x_use, u, y, L_ext_spec(b_cap));
+  // rate at the same seam (one extra sigma sample, on this path only); M3k:
+  // the same sample's g_xu locks L's secondary track to the drift-free ratio.
+  detail::SigmaUHigh sh{real(0), real(0), real(0), real(0)};
+  if (u > u_hi) {
+    sh = detail::aeval_sigma_u_high(sigma, detail::aeval_clamp(x_use, x_lo, x_hi), u_hi, y,
+                                     ext_slope_floor_sigma);
+  }
+  const real b_cap = sh.alpha > real(0) ? (real(1) + cs2_ext_cap) * sh.alpha : real(0);
+  const BsplineEval3 Lv =
+      detail::aeval_extended(L, x_use, u, y, L_ext_spec(b_cap, sh));
 
   // --- 5: chain rule -------------------------------------------------------
   const real lambda = detail::kLn10;
@@ -1032,6 +1192,12 @@ EEOS_HOST_DEVICE inline EOSPoint EntropyEOSView::eval_at(real x_use, real u, rea
   const real p = rho_eff * rho_eff * U_rho;
   const real h = real(1) + U + p / rho_eff;
   const real cs2 = (real(2) * rho_eff * U_rho + rho_eff * rho_eff * U_rhorho) / h;
+  if (!(cs2 < real(1))) {
+    flags |= flag_cs2_acausal;
+  }
+  if (!(cs2 > real(0))) {
+    flags |= flag_cs2_nonpositive;
+  }
 
   EOSPoint pt;
   pt.U = U;
