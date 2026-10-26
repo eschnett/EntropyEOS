@@ -348,12 +348,14 @@ SyntheticOptions dirty_synthetic_options() {
   // 0.256 dex per cell, so a capped profile (ln h growing at cs2_cap per
   // unit ln rho) advances 0.585 per cell and a cubic spline's second
   // derivative, which is what c_s^2 is built from, carries an O((0.585)^2/12)
-  // ~ 3% error there, larger than the 1% cs2_max/cs2_cap hysteresis. The
-  // causal-cap stage therefore collapses this corner's severity (max c_s^2
-  // ~1.63 -> ~1.01) but cannot drive the count to zero on THIS grid; the
-  // dedicated unit test (tests/test_causal_cap.cpp) plants the same defect
-  // on a rho-resolved grid, where the same stage does reach zero. See
-  // tests/integration.sh for the narrative.
+  // ~ 3% error there -- larger than the 1% cs2_max/cs2_cap hysteresis of
+  // 1.2.0 (cs2_cap = 0.99), which therefore only collapsed this corner's
+  // severity (max c_s^2 ~1.63 -> ~1.01), and smaller than 1.3.0's 5% gap
+  // (0.95), under which the corner converges and only interior runs of the
+  // preset's other defects remain. The dedicated unit test
+  // (tests/test_causal_cap.cpp) plants the same defect on a rho-resolved
+  // grid, where the same stage reaches zero. See tests/integration.sh for
+  // the narrative.
   opts.stiffen.push_back(StiffenDefect{"logenergy", 1e13, 2.0, 1.35e17});
 
   // Mimics the Hempel DD2/SFHo rho-column stitching seam (CODE.md open

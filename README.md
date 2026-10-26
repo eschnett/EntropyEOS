@@ -401,13 +401,16 @@ energy-consistency ODE, writing only where the envelope actually bounds and $\ep
 drops. Only `logenergy` is touched, so the adiabat labels
 are stable from round to round. Interior violation runs are counted and deliberately
 never edited, since their defect lives in $\sigma_T$'s flatness rather than in
-$\epsilon$'s stiffness, and so are samples with $c_s^2 \le 0$. On LS220 the stage runs
-seven rounds and caps 66,419 nodes, covering the top 18% of the density axis at *every*
-temperature, and takes the violation count from 4,076,091 to 7,622 — of which 7,532 are
-exactly those untouched interior runs. A lexicographic backstop then requires that
-monotonicity counts have not regressed and the $c_s^2$ count has not risen, reverting
-the entire stage otherwise: causality is never enforced at the price of the $T$-solve's
-hard requirement.
+$\epsilon$'s stiffness, and so are samples with $c_s^2 \le 0$. The envelope's slope is $c_s^2 = 0.95$, not 1: the
+projection controls $\epsilon$ at nodes while $c_s^2$ is a second derivative of the
+refit, and the gap absorbs the refit's ringing. On LS220 the stage runs three rounds and
+caps 67,057 nodes, covering the top 18% of the density axis at *every* temperature, and
+takes the violation count from 4,052,900 to 209 — of which 197 are exactly those
+untouched interior runs. A lexicographic backstop then requires that the $c_s^2$ count
+has not risen and that the monotonicity count has not regressed by more than 0.1% —
+a tolerance granted only to a projection that removed acausal samples — reverting the
+entire stage otherwise: causality is never bought with more than a sliver of the
+$T$-solve's hard requirement.
 
 The interior runs it leaves alone are almost all the $\sigma_T$ pockets below
 $T \approx 0.1$ MeV, where the tables reach far below the validity of nuclear statistical
@@ -469,6 +472,10 @@ T=tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5
 ./tools/eos_repair $T tables/LS220_repaired.h5 --log repair.log
 ./tools/eos_test --level con2prim tables/LS220_repaired.h5
 ```
+
+`tools/repair_tables.sh` (`make repair-tables`) does this for every table the package has
+been measured on that is present under `tables/` — LS220, SRO, DD2, SFHo and APR-LDP — and
+records each one's source and baryon mass; `--test` adds the `eos_test` checks.
 
 `eos_test` also runs at `--level table` and `--level adapter`, and against a built-in
 synthetic table (`--synthetic`, `--synthetic-dirty`) when no real table is at hand;
@@ -614,7 +621,7 @@ vendor hardware yet — reports welcome.
 
 ## Status and testing
 
-This is version **1.2.0**. The version is available to consumers as
+This is version **1.3.0**. The version is available to consumers as
 `EEOS_VERSION_MAJOR/_MINOR/_PATCH`, as an encoded integer `EEOS_VERSION` for
 `#if EEOS_VERSION >= EEOS_VERSION_ENCODE(1, 1, 0)` feature guards, as
 `EEOS_VERSION_STRING`, and as `constexpr eeos::version*` values, all from

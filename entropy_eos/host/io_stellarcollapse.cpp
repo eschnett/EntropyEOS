@@ -670,6 +670,8 @@ std::string append_repair_group(const std::string &path, const RepairResult &res
   write_attr_uint64(group.get(), "trace_depth_max",
                      static_cast<std::uint64_t>(options.trace_depth_max));
   write_attr_uint64(group.get(), "anchor_pad", static_cast<std::uint64_t>(options.anchor_pad));
+  // 1.3.0: the backstop's monotonicity tolerance (RepairOptions::causal_mono_slack).
+  write_attr_double(group.get(), "causal_mono_slack", options.causal_mono_slack);
   write_attr_uint64(group.get(), "causal_nodes_capped",
                      static_cast<std::uint64_t>(result.causal_cap.nodes_capped));
   write_attr_uint64(group.get(), "causal_cs2_violations_before",

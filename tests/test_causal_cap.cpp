@@ -12,6 +12,8 @@
 //       (host/synthetic.hpp's StiffenDefect): detect -> cap -> clean ->
 //       idempotent, "entropy" never edited, untouched nodes bit-identical,
 //       and the stage's opt-out behaving as documented.
+//   (3) causal_backstop_keeps(), the stage's keep-or-revert decision, with
+//       the 1.3.0 monotonicity tolerance (RepairOptions::causal_mono_slack).
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
@@ -278,7 +280,11 @@ TEST_CASE("repair_table: causal-cap detects and removes a stiffened high-density
   CHECK(c.trace_giveups == 0);
   CHECK(c.interior_untouched == 0);
   CHECK(c.cs2_max_seen < 1.0);
-  // The stage must never trade the T-solve's hard requirement for causality.
+  // The stage must never trade the T-solve's hard requirement for causality
+  // beyond its proportional tolerance -- and a table without monotonicity
+  // residual gets no tolerance at all.
+  CHECK(c.mono_logenergy_before == 0);
+  CHECK(c.mono_slack == 0);
   CHECK(c.mono_logenergy_after <= c.mono_logenergy_before);
 
   // Only "logenergy" is ever edited by this stage; this table has no other
@@ -407,6 +413,51 @@ TEST_CASE("repair_table: an unusable cs2_cap is a caller error, reported before 
   CHECK_NOTHROW(eeos::repair_table(table, off));
 }
 
+TEST_CASE("repair_table: an unusable causal_mono_slack is a caller error (1.3.0)") {
+  SyntheticOptions opts;
+  opts.nrho = 24;
+  opts.ntemp = 12;
+  opts.nye = 6;
+  RawTable table = eeos::make_synthetic_table(opts);
+  const std::vector<double> before = table.field("logenergy");
+
+  for (double bad : {-1e-3, std::numeric_limits<double>::quiet_NaN(),
+                     std::numeric_limits<double>::infinity()}) {
+    RepairOptions o;
+    o.causal_mono_slack = bad;
+    CHECK_THROWS_AS(eeos::repair_table(table, o), std::invalid_argument);
+    CHECK(table.field("logenergy") == before); // nothing was modified
+  }
+
+  RepairOptions strict;
+  strict.causal_mono_slack = 0.0; // the pre-1.3.0 rule is a valid setting
+  CHECK_NOTHROW(eeos::repair_table(table, strict));
+}
+
+TEST_CASE("causal_backstop_keeps: the lexicographic backstop with its 1.3.0 tolerance") {
+  // Arguments: cs2_before, cs2_after, mono_before, mono_after, mono_slack.
+  // (b) more c_s^2 violations is always a revert, whatever the slack.
+  CHECK_FALSE(eeos::causal_backstop_keeps(100, 101, 50, 50, 10));
+  // Equal or fewer violations with no monotonicity regression: kept.
+  CHECK(eeos::causal_backstop_keeps(100, 100, 50, 50, 0));
+  CHECK(eeos::causal_backstop_keeps(100, 10, 50, 40, 0));
+  // A regression within the slack is kept -- when causality improved ...
+  CHECK(eeos::causal_backstop_keeps(100, 10, 50, 52, 2));
+  CHECK_FALSE(eeos::causal_backstop_keeps(100, 10, 50, 53, 2));
+  // ... and never when it did not: the tolerance buys causality only.
+  CHECK_FALSE(eeos::causal_backstop_keeps(100, 100, 50, 51, 2));
+  // Slack 0 is the strict pre-1.3.0 rule.
+  CHECK_FALSE(eeos::causal_backstop_keeps(100, 10, 50, 51, 0));
+  // The LS220-2009 case that motivated it (CODE.md milestone M3l): at
+  // cs2_cap 0.97 a 4,052,900 -> 396 projection regressed L_u 20,650 ->
+  // 20,652; the default slack there is floor(1e-3 * 20,650) = 20.
+  const size_t slack =
+      static_cast<size_t>(RepairOptions().causal_mono_slack * 20650.0);
+  CHECK(slack == 20);
+  CHECK(eeos::causal_backstop_keeps(4052900, 396, 20650, 20652, slack));
+  CHECK_FALSE(eeos::causal_backstop_keeps(4052900, 210, 20650, 20701, slack)); // cs2_cap 0.93
+}
+
 TEST_CASE("repair_table: causal-cap is deterministic (independent builds agree bit for bit)") {
   RawTable a = eeos::make_synthetic_table(stiff_corner_options());
   RawTable b = eeos::make_synthetic_table(stiff_corner_options());
@@ -440,7 +491,9 @@ TEST_CASE("repair_table: causal-cap reports, but never edits, the dirty preset's
   CHECK(c.ran);
   CHECK(c.violations_before > 0);
   CHECK(c.violations_after < c.violations_before);
-  CHECK(c.mono_logenergy_after <= c.mono_logenergy_before);
+  CHECK(c.mono_slack == static_cast<size_t>(RepairOptions().causal_mono_slack *
+                                            static_cast<double>(c.mono_logenergy_before)));
+  CHECK(c.mono_logenergy_after <= c.mono_logenergy_before + c.mono_slack);
 
   // Even on this messy table -- where the entropy WiggleDefect makes sigma
   // nearly flat in places and c_s^2 blows up in the resulting pockets -- the

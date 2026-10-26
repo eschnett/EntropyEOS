@@ -16,10 +16,12 @@
 //
 //   eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]
 //              [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]
-//              [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N] [--log FILE]
+//              [--no-causal-cap] [--cs2-cap X] [--causal-mono-slack X]
+//              [--trim-t-hi N] [--log FILE]
 //   eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]
 //              [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]
-//              [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N]
+//              [--no-causal-cap] [--cs2-cap X] [--causal-mono-slack X]
+//              [--trim-t-hi N]
 //   eos_repair --version
 //
 // Exit codes: 0 = already clean (which includes re-repairing an
@@ -31,6 +33,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -56,10 +59,12 @@ void print_usage(std::ostream &os) {
   os << "usage:\n"
         "  eos_repair IN.h5 OUT.h5 [--min-slope-s X] [--min-slope-loge X]\n"
         "             [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]\n"
-        "             [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N] [--log FILE]\n"
+        "             [--no-causal-cap] [--cs2-cap X] [--causal-mono-slack X]\n"
+        "             [--trim-t-hi N] [--log FILE]\n"
         "  eos_repair --check-only IN.h5 [--min-slope-s X] [--min-slope-loge X]\n"
         "             [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d]\n"
-        "             [--no-causal-cap] [--cs2-cap X] [--trim-t-hi N]\n"
+        "             [--no-causal-cap] [--cs2-cap X] [--causal-mono-slack X]\n"
+        "             [--trim-t-hi N]\n"
         "  eos_repair --version\n"
         "\n"
         "First -- unless --no-seam-blend -- the seam-blend stage (1.2.0, CODE.md\n"
@@ -138,10 +143,22 @@ void print_usage(std::ostream &os) {
         "                      unchanged. On by default.\n"
         "  --cs2-cap X         target slope of the causality projection, in\n"
         "                      units of c^2 (RepairOptions::cs2_cap; default\n"
-        "                      0.99 -- deliberately below the audit threshold\n"
+        "                      0.95 -- deliberately below the audit threshold\n"
         "                      cs2_max = 1.0, so the gap absorbs refit ringing\n"
         "                      and leaves the con2prim Newton some 1 - c_s^2\n"
-        "                      conditioning headroom)\n"
+        "                      conditioning headroom; 0.99 reproduces releases\n"
+        "                      before 1.3.0)\n"
+        "  --causal-mono-slack X\n"
+        "                      the causality projection's tolerance on the\n"
+        "                      logenergy monotonicity count, as a fraction of\n"
+        "                      the count before the stage\n"
+        "                      (RepairOptions::causal_mono_slack; default\n"
+        "                      0.001). A projection that removes acausal\n"
+        "                      samples is kept if it adds at most that many\n"
+        "                      monotonicity violation samples; otherwise the\n"
+        "                      whole stage is reverted. 0 is the strict rule\n"
+        "                      of releases before 1.3.0. Recorded in the\n"
+        "                      provenance group.\n"
         "  --trim-t-hi N       how many of the hottest T rows to drop from the\n"
         "                      table before repairing it (RepairOptions::\n"
         "                      trim_t_hi_rows, default 1): OUT.h5's T axis is\n"
@@ -176,6 +193,8 @@ struct ParsedArgs {
   bool no_causal_cap = false;
   bool have_cs2_cap = false;
   double cs2_cap = 0.0;
+  bool have_causal_mono_slack = false;
+  double causal_mono_slack = 0.0;
   bool have_trim_t_hi = false;
   long long trim_t_hi = 0;
   bool have_log = false;
@@ -251,6 +270,26 @@ bool parse_args(const std::vector<std::string> &args, ParsedArgs &out) {
         return false;
       }
       out.have_cs2_cap = true;
+    } else if (a == "--causal-mono-slack") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "eos_repair: option '--causal-mono-slack' requires a value\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      try {
+        out.causal_mono_slack = std::stod(args[++i]);
+      } catch (const std::exception &) {
+        std::cerr << "eos_repair: invalid number for --causal-mono-slack: '" << args[i] << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      if (!(out.causal_mono_slack >= 0.0) || !std::isfinite(out.causal_mono_slack)) {
+        std::cerr << "eos_repair: --causal-mono-slack must be finite and >= 0, got '" << args[i]
+                  << "'\n\n";
+        print_usage(std::cerr);
+        return false;
+      }
+      out.have_causal_mono_slack = true;
     } else if (a == "--trim-t-hi") {
       if (i + 1 >= args.size()) {
         std::cerr << "eos_repair: option '--trim-t-hi' requires a value\n\n";
@@ -349,6 +388,7 @@ void write_log(const std::string &log_path, const std::string &in_path, const st
   log << "causal_rounds_max:   " << options.causal_rounds_max << "\n";
   log << "trace_depth_max:     " << options.trace_depth_max << "\n";
   log << "anchor_pad:          " << options.anchor_pad << "\n";
+  log << "causal_mono_slack:   " << options.causal_mono_slack << "\n";
   log << "trim_t_hi_rows:      " << options.trim_t_hi_rows << "\n";
   log << "timestamp:           " << std::put_time(&now_tm, "%Y-%m-%dT%H:%M:%SZ") << "\n";
   log << "\n";
@@ -459,6 +499,9 @@ int main(int argc, char **argv) {
     }
     if (pa.have_cs2_cap) {
       repair_opts.cs2_cap = pa.cs2_cap;
+    }
+    if (pa.have_causal_mono_slack) {
+      repair_opts.causal_mono_slack = pa.causal_mono_slack;
     }
     if (pa.have_trim_t_hi) {
       repair_opts.trim_t_hi_rows = static_cast<int>(pa.trim_t_hi);

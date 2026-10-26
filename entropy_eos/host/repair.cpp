@@ -1332,10 +1332,15 @@ void causal_cap_stage(const RawTable &table, const std::vector<double> &sigma_da
   out.projected_violations = after.violations;
   out.projected_mono_logenergy = out.mono_logenergy_after;
 
-  const bool worse_monotonicity = out.mono_logenergy_after > out.mono_logenergy_before;
-  const bool worse_causality = after.violations > before.violations;
+  // 1.3.0 tolerance (RepairOptions::causal_mono_slack): a proportional
+  // allowance on the monotonicity count, granted only to a projection that
+  // strictly reduced the c_s^2 count (causal_backstop_keeps()).
+  out.mono_slack = static_cast<size_t>(options.causal_mono_slack *
+                                       static_cast<double>(out.mono_logenergy_before));
   const CausalAuditCounts *kept = &after;
-  if (!unchanged && (worse_monotonicity || worse_causality)) {
+  if (!unchanged &&
+      !causal_backstop_keeps(before.violations, after.violations, out.mono_logenergy_before,
+                             out.mono_logenergy_after, out.mono_slack)) {
     logenergy_data = pre_stage;
     out.reverted = true;
     out.rounds_used = 0;
@@ -1677,6 +1682,12 @@ void seam_blend_stage(RawTable &table, const RepairOptions &options,
 
 } // namespace
 
+bool causal_backstop_keeps(size_t cs2_before, size_t cs2_after, size_t mono_before,
+                           size_t mono_after, size_t mono_slack) {
+  const size_t mono_limit = mono_before + (cs2_after < cs2_before ? mono_slack : 0);
+  return mono_after <= mono_limit && cs2_after <= cs2_before;
+}
+
 CausalEnvelope causal_envelope(const std::vector<double> &h, double eps_node, double cs2_cap,
                                 double delta) {
   CausalEnvelope out;
@@ -1754,6 +1765,10 @@ RepairResult repair_table(RawTable &table, const RepairOptions &options) {
   // an unknown field name is -- a caller error, not table noise.
   if (options.causal_cap && (!(options.cs2_cap > 0.0) || !(options.cs2_cap < options.cs2_max))) {
     throw std::invalid_argument("repair_table: causal_cap requires 0 < cs2_cap < cs2_max");
+  }
+  if (options.causal_cap &&
+      (!(options.causal_mono_slack >= 0.0) || !std::isfinite(options.causal_mono_slack))) {
+    throw std::invalid_argument("repair_table: causal_cap requires a finite causal_mono_slack >= 0");
   }
   if (options.seam_blend &&
       (!(options.seam_tol > 0.0) || options.seam_fit_cells < 3 || options.seam_halfwidth < 1 ||
@@ -2026,7 +2041,8 @@ void RepairResult::print(std::ostream &os) const {
        << " cs2_ge_cap=" << c.cs2_near_cap << " cs2_max=" << c.cs2_max_seen
        << " trace_giveups=" << c.trace_giveups << "\n";
     os << "    causal-cap monotonicity (4,4,4): entropy=" << c.mono_entropy
-       << " logenergy " << c.mono_logenergy_before << " -> " << c.mono_logenergy_after << "\n";
+       << " logenergy " << c.mono_logenergy_before << " -> " << c.mono_logenergy_after
+       << " (slack " << c.mono_slack << ")\n";
     if (c.reverted) {
       os << "    causal-cap rejected state (4,4,4): cs2_violations=" << c.projected_violations
          << " logenergy_monotonicity=" << c.projected_mono_logenergy << "\n";

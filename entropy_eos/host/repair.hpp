@@ -198,7 +198,18 @@ struct RepairOptions {
   // precondition, not a preference -- repair_table() throws
   // std::invalid_argument otherwise (see its doc comment), since without the
   // gap the loop has no mechanism to converge.
-  double cs2_cap = 0.99;
+  //
+  // 1.3.0: 0.95 (was 0.99). The 1% gap was too narrow for the refit's own
+  // ringing -- the projection controls eps at nodes, c_s^2 is a second
+  // derivative of the refit -- so the capped corner kept samples above 1.
+  // At 0.95 the adapter's in-box c_s^2 >= 1 count drops to 0 on LS220, SRO
+  // and SFHo (from 49 / 70 / 17) and 3,165 -> 257 on APRLDP; DD2 is
+  // unaffected (its cap never acts). No table gains an edit on a node its own
+  // stored cs2 calls causal; the price is a slightly deeper edit of the
+  // already-acausal corner (max |d log10(eps + shift)| 0.081 -> 0.097 on
+  // LS220, 0.085 -> 0.104 on SRO). Measured in CODE.md milestone M3l; 0.99
+  // reproduces 1.2.0.
+  double cs2_cap = 0.95;
 
   // Absolute ceiling on the stage's audit/project/re-repair loop -- a pure
   // runaway backstop, NOT the working budget (M3j semantic change; it was a
@@ -226,6 +237,21 @@ struct RepairOptions {
   // anchor exactly where the refit is most likely to ring back above the
   // cap).
   int anchor_pad = 2;
+
+  // 1.3.0: the lexicographic backstop's monotonicity tolerance (repair_table()'s
+  // doc comment, causal-cap step 10), as a fraction of the pre-stage (4,4,4)
+  // "logenergy" monotonicity count. A projected state whose count exceeds the
+  // pre-stage one by at most floor(causal_mono_slack * before) samples is kept
+  // -- but only if it also has strictly fewer c_s^2 violations, i.e. a
+  // monotonicity regression is only ever accepted in exchange for causality.
+  // Proportional on purpose: a table with no monotonicity residual gets no
+  // slack at all, so the stage can never introduce that defect class into a
+  // table that did not already carry it. The strict rule this replaces made
+  // the outcome discontinuous in cs2_cap: on LS220-2009, regressions of 2-14
+  // samples out of 20,650 reverted the whole stage at caps 0.98, 0.97, 0.945
+  // and 0.94, while 0.99, 0.96, 0.955 and 0.95 were kept (CODE.md milestone
+  // M3l). 0 restores the pre-1.3.0 strict rule. Must be finite and >= 0.
+  double causal_mono_slack = 1e-3;
 
   // The stage's refined audit grid reuses refine3d_xy / refine3d_u above:
   // the main loop audits at (refine3d_xy, refine3d_u, refine3d_xy) and the
@@ -395,9 +421,10 @@ struct RepairResult {
     // True iff the stage's lexicographic backstop (repair_table()'s doc
     // comment, causal-cap step 6) rejected the projected state and reverted
     // "logenergy" to exactly its pre-stage bytes -- either because the
-    // (4,4,4) L_u monotonicity count got worse (never trade the T-solve's
-    // hard requirement for causality) or because the (4,4,4) c_s^2 count
-    // did. When true, nodes_capped and rounds_used are 0 and
+    // (4,4,4) L_u monotonicity count got worse by more than the 1.3.0
+    // tolerance allows (mono_slack below; never trade the T-solve's hard
+    // requirement for causality) or because the (4,4,4) c_s^2 count did.
+    // When true, nodes_capped and rounds_used are 0 and
     // violations_after is the pre-stage count.
     bool reverted = false;
 
@@ -473,6 +500,13 @@ struct RepairResult {
     // "Environment"); tools/eos_repair prints these as per-round progress
     // lines, exactly as it does for the 3D stage.
     std::vector<size_t> rounds_violation_history;
+
+    // 1.3.0: the monotonicity regression the backstop allowed this run,
+    // floor(options.causal_mono_slack * mono_logenergy_before) samples
+    // (RepairOptions::causal_mono_slack). It applies only to a projection
+    // that strictly reduced the c_s^2 violation count; a kept state with
+    // mono_logenergy_after > mono_logenergy_before used it.
+    size_t mono_slack = 0;
   };
   CausalCapSummary causal_cap;
 
@@ -750,11 +784,13 @@ struct RepairResult {
 //      CODE.md "DD2 / SFHo empirical findings").
 //  10. Verification + lexicographic backstop: one final (4,4,4) audit of
 //      c_s^2, plus (4,4,4) fu-monotonicity counts of both fields. The kept
-//      state must satisfy, in order, (a) monotonicity counts no worse than
+//      state must satisfy, in order, (a) a monotonicity count no worse than
 //      the pre-stage state's -- never trade the T-solve's hard requirement
-//      for causality -- and (b) a c_s^2 count no worse than the pre-stage
-//      state's. If either fails, "logenergy" reverts to exactly its
-//      pre-stage bytes and CausalCapSummary::reverted is set.
+//      for causality -- up to options.causal_mono_slack's proportional
+//      tolerance (1.3.0), which is granted only to a state that also has
+//      strictly fewer c_s^2 violations, and (b) a c_s^2 count no worse than
+//      the pre-stage state's. If either fails, "logenergy" reverts to
+//      exactly its pre-stage bytes and CausalCapSummary::reverted is set.
 //
 // Final write-back, per field (the listed fields, then "logpress" if the
 // seam-blend stage ran): a RepairEntry for every index whose value
@@ -899,5 +935,17 @@ struct CausalEnvelope {
 // with bound == false. Throws nothing.
 CausalEnvelope causal_envelope(const std::vector<double> &h, double eps_node, double cs2_cap,
                                 double delta);
+
+// The causal-cap stage's lexicographic backstop (repair_table()'s doc
+// comment, causal-cap step 10), exposed for unit testing: whether the
+// projected state is kept rather than reverted, given the (4,4,4) c_s^2
+// violation counts and "logenergy" monotonicity counts before and after the
+// stage. Kept iff (a) mono_after <= mono_before, or mono_after <=
+// mono_before + mono_slack when cs2_after < cs2_before (1.3.0: the
+// tolerance is granted only in exchange for causality), and (b) cs2_after
+// <= cs2_before. The stage passes mono_slack =
+// floor(RepairOptions::causal_mono_slack * mono_before).
+bool causal_backstop_keeps(size_t cs2_before, size_t cs2_after, size_t mono_before,
+                           size_t mono_after, size_t mono_slack);
 
 } // namespace eeos

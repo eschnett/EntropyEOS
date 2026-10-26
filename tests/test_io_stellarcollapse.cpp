@@ -522,6 +522,7 @@ TEST_CASE("append_repair_group: writes group contents and attributes correctly")
         static_cast<std::uint64_t>(options.trace_depth_max));
   CHECK(read_uint64_attr(group.get(), "anchor_pad") ==
         static_cast<std::uint64_t>(options.anchor_pad));
+  CHECK(read_double_attr(group.get(), "causal_mono_slack") == options.causal_mono_slack);
   CHECK(read_uint64_attr(group.get(), "causal_nodes_capped") == 0);
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_before") == 0);
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_after") == 0);
@@ -561,8 +562,9 @@ TEST_CASE("append_repair_group: records a non-default causal-cap outcome") {
   result.seam_blend.seams_unfaded.resize(1);
 
   RepairOptions options;
-  options.cs2_cap = 0.95;
+  options.cs2_cap = 0.97; // 1.3.0 default is 0.95
   options.anchor_pad = 3;
+  options.causal_mono_slack = 0.0;
   options.seam_blend = false;
   options.seam_tol = 2.5e-3;
   options.seam_halfwidth = 4;
@@ -576,8 +578,9 @@ TEST_CASE("append_repair_group: records a non-default causal-cap outcome") {
   H5Guard group(H5Gopen(file.get(), "repair", H5P_DEFAULT), H5Gclose);
   REQUIRE(group.valid());
 
-  CHECK(read_double_attr(group.get(), "cs2_cap") == 0.95);
+  CHECK(read_double_attr(group.get(), "cs2_cap") == 0.97);
   CHECK(read_uint64_attr(group.get(), "anchor_pad") == 3);
+  CHECK(read_double_attr(group.get(), "causal_mono_slack") == 0.0);
   CHECK(read_uint64_attr(group.get(), "causal_nodes_capped") == 12345);
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_before") == 999);
   CHECK(read_uint64_attr(group.get(), "causal_cs2_violations_after") == 999);
