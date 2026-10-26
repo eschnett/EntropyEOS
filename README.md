@@ -473,6 +473,10 @@ T=tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5
 ./tools/eos_test --level con2prim tables/LS220_repaired.h5
 ```
 
+`tools/repair_tables.sh` (`make repair-tables`) does this for every table the package has
+been measured on that is present under `tables/` — LS220, SRO, DD2, SFHo and APR-LDP — and
+records each one's source and baryon mass; `--test` adds the `eos_test` checks.
+
 `eos_test` also runs at `--level table` and `--level adapter`, and against a built-in
 synthetic table (`--synthetic`, `--synthetic-dirty`) when no real table is at hand;
 [`tables/README.md`](tables/README.md) says where to download the real ones, which are

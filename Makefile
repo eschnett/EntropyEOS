@@ -64,7 +64,7 @@ TOOL_BINS = $(TOOL_SRCS:.cpp=)
 HDRS = $(wildcard entropy_eos/*.hpp entropy_eos/core/*.hpp entropy_eos/host/*.hpp \
 	entropy_eos/device/*.hpp tests/*.hpp tests/*.h)
 
-.PHONY: all lib test tools integration install clean san-fixture
+.PHONY: all lib test tools integration install clean san-fixture repair-tables
 
 all: lib
 
@@ -105,6 +105,16 @@ integration: tools
 san-fixture: tools
 	./tools/eos_crop tables/LS220_234r_136t_50y_analmu_20091212_SVNr26.h5 \
 		tables/LS220_san_crop.h5 --irho 60 120 --jt 0 135 --kye 10 25
+
+# Repairs every known EOS table present under tables/ the way this release
+# does it, writing <file>_repaired.h5 and <NAME>_repair.log next to each and
+# checking that each output is a one-run fixed point; the per-table record
+# (file, baryon mass, source) lives in the script. Not run by `test` or
+# `integration`: it needs the tables and writes up to ~0.9 GB per table. For
+# the eos_test checks too, or a subset of tables, run the script directly:
+#   ./tools/repair_tables.sh --test SRO APRLDP
+repair-tables: tools
+	./tools/repair_tables.sh
 
 # --- M4 GPU device test (opt-in; `make`/`make test` never build or run this,
 # see eos-device-interface.md S6) ------------------------------------------

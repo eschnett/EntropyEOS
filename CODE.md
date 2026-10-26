@@ -164,6 +164,7 @@ EntropyEOS/
       io_compose.hpp/.cpp      #   CompOSE/MUSES backend (planned only; same interface)
   tools/
     eos_repair.cpp             # M1
+    repair_tables.sh           # how each known table is repaired (make repair-tables)
     eos_test.cpp               # M1 (staged; grows with M2/M3)
   tests/
     doctest.h                  # vendored single-header framework (committed; nothing to install)
@@ -244,7 +245,7 @@ kernels — the same reason `core/` forbids it. See [`RELATED.md`](RELATED.md).
 ```
 eos_repair in.h5 out.h5 [--check-only] [--min-slope-s X] [--min-slope-loge X]
            [--no-seam-blend] [--no-spline-safe] [--no-spline-safe-3d] [--no-causal-cap]
-           [--cs2-cap X] [--trim-t-hi N] [--log FILE]
+           [--cs2-cap X] [--causal-mono-slack X] [--trim-t-hi N] [--log FILE]
 ```
 
 Purpose: make a table satisfy the hard requirements of `eos-adapter-F-to-U.md` §8 —
@@ -329,6 +330,16 @@ Design points:
 - Exit codes: 0 = already clean — **including the re-repair case**, where the input is
   itself an `eos_repair` output and this run found nothing left to do;
   1 = repaired (or would repair, under `--check-only`); 2 = fatal structural problem.
+- **How each known table is repaired: `tools/repair_tables.sh`** (`make
+  repair-tables`). One registry of the tables this package has been measured on —
+  LS220, SRO, DD2, SFHo, APR-LDP — with each one's file name, source and baryon mass.
+  It repairs every table present under `tables/` (or `--dir`) with `eos_repair`'s
+  defaults into `<file>_repaired.h5` plus `<NAME>_repair.log`, checks that each output
+  is a one-run fixed point, and with `--test` runs `eos_test`'s table, adapter and
+  con2prim levels with the right baryon mass (the only per-table fact the checks need;
+  the repair itself is m_B-independent). Since 1.3.0 no table needs its own repair
+  options (milestone M3l); one that ever does gets them in its registry entry, so the
+  record of how each table was made stays in one file.
 
 ## Test harness — `tools/eos_test` (staged; M1 ships the first stage)
 
